@@ -9,8 +9,8 @@ import urllib.error
 import urllib.request
 
 
-DEFAULT_PROJECT = "rich-compiler-479518-d2"
-DEFAULT_SERVICE = "blossom-upload-rust"
+DEFAULT_PROJECT = "dv-platform-prod"
+DEFAULT_SERVICE = "divine-upload-server"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--service-name",
         default=DEFAULT_SERVICE,
-        help=f"Cloud Run service name to query. Default: {DEFAULT_SERVICE}",
+        help=(
+            "Upload service identifier to query. Matches Cloud Run "
+            "service_name and GKE container_name. "
+            f"Default: {DEFAULT_SERVICE}"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -57,8 +61,11 @@ def get_access_token() -> str:
 
 def build_filter(service_name: str, since: str, until: str | None) -> str:
     clauses = [
-        'resource.type="cloud_run_revision"',
-        f'resource.labels.service_name="{service_name}"',
+        "("
+        f'(resource.type="cloud_run_revision" AND resource.labels.service_name="{service_name}") '
+        "OR "
+        f'(resource.type="k8s_container" AND resource.labels.container_name="{service_name}")'
+        ")",
         'labels.service="divine-blossom"',
         'labels.component="audit"',
         'jsonPayload.action="upload"',
@@ -119,7 +126,11 @@ def extract_record(entry: dict) -> dict | None:
 
     return {
         "sha256": sha256,
-        "uploaded": metadata.get("uploaded") or payload.get("timestamp"),
+        "uploaded": (
+            metadata.get("uploaded")
+            or payload.get("timestamp")
+            or entry.get("timestamp")
+        ),
         "owner": metadata.get("owner"),
         "size": metadata.get("size"),
         "dim": metadata.get("dim"),

@@ -34,6 +34,7 @@ Run tests:
 
 ```bash
 cargo test
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Run locally:
@@ -50,4 +51,6 @@ Phase 1 targets production GKE behind `https://upload.divine.video`.
 
 The current media follow-up path still points at the existing transcoder endpoint through `TRANSCODER_URL`. GPU-backed transcoder migration is a separate phase.
 
-`export-video-upload-hashes.py` still assumes the legacy Cloud Run log query shape and needs a follow-up update once production audit logs come from the GKE deployment.
+The repository CI workflow builds and tests on pull requests, then publishes `divine-upload-server` to `us-central1-docker.pkg.dev/dv-platform-prod/containers-production` on pushes to `main`.
+
+`export-video-upload-hashes.py` queries both the legacy Cloud Run audit logs and the GKE `k8s_container` audit logs so historic exports continue to work across the migration.

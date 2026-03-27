@@ -8,7 +8,6 @@ use tempfile::NamedTempFile;
 
 pub struct ThumbnailResult {
     pub data: Vec<u8>,
-    pub content_type: String,
 }
 
 /// Extract thumbnail from video bytes using ffmpeg
@@ -92,10 +91,7 @@ pub fn extract_thumbnail(video_data: &[u8]) -> Result<ThumbnailResult> {
         return Err(anyhow!("Empty thumbnail generated"));
     }
 
-    Ok(ThumbnailResult {
-        data,
-        content_type: "image/jpeg".into(),
-    })
+    Ok(ThumbnailResult { data })
 }
 
 /// Check if a content type is a video type that can have thumbnails extracted

@@ -1107,6 +1107,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{media_source_candidates, new_temp_media_path};
 
