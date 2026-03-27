@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>upload.divine.video</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e8;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .container {
+    max-width: 640px;
+    padding: 3rem 2rem;
+    text-align: center;
+  }
+  h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: #fff;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  .subtitle {
+    font-size: 1rem;
+    color: #8888a0;
+    margin-bottom: 2.5rem;
+  }
+  .description {
+    font-size: 0.95rem;
+    line-height: 1.7;
+    color: #b0b0c0;
+    margin-bottom: 2rem;
+    text-align: left;
+  }
+  .endpoints {
+    text-align: left;
+    background: #12121a;
+    border: 1px solid #1e1e2e;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .endpoints h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #6666a0;
+    margin-bottom: 1rem;
+  }
+  .endpoint {
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  .endpoint:last-child { margin-bottom: 0; }
+  .method {
+    display: inline-block;
+    width: 4rem;
+    font-weight: 600;
+    font-size: 0.75rem;
+    padding: 0.15rem 0;
+    text-align: center;
+    border-radius: 3px;
+    margin-right: 0.5rem;
+  }
+  .method-put { background: #1a2a1a; color: #4a9; }
+  .method-post { background: #2a2a1a; color: #ca4; }
+  .method-head { background: #1a1a2a; color: #68c; }
+  .method-delete { background: #2a1a1a; color: #c66; }
+  .path { color: #d0d0e0; }
+  .desc { color: #666680; font-size: 0.8rem; font-family: -apple-system, sans-serif; margin-left: 4.8rem; }
+  .links {
+    font-size: 0.85rem;
+    color: #6666a0;
+  }
+  .links a {
+    color: #8888cc;
+    text-decoration: none;
+  }
+  .links a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>upload.divine.video</h1>
+  <div class="subtitle">Blossom media upload server for divine.video</div>
+
+  <div class="description">
+    This is the media upload endpoint for the <a href="https://divine.video" style="color:#8888cc;text-decoration:none">divine.video</a> platform.
+    It implements the <a href="https://github.com/hzrd149/blossom" style="color:#8888cc;text-decoration:none">Blossom protocol</a> for
+    content-addressed blob storage, with support for resumable uploads, automatic thumbnail extraction, and video transcoding.
+  </div>
+
+  <div class="endpoints">
+    <h2>API Endpoints</h2>
+    <div class="endpoint">
+      <span class="method method-put">PUT</span>
+      <span class="path">/upload</span>
+      <div class="desc">Upload a blob (NIP-98 auth required)</div>
+    </div>
+    <div class="endpoint">
+      <span class="method method-post">POST</span>
+      <span class="path">/upload/init</span>
+      <div class="desc">Initialize a resumable upload session</div>
+    </div>
+    <div class="endpoint">
+      <span class="method method-put">PUT</span>
+      <span class="path">/sessions/:id</span>
+      <div class="desc">Upload a chunk to a resumable session</div>
+    </div>
+    <div class="endpoint">
+      <span class="method method-head">HEAD</span>
+      <span class="path">/sessions/:id</span>
+      <div class="desc">Check resumable upload progress</div>
+    </div>
+    <div class="endpoint">
+      <span class="method method-post">POST</span>
+      <span class="path">/upload/:id/complete</span>
+      <div class="desc">Finalize a resumable upload</div>
+    </div>
+    <div class="endpoint">
+      <span class="method method-delete">DELETE</span>
+      <span class="path">/upload/:id</span>
+      <div class="desc">Abort a resumable upload</div>
+    </div>
+  </div>
+
+  <div class="links">
+    Part of <a href="https://divine.video">divine.video</a> &middot;
+    <a href="https://github.com/divinevideo">GitHub</a>
+  </div>
+</div>
+</body>
+</html>

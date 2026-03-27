@@ -215,6 +215,7 @@ async fn main() -> Result<()> {
         .route("/audit", post(handle_audit_log))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
+        .route("/", get(handle_landing))
         .route("/", put(handle_upload))
         .route("/", options(handle_cors_preflight))
         .layer(cors)
@@ -247,6 +248,14 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+async fn handle_landing() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(include_str!("landing.html")))
+        .unwrap()
 }
 
 async fn handle_cors_preflight() -> impl IntoResponse {
