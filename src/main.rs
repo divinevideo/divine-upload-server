@@ -380,6 +380,7 @@ fn resumable_manager(
         ),
         resumable::GcsSessionStore::new(state.gcs_client.clone(), state.config.gcs_bucket.clone()),
         state.config.upload_base_url.clone(),
+        state.config.cdn_base_url.clone(),
         state.config.resumable_chunk_size,
         state.config.resumable_session_ttl_secs,
     )

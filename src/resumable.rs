@@ -58,14 +58,28 @@ pub struct ResumableUploadInitResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteUploadResponse {
-    pub sha256: String,
-    pub size: u64,
-    pub content_type: String,
+#[serde(rename_all = "camelCase")]
+pub struct StreamingInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hls_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mp4_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dim: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteUploadResponse {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<StreamingInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +213,7 @@ pub struct ResumableManager<B, S> {
     backend: B,
     store: S,
     upload_base_url: String,
+    cdn_base_url: String,
     chunk_size: u64,
     session_ttl_secs: u64,
 }
@@ -212,6 +227,7 @@ where
         backend: B,
         store: S,
         upload_base_url: impl Into<String>,
+        cdn_base_url: impl Into<String>,
         chunk_size: u64,
         session_ttl_secs: u64,
     ) -> Self {
@@ -219,6 +235,7 @@ where
             backend,
             store,
             upload_base_url: upload_base_url.into().trim_end_matches('/').to_string(),
+            cdn_base_url: cdn_base_url.into().trim_end_matches('/').to_string(),
             chunk_size,
             session_ttl_secs,
         }
@@ -379,13 +396,10 @@ where
         }
 
         if let Some(finalized_object) = session.finalized_object.as_ref() {
-            return Ok(CompleteUploadResponse {
-                sha256: finalized_object.clone(),
-                size: session.declared_size,
-                content_type: session.content_type.clone(),
-                thumbnail_url: None,
-                dim: None,
-            });
+            return Ok(self.build_complete_upload_response(
+                finalized_object,
+                &session.content_type,
+            ));
         }
 
         let (computed_hash, computed_size) = self
@@ -429,13 +443,7 @@ where
         session.finalized_object = Some(session.final_sha256.clone());
         self.store.save(&session).await.map_err(internal_error)?;
 
-        Ok(CompleteUploadResponse {
-            sha256: session.final_sha256.clone(),
-            size: session.declared_size,
-            content_type: session.content_type.clone(),
-            thumbnail_url: None,
-            dim: None,
-        })
+        Ok(self.build_complete_upload_response(&session.final_sha256, &session.content_type))
     }
 
     pub async fn abort_session(
@@ -494,6 +502,31 @@ where
             let _ = self.backend.delete_object(&session.temp_object).await;
         }
         let _ = self.store.delete(&session.upload_id).await;
+    }
+
+    fn build_complete_upload_response(
+        &self,
+        sha256: &str,
+        content_type: &str,
+    ) -> CompleteUploadResponse {
+        let canonical_url = format!("{}/{}", self.cdn_base_url, sha256);
+        let streaming = if is_video_content_type(content_type) {
+            Some(StreamingInfo {
+                hls_url: None,
+                mp4_url: None,
+                thumbnail_url: None,
+                status: Some("processing".to_string()),
+            })
+        } else {
+            None
+        };
+
+        CompleteUploadResponse {
+            url: canonical_url.clone(),
+            fallback_url: Some(canonical_url),
+            thumbnail: None,
+            streaming,
+        }
     }
 
     async fn hash_temp_object(&self, object_key: &str) -> Result<(String, u64)> {
@@ -850,6 +883,10 @@ fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
     authorization.and_then(|value| value.strip_prefix("Bearer "))
 }
 
+fn is_video_content_type(content_type: &str) -> bool {
+    content_type.starts_with("video/")
+}
+
 fn internal_error(error: anyhow::Error) -> ResumableError {
     ResumableError::Internal(error.to_string())
 }
@@ -992,6 +1029,7 @@ mod tests {
             FakeBackend::default(),
             InMemoryStore::default(),
             "https://upload.divine.video",
+            "https://media.divine.video",
             DEFAULT_RESUMABLE_CHUNK_SIZE,
             DEFAULT_RESUMABLE_SESSION_TTL_SECS,
         )
@@ -1203,5 +1241,67 @@ mod tests {
             .expect_err("non-contiguous chunk should fail");
 
         assert!(matches!(error, ResumableError::RangeNotSatisfiable(_)));
+    }
+
+    #[tokio::test]
+    async fn complete_session_returns_public_descriptor_fields() {
+        let manager = manager();
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                        .to_string(),
+                    size: 5,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("hello.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .expect("final chunk");
+
+        let complete = manager
+            .complete_session(&response.upload_id, "owner_pubkey")
+            .await
+            .expect("complete session");
+        let json = serde_json::to_value(&complete).expect("serialize complete response");
+
+        assert_eq!(
+            complete.url,
+            "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(
+            complete.fallback_url.as_deref(),
+            Some(
+                "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
+        );
+        assert_eq!(
+            json.get("fallbackUrl").and_then(|value| value.as_str()),
+            Some(
+                "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
+        );
+        assert_eq!(
+            json.get("streaming")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("processing")
+        );
     }
 }
