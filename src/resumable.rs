@@ -32,15 +32,19 @@ pub const SESSION_EXPIRES_HEADER: &str = "Upload-Expires";
 pub const SESSION_CHUNK_SIZE_HEADER: &str = "X-Divine-Chunk-Size";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitRequest {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "file_name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitResponse {
     pub upload_id: String,
     pub upload_url: String,
@@ -982,6 +986,43 @@ mod tests {
             DEFAULT_RESUMABLE_CHUNK_SIZE,
             DEFAULT_RESUMABLE_SESSION_TTL_SECS,
         )
+    }
+
+    #[test]
+    fn init_contract_request_accepts_camel_case_fields() {
+        let payload = serde_json::json!({
+            "sha256": "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929",
+            "size": 12,
+            "contentType": "video/mp4",
+            "fileName": "clip.mp4"
+        });
+
+        let request: ResumableUploadInitRequest =
+            serde_json::from_value(payload).expect("camelCase init request should deserialize");
+
+        assert_eq!(request.content_type, "video/mp4");
+        assert_eq!(request.file_name.as_deref(), Some("clip.mp4"));
+    }
+
+    #[test]
+    fn init_contract_response_serializes_camel_case_fields() {
+        let response = ResumableUploadInitResponse {
+            upload_id: "up_123".to_string(),
+            upload_url: "https://upload.divine.video/sessions/up_123".to_string(),
+            expires_at: "2026-03-28T04:00:00Z".to_string(),
+            chunk_size: 8 * 1024 * 1024,
+            next_offset: 0,
+            required_headers: HashMap::new(),
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert!(json.get("uploadId").is_some());
+        assert!(json.get("uploadUrl").is_some());
+        assert!(json.get("expiresAt").is_some());
+        assert!(json.get("chunkSize").is_some());
+        assert!(json.get("nextOffset").is_some());
+        assert!(json.get("upload_id").is_none());
     }
 
     #[tokio::test]
