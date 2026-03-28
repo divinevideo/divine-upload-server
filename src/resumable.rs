@@ -23,6 +23,7 @@ use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const DEFAULT_RESUMABLE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_RESUMABLE_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
@@ -266,7 +267,7 @@ where
         Ok(ResumableUploadInitResponse {
             upload_id: upload_id.clone(),
             upload_url: format!("{}/sessions/{}", self.upload_base_url, upload_id),
-            expires_at: expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(expires_at_epoch_secs),
             chunk_size: self.chunk_size,
             next_offset: 0,
             required_headers,
@@ -283,7 +284,7 @@ where
         Ok(UploadSessionStatus {
             next_offset: session.next_offset,
             declared_size: session.declared_size,
-            expires_at: session.expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
             chunk_size: self.chunk_size,
         })
     }
@@ -341,7 +342,7 @@ where
         Ok(UploadSessionStatus {
             next_offset: session.next_offset,
             declared_size: session.declared_size,
-            expires_at: session.expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
             chunk_size: self.chunk_size,
         })
     }
@@ -837,6 +838,13 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+fn format_epoch_secs_as_rfc3339(epoch_secs: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(epoch_secs as i64)
+        .expect("epoch seconds should produce a valid timestamp")
+        .format(&Rfc3339)
+        .expect("rfc3339 timestamp formatting should succeed")
+}
+
 fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
     authorization.and_then(|value| value.strip_prefix("Bearer "))
 }
@@ -1023,6 +1031,59 @@ mod tests {
         assert!(json.get("chunkSize").is_some());
         assert!(json.get("nextOffset").is_some());
         assert!(json.get("upload_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn rfc3339_expiry_is_used_in_init_response() {
+        let manager = manager();
+
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("video.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+
+        assert!(response.expires_at.contains('T'));
+        assert!(response.expires_at.ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn rfc3339_expiry_is_used_in_session_status() {
+        let manager = manager();
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024 * 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        let head = manager
+            .head_session(&response.upload_id, Some(&auth))
+            .await
+            .expect("head session");
+
+        assert!(head.expires_at.contains('T'));
+        assert!(head.expires_at.ends_with('Z'));
     }
 
     #[tokio::test]
