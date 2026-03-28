@@ -30,6 +30,7 @@ pub const DEFAULT_RESUMABLE_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 pub const SESSION_OFFSET_HEADER: &str = "Upload-Offset";
 pub const SESSION_LENGTH_HEADER: &str = "Upload-Length";
 pub const SESSION_EXPIRES_HEADER: &str = "Upload-Expires";
+pub const SESSION_EXPIRES_AT_HEADER: &str = "Upload-Expires-At";
 pub const SESSION_CHUNK_SIZE_HEADER: &str = "X-Divine-Chunk-Size";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

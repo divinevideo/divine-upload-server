@@ -295,6 +295,32 @@ fn header_value(value: u64) -> HeaderValue {
     HeaderValue::from_str(&value.to_string()).expect("numeric header values must be valid")
 }
 
+fn build_session_status_response(status: resumable::UploadSessionStatus) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response.headers_mut().insert(
+        resumable::SESSION_OFFSET_HEADER,
+        header_value(status.next_offset),
+    );
+    response.headers_mut().insert(
+        resumable::SESSION_LENGTH_HEADER,
+        header_value(status.declared_size),
+    );
+    let expires_at = HeaderValue::from_str(&status.expires_at)
+        .expect("session expiry header must be valid ASCII");
+    response
+        .headers_mut()
+        .insert(resumable::SESSION_EXPIRES_AT_HEADER, expires_at.clone());
+    response
+        .headers_mut()
+        .insert(resumable::SESSION_EXPIRES_HEADER, expires_at);
+    response.headers_mut().insert(
+        resumable::SESSION_CHUNK_SIZE_HEADER,
+        header_value(status.chunk_size),
+    );
+    response
+}
+
 /// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
 /// Google Cloud container logging: JSON on stdout is auto-ingested by Cloud Logging.
 /// This gives us: queryable logs, retention policies, export to BigQuery, alerting.
@@ -399,28 +425,7 @@ async fn handle_session_head(
         )
         .await
     {
-        Ok(status) => {
-            let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            response.headers_mut().insert(
-                resumable::SESSION_OFFSET_HEADER,
-                header_value(status.next_offset),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_LENGTH_HEADER,
-                header_value(status.declared_size),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_EXPIRES_HEADER,
-                HeaderValue::from_str(&status.expires_at)
-                    .expect("session expiry header must be valid ASCII"),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_CHUNK_SIZE_HEADER,
-                header_value(status.chunk_size),
-            );
-            response
-        }
+        Ok(status) => build_session_status_response(status),
         Err(error) => resumable_error_response(error),
     }
 }
@@ -465,28 +470,7 @@ async fn handle_session_chunk(
         )
         .await
     {
-        Ok(status) => {
-            let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            response.headers_mut().insert(
-                resumable::SESSION_OFFSET_HEADER,
-                header_value(status.next_offset),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_LENGTH_HEADER,
-                header_value(status.declared_size),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_EXPIRES_HEADER,
-                HeaderValue::from_str(&status.expires_at)
-                    .expect("session expiry header must be valid ASCII"),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_CHUNK_SIZE_HEADER,
-                header_value(status.chunk_size),
-            );
-            response
-        }
+        Ok(status) => build_session_status_response(status),
         Err(error) => resumable_error_response(error),
     }
 }
@@ -1118,7 +1102,8 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{media_source_candidates, new_temp_media_path};
+    use super::{build_session_status_response, media_source_candidates, new_temp_media_path};
+    use crate::resumable;
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1140,6 +1125,24 @@ mod tests {
         assert_eq!(candidates[0], hash);
         assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
         assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
+    }
+
+    #[test]
+    fn session_responses_include_upload_expires_at_header() {
+        let response = build_session_status_response(resumable::UploadSessionStatus {
+            next_offset: 0,
+            declared_size: 1024,
+            expires_at: "2026-03-28T00:40:00Z".to_string(),
+            chunk_size: 8 * 1024 * 1024,
+        });
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Upload-Expires-At")
+                .expect("contract expiry header"),
+            "2026-03-28T00:40:00Z"
+        );
     }
 }
 
