@@ -148,6 +148,16 @@ struct ErrorResponse {
 
 const BLOSSOM_AUTH_KIND: u32 = 24242;
 
+fn cors_exposed_upload_headers() -> Vec<HeaderName> {
+    vec![
+        HeaderName::from_static("upload-offset"),
+        HeaderName::from_static("upload-length"),
+        HeaderName::from_static("upload-expires"),
+        HeaderName::from_static("upload-expires-at"),
+        HeaderName::from_static("x-divine-chunk-size"),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -183,12 +193,7 @@ async fn main() -> Result<()> {
             header::CONTENT_TYPE,
             header::CONTENT_RANGE,
         ])
-        .expose_headers([
-            HeaderName::from_static("upload-offset"),
-            HeaderName::from_static("upload-length"),
-            HeaderName::from_static("upload-expires"),
-            HeaderName::from_static("x-divine-chunk-size"),
-        ])
+        .expose_headers(cors_exposed_upload_headers())
         .max_age(std::time::Duration::from_secs(86400));
 
     // Build router
@@ -1103,7 +1108,10 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{build_session_status_response, media_source_candidates, new_temp_media_path};
+    use super::{
+        build_session_status_response, cors_exposed_upload_headers, media_source_candidates,
+        new_temp_media_path,
+    };
     use crate::resumable;
 
     #[test]
@@ -1144,6 +1152,13 @@ mod tests {
                 .expect("contract expiry header"),
             "2026-03-28T00:40:00Z"
         );
+    }
+
+    #[test]
+    fn cors_exposes_upload_expires_at_header() {
+        assert!(cors_exposed_upload_headers()
+            .iter()
+            .any(|header| header.as_str() == "upload-expires-at"));
     }
 }
 

@@ -55,6 +55,15 @@ pub struct ResumableUploadInitResponse {
     pub next_offset: u64,
     #[serde(default)]
     pub required_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub capabilities: ResumableCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumableCapabilities {
+    pub resume: bool,
+    pub query_offset: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +298,10 @@ where
             chunk_size: self.chunk_size,
             next_offset: 0,
             required_headers,
+            capabilities: ResumableCapabilities {
+                resume: true,
+                query_offset: true,
+            },
         })
     }
 
@@ -396,10 +409,7 @@ where
         }
 
         if let Some(finalized_object) = session.finalized_object.as_ref() {
-            return Ok(self.build_complete_upload_response(
-                finalized_object,
-                &session.content_type,
-            ));
+            return Ok(self.build_complete_upload_response(finalized_object, &session.content_type));
         }
 
         let (computed_hash, computed_size) = self
@@ -1060,6 +1070,7 @@ mod tests {
             chunk_size: 8 * 1024 * 1024,
             next_offset: 0,
             required_headers: HashMap::new(),
+            capabilities: ResumableCapabilities::default(),
         };
 
         let json = serde_json::to_value(response).expect("serialize response");
@@ -1070,6 +1081,39 @@ mod tests {
         assert!(json.get("chunkSize").is_some());
         assert!(json.get("nextOffset").is_some());
         assert!(json.get("upload_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn init_contract_response_includes_capabilities_flags() {
+        let manager = manager();
+
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("video.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+        let json = serde_json::to_value(response).expect("serialize init response");
+
+        assert_eq!(
+            json.get("capabilities")
+                .and_then(|value| value.get("resume"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            json.get("capabilities")
+                .and_then(|value| value.get("queryOffset"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
     }
 
     #[tokio::test]
