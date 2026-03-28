@@ -14,6 +14,12 @@ Rust upload data plane for Divine Blossom media uploads.
 
 It does not own the Blossom control plane. `divine-blossom` remains the Fastly-facing service that answers client control-plane requests such as `HEAD /upload`, validates Blossom auth, and proxies short `init` and `complete` calls to this service.
 
+In the approved Divine resumable flow:
+
+- `https://media.divine.video` is the client-facing control plane
+- `https://upload.divine.video` is the opaque resumable session data plane
+- `uploadUrl` values returned to clients are server-issued session URLs and must be treated as opaque
+
 ## Runtime Configuration
 
 The service reads configuration from environment variables:
