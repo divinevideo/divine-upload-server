@@ -27,6 +27,7 @@ The service reads configuration from environment variables:
 - `TRANSCRIBER_URL`
 - `RESUMABLE_SESSION_TTL_SECS`
 - `RESUMABLE_CHUNK_SIZE`
+- `RESUMABLE_MAX_REQUEST_BODY_SIZE` to cap advertised chunk size to the real upload-route body limit
 
 ## Development
 

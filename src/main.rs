@@ -57,6 +57,14 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
+        let requested_resumable_chunk_size = env::var("RESUMABLE_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE);
+        let resumable_request_body_limit = env::var("RESUMABLE_MAX_REQUEST_BODY_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok());
+
         Self {
             gcs_bucket: env::var("GCS_BUCKET")
                 .unwrap_or_else(|_| "divine-blossom-media".to_string()),
@@ -79,11 +87,21 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS),
-            resumable_chunk_size: env::var("RESUMABLE_CHUNK_SIZE")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+            resumable_chunk_size: effective_resumable_chunk_size(
+                requested_resumable_chunk_size,
+                resumable_request_body_limit,
+            ),
         }
+    }
+}
+
+fn effective_resumable_chunk_size(
+    configured_chunk_size: u64,
+    route_body_limit: Option<u64>,
+) -> u64 {
+    match route_body_limit {
+        Some(limit) if limit > 0 => configured_chunk_size.min(limit),
+        _ => configured_chunk_size,
     }
 }
 
@@ -1118,7 +1136,9 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{media_source_candidates, new_temp_media_path};
+    use super::{
+        effective_resumable_chunk_size, media_source_candidates, new_temp_media_path,
+    };
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1140,6 +1160,22 @@ mod tests {
         assert_eq!(candidates[0], hash);
         assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
         assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
+    }
+
+    #[test]
+    fn advertised_chunk_size_never_exceeds_route_body_limit() {
+        assert_eq!(
+            effective_resumable_chunk_size(8 * 1024 * 1024, Some(16 * 1024 * 1024)),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_resumable_chunk_size(8 * 1024 * 1024, Some(1024 * 1024)),
+            1024 * 1024
+        );
+        assert_eq!(
+            effective_resumable_chunk_size(8 * 1024 * 1024, None),
+            8 * 1024 * 1024
+        );
     }
 }
 
