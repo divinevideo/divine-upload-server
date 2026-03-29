@@ -33,6 +33,9 @@ The service reads configuration from environment variables:
 - `TRANSCRIBER_URL`
 - `RESUMABLE_SESSION_TTL_SECS`
 - `RESUMABLE_CHUNK_SIZE`
+- `RESUMABLE_MAX_REQUEST_BODY_SIZE`
+
+`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`, so the published chunk contract cannot exceed the actual request-body limit on `upload.divine.video`. The default route limit is `1048576` bytes, matching the current production nginx ingress behavior. `UPLOAD_ROUTE_MAX_BODY_SIZE` is also accepted as a compatibility alias.
 
 ## Development
 

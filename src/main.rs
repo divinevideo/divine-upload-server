@@ -41,6 +41,8 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
+
 // Configuration
 #[derive(Clone)]
 struct Config {
@@ -79,12 +81,38 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS),
-            resumable_chunk_size: env::var("RESUMABLE_CHUNK_SIZE")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+            resumable_chunk_size: resolve_resumable_chunk_size(
+                env::var("RESUMABLE_CHUNK_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value: &u64| *value > 0)
+                    .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+                load_resumable_max_request_body_size(),
+            ),
         }
     }
+}
+
+fn load_resumable_max_request_body_size() -> u64 {
+    [
+        "RESUMABLE_MAX_REQUEST_BODY_SIZE",
+        "UPLOAD_ROUTE_MAX_BODY_SIZE",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &u64| *value > 0)
+    })
+    .unwrap_or(DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE)
+}
+
+fn resolve_resumable_chunk_size(
+    configured_chunk_size: u64,
+    upload_route_max_body_size: u64,
+) -> u64 {
+    configured_chunk_size.min(upload_route_max_body_size)
 }
 
 // App state shared across handlers
@@ -1110,7 +1138,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::{
         build_session_status_response, cors_exposed_upload_headers, media_source_candidates,
-        new_temp_media_path,
+        new_temp_media_path, resolve_resumable_chunk_size,
     };
     use crate::resumable;
 
@@ -1159,6 +1187,22 @@ mod tests {
         assert!(cors_exposed_upload_headers()
             .iter()
             .any(|header| header.as_str() == "upload-expires-at"));
+    }
+
+    #[test]
+    fn advertised_chunk_size_is_capped_to_upload_route_body_limit() {
+        assert_eq!(
+            resolve_resumable_chunk_size(8 * 1024 * 1024, 1024 * 1024),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn advertised_chunk_size_keeps_smaller_configured_value() {
+        assert_eq!(
+            resolve_resumable_chunk_size(512 * 1024, 1024 * 1024),
+            512 * 1024
+        );
     }
 }
 

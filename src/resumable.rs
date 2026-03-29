@@ -1243,6 +1243,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_chunk_accepts_configured_max_chunk_size() {
+        let manager = manager();
+        let declared_size = DEFAULT_RESUMABLE_CHUNK_SIZE * 2;
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: declared_size,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        let status = manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                &format!(
+                    "bytes 0-{}/{}",
+                    DEFAULT_RESUMABLE_CHUNK_SIZE - 1,
+                    declared_size
+                ),
+                Bytes::from(vec![3u8; DEFAULT_RESUMABLE_CHUNK_SIZE as usize]),
+            )
+            .await
+            .expect("max-sized chunk upload");
+
+        assert_eq!(status.next_offset, DEFAULT_RESUMABLE_CHUNK_SIZE);
+        assert_eq!(status.chunk_size, DEFAULT_RESUMABLE_CHUNK_SIZE);
+    }
+
+    #[tokio::test]
     async fn put_session_chunk_rejects_non_contiguous_ranges() {
         let manager = manager();
         let response = manager
