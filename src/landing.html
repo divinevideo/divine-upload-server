@@ -93,9 +93,8 @@
   <div class="subtitle">Blossom media upload server for divine.video</div>
 
   <div class="description">
-    This is the media upload endpoint for the <a href="https://divine.video" style="color:#8888cc;text-decoration:none">divine.video</a> platform.
-    It implements the <a href="https://github.com/hzrd149/blossom" style="color:#8888cc;text-decoration:none">Blossom protocol</a> for
-    content-addressed blob storage, with support for resumable uploads, automatic thumbnail extraction, and video transcoding.
+    This is the resumable upload data plane for the <a href="https://divine.video" style="color:#8888cc;text-decoration:none">divine.video</a> platform.
+    The public Blossom control plane remains on <span class="path">media.divine.video</span>; this host accepts server-issued session URLs and final blob uploads behind that control plane.
   </div>
 
   <div class="endpoints">
@@ -108,7 +107,7 @@
     <div class="endpoint">
       <span class="method method-post">POST</span>
       <span class="path">/upload/init</span>
-      <div class="desc">Initialize a resumable upload session</div>
+      <div class="desc">Internal/proxied resumable session initialization</div>
     </div>
     <div class="endpoint">
       <span class="method method-put">PUT</span>
@@ -123,12 +122,12 @@
     <div class="endpoint">
       <span class="method method-post">POST</span>
       <span class="path">/upload/:id/complete</span>
-      <div class="desc">Finalize a resumable upload</div>
+      <div class="desc">Internal/proxied resumable upload finalization</div>
     </div>
     <div class="endpoint">
       <span class="method method-delete">DELETE</span>
       <span class="path">/upload/:id</span>
-      <div class="desc">Abort a resumable upload</div>
+      <div class="desc">Abort a server-issued resumable upload session</div>
     </div>
   </div>
 

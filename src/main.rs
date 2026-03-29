@@ -41,6 +41,8 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
+
 // Configuration
 #[derive(Clone)]
 struct Config {
@@ -79,12 +81,38 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS),
-            resumable_chunk_size: env::var("RESUMABLE_CHUNK_SIZE")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+            resumable_chunk_size: resolve_resumable_chunk_size(
+                env::var("RESUMABLE_CHUNK_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value: &u64| *value > 0)
+                    .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+                load_resumable_max_request_body_size(),
+            ),
         }
     }
+}
+
+fn load_resumable_max_request_body_size() -> u64 {
+    [
+        "RESUMABLE_MAX_REQUEST_BODY_SIZE",
+        "UPLOAD_ROUTE_MAX_BODY_SIZE",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &u64| *value > 0)
+    })
+    .unwrap_or(DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE)
+}
+
+fn resolve_resumable_chunk_size(
+    configured_chunk_size: u64,
+    upload_route_max_body_size: u64,
+) -> u64 {
+    configured_chunk_size.min(upload_route_max_body_size)
 }
 
 // App state shared across handlers
@@ -148,6 +176,16 @@ struct ErrorResponse {
 
 const BLOSSOM_AUTH_KIND: u32 = 24242;
 
+fn cors_exposed_upload_headers() -> Vec<HeaderName> {
+    vec![
+        HeaderName::from_static("upload-offset"),
+        HeaderName::from_static("upload-length"),
+        HeaderName::from_static("upload-expires"),
+        HeaderName::from_static("upload-expires-at"),
+        HeaderName::from_static("x-divine-chunk-size"),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -183,12 +221,7 @@ async fn main() -> Result<()> {
             header::CONTENT_TYPE,
             header::CONTENT_RANGE,
         ])
-        .expose_headers([
-            HeaderName::from_static("upload-offset"),
-            HeaderName::from_static("upload-length"),
-            HeaderName::from_static("upload-expires"),
-            HeaderName::from_static("x-divine-chunk-size"),
-        ])
+        .expose_headers(cors_exposed_upload_headers())
         .max_age(std::time::Duration::from_secs(86400));
 
     // Build router
@@ -295,6 +328,32 @@ fn header_value(value: u64) -> HeaderValue {
     HeaderValue::from_str(&value.to_string()).expect("numeric header values must be valid")
 }
 
+fn build_session_status_response(status: resumable::UploadSessionStatus) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response.headers_mut().insert(
+        resumable::SESSION_OFFSET_HEADER,
+        header_value(status.next_offset),
+    );
+    response.headers_mut().insert(
+        resumable::SESSION_LENGTH_HEADER,
+        header_value(status.declared_size),
+    );
+    let expires_at = HeaderValue::from_str(&status.expires_at)
+        .expect("session expiry header must be valid ASCII");
+    response
+        .headers_mut()
+        .insert(resumable::SESSION_EXPIRES_AT_HEADER, expires_at.clone());
+    response
+        .headers_mut()
+        .insert(resumable::SESSION_EXPIRES_HEADER, expires_at);
+    response.headers_mut().insert(
+        resumable::SESSION_CHUNK_SIZE_HEADER,
+        header_value(status.chunk_size),
+    );
+    response
+}
+
 /// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
 /// Google Cloud container logging: JSON on stdout is auto-ingested by Cloud Logging.
 /// This gives us: queryable logs, retention policies, export to BigQuery, alerting.
@@ -354,6 +413,7 @@ fn resumable_manager(
         ),
         resumable::GcsSessionStore::new(state.gcs_client.clone(), state.config.gcs_bucket.clone()),
         state.config.upload_base_url.clone(),
+        state.config.cdn_base_url.clone(),
         state.config.resumable_chunk_size,
         state.config.resumable_session_ttl_secs,
     )
@@ -399,28 +459,7 @@ async fn handle_session_head(
         )
         .await
     {
-        Ok(status) => {
-            let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            response.headers_mut().insert(
-                resumable::SESSION_OFFSET_HEADER,
-                header_value(status.next_offset),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_LENGTH_HEADER,
-                header_value(status.declared_size),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_EXPIRES_HEADER,
-                HeaderValue::from_str(&status.expires_at)
-                    .expect("session expiry header must be valid ASCII"),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_CHUNK_SIZE_HEADER,
-                header_value(status.chunk_size),
-            );
-            response
-        }
+        Ok(status) => build_session_status_response(status),
         Err(error) => resumable_error_response(error),
     }
 }
@@ -465,28 +504,7 @@ async fn handle_session_chunk(
         )
         .await
     {
-        Ok(status) => {
-            let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            response.headers_mut().insert(
-                resumable::SESSION_OFFSET_HEADER,
-                header_value(status.next_offset),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_LENGTH_HEADER,
-                header_value(status.declared_size),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_EXPIRES_HEADER,
-                HeaderValue::from_str(&status.expires_at)
-                    .expect("session expiry header must be valid ASCII"),
-            );
-            response.headers_mut().insert(
-                resumable::SESSION_CHUNK_SIZE_HEADER,
-                header_value(status.chunk_size),
-            );
-            response
-        }
+        Ok(status) => build_session_status_response(status),
         Err(error) => resumable_error_response(error),
     }
 }
@@ -1118,7 +1136,11 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{media_source_candidates, new_temp_media_path};
+    use super::{
+        build_session_status_response, cors_exposed_upload_headers, media_source_candidates,
+        new_temp_media_path, resolve_resumable_chunk_size,
+    };
+    use crate::resumable;
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1140,6 +1162,47 @@ mod tests {
         assert_eq!(candidates[0], hash);
         assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
         assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
+    }
+
+    #[test]
+    fn session_responses_include_upload_expires_at_header() {
+        let response = build_session_status_response(resumable::UploadSessionStatus {
+            next_offset: 0,
+            declared_size: 1024,
+            expires_at: "2026-03-28T00:40:00Z".to_string(),
+            chunk_size: 8 * 1024 * 1024,
+        });
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Upload-Expires-At")
+                .expect("contract expiry header"),
+            "2026-03-28T00:40:00Z"
+        );
+    }
+
+    #[test]
+    fn cors_exposes_upload_expires_at_header() {
+        assert!(cors_exposed_upload_headers()
+            .iter()
+            .any(|header| header.as_str() == "upload-expires-at"));
+    }
+
+    #[test]
+    fn advertised_chunk_size_is_capped_to_upload_route_body_limit() {
+        assert_eq!(
+            resolve_resumable_chunk_size(8 * 1024 * 1024, 1024 * 1024),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn advertised_chunk_size_keeps_smaller_configured_value() {
+        assert_eq!(
+            resolve_resumable_chunk_size(512 * 1024, 1024 * 1024),
+            512 * 1024
+        );
     }
 }
 

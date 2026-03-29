@@ -23,24 +23,30 @@ use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const DEFAULT_RESUMABLE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_RESUMABLE_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 pub const SESSION_OFFSET_HEADER: &str = "Upload-Offset";
 pub const SESSION_LENGTH_HEADER: &str = "Upload-Length";
 pub const SESSION_EXPIRES_HEADER: &str = "Upload-Expires";
+pub const SESSION_EXPIRES_AT_HEADER: &str = "Upload-Expires-At";
 pub const SESSION_CHUNK_SIZE_HEADER: &str = "X-Divine-Chunk-Size";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitRequest {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "file_name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitResponse {
     pub upload_id: String,
     pub upload_url: String,
@@ -49,17 +55,40 @@ pub struct ResumableUploadInitResponse {
     pub next_offset: u64,
     #[serde(default)]
     pub required_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub capabilities: ResumableCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumableCapabilities {
+    pub resume: bool,
+    pub query_offset: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteUploadResponse {
-    pub sha256: String,
-    pub size: u64,
-    pub content_type: String,
+#[serde(rename_all = "camelCase")]
+pub struct StreamingInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hls_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mp4_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dim: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteUploadResponse {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<StreamingInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +222,7 @@ pub struct ResumableManager<B, S> {
     backend: B,
     store: S,
     upload_base_url: String,
+    cdn_base_url: String,
     chunk_size: u64,
     session_ttl_secs: u64,
 }
@@ -206,6 +236,7 @@ where
         backend: B,
         store: S,
         upload_base_url: impl Into<String>,
+        cdn_base_url: impl Into<String>,
         chunk_size: u64,
         session_ttl_secs: u64,
     ) -> Self {
@@ -213,6 +244,7 @@ where
             backend,
             store,
             upload_base_url: upload_base_url.into().trim_end_matches('/').to_string(),
+            cdn_base_url: cdn_base_url.into().trim_end_matches('/').to_string(),
             chunk_size,
             session_ttl_secs,
         }
@@ -262,10 +294,14 @@ where
         Ok(ResumableUploadInitResponse {
             upload_id: upload_id.clone(),
             upload_url: format!("{}/sessions/{}", self.upload_base_url, upload_id),
-            expires_at: expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(expires_at_epoch_secs),
             chunk_size: self.chunk_size,
             next_offset: 0,
             required_headers,
+            capabilities: ResumableCapabilities {
+                resume: true,
+                query_offset: true,
+            },
         })
     }
 
@@ -279,7 +315,7 @@ where
         Ok(UploadSessionStatus {
             next_offset: session.next_offset,
             declared_size: session.declared_size,
-            expires_at: session.expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
             chunk_size: self.chunk_size,
         })
     }
@@ -337,7 +373,7 @@ where
         Ok(UploadSessionStatus {
             next_offset: session.next_offset,
             declared_size: session.declared_size,
-            expires_at: session.expires_at_epoch_secs.to_string(),
+            expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
             chunk_size: self.chunk_size,
         })
     }
@@ -373,13 +409,7 @@ where
         }
 
         if let Some(finalized_object) = session.finalized_object.as_ref() {
-            return Ok(CompleteUploadResponse {
-                sha256: finalized_object.clone(),
-                size: session.declared_size,
-                content_type: session.content_type.clone(),
-                thumbnail_url: None,
-                dim: None,
-            });
+            return Ok(self.build_complete_upload_response(finalized_object, &session.content_type));
         }
 
         let (computed_hash, computed_size) = self
@@ -423,13 +453,7 @@ where
         session.finalized_object = Some(session.final_sha256.clone());
         self.store.save(&session).await.map_err(internal_error)?;
 
-        Ok(CompleteUploadResponse {
-            sha256: session.final_sha256.clone(),
-            size: session.declared_size,
-            content_type: session.content_type.clone(),
-            thumbnail_url: None,
-            dim: None,
-        })
+        Ok(self.build_complete_upload_response(&session.final_sha256, &session.content_type))
     }
 
     pub async fn abort_session(
@@ -488,6 +512,31 @@ where
             let _ = self.backend.delete_object(&session.temp_object).await;
         }
         let _ = self.store.delete(&session.upload_id).await;
+    }
+
+    fn build_complete_upload_response(
+        &self,
+        sha256: &str,
+        content_type: &str,
+    ) -> CompleteUploadResponse {
+        let canonical_url = format!("{}/{}", self.cdn_base_url, sha256);
+        let streaming = if is_video_content_type(content_type) {
+            Some(StreamingInfo {
+                hls_url: None,
+                mp4_url: None,
+                thumbnail_url: None,
+                status: Some("processing".to_string()),
+            })
+        } else {
+            None
+        };
+
+        CompleteUploadResponse {
+            url: canonical_url.clone(),
+            fallback_url: Some(canonical_url),
+            thumbnail: None,
+            streaming,
+        }
     }
 
     async fn hash_temp_object(&self, object_key: &str) -> Result<(String, u64)> {
@@ -833,8 +882,19 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+fn format_epoch_secs_as_rfc3339(epoch_secs: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(epoch_secs as i64)
+        .expect("epoch seconds should produce a valid timestamp")
+        .format(&Rfc3339)
+        .expect("rfc3339 timestamp formatting should succeed")
+}
+
 fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
     authorization.and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn is_video_content_type(content_type: &str) -> bool {
+    content_type.starts_with("video/")
 }
 
 fn internal_error(error: anyhow::Error) -> ResumableError {
@@ -979,9 +1039,134 @@ mod tests {
             FakeBackend::default(),
             InMemoryStore::default(),
             "https://upload.divine.video",
+            "https://media.divine.video",
             DEFAULT_RESUMABLE_CHUNK_SIZE,
             DEFAULT_RESUMABLE_SESSION_TTL_SECS,
         )
+    }
+
+    #[test]
+    fn init_contract_request_accepts_camel_case_fields() {
+        let payload = serde_json::json!({
+            "sha256": "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929",
+            "size": 12,
+            "contentType": "video/mp4",
+            "fileName": "clip.mp4"
+        });
+
+        let request: ResumableUploadInitRequest =
+            serde_json::from_value(payload).expect("camelCase init request should deserialize");
+
+        assert_eq!(request.content_type, "video/mp4");
+        assert_eq!(request.file_name.as_deref(), Some("clip.mp4"));
+    }
+
+    #[test]
+    fn init_contract_response_serializes_camel_case_fields() {
+        let response = ResumableUploadInitResponse {
+            upload_id: "up_123".to_string(),
+            upload_url: "https://upload.divine.video/sessions/up_123".to_string(),
+            expires_at: "2026-03-28T04:00:00Z".to_string(),
+            chunk_size: 8 * 1024 * 1024,
+            next_offset: 0,
+            required_headers: HashMap::new(),
+            capabilities: ResumableCapabilities::default(),
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert!(json.get("uploadId").is_some());
+        assert!(json.get("uploadUrl").is_some());
+        assert!(json.get("expiresAt").is_some());
+        assert!(json.get("chunkSize").is_some());
+        assert!(json.get("nextOffset").is_some());
+        assert!(json.get("upload_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn init_contract_response_includes_capabilities_flags() {
+        let manager = manager();
+
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("video.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+        let json = serde_json::to_value(response).expect("serialize init response");
+
+        assert_eq!(
+            json.get("capabilities")
+                .and_then(|value| value.get("resume"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            json.get("capabilities")
+                .and_then(|value| value.get("queryOffset"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc3339_expiry_is_used_in_init_response() {
+        let manager = manager();
+
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("video.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+
+        assert!(response.expires_at.contains('T'));
+        assert!(response.expires_at.ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn rfc3339_expiry_is_used_in_session_status() {
+        let manager = manager();
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: 1024 * 1024,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        let head = manager
+            .head_session(&response.upload_id, Some(&auth))
+            .await
+            .expect("head session");
+
+        assert!(head.expires_at.contains('T'));
+        assert!(head.expires_at.ends_with('Z'));
     }
 
     #[tokio::test]
@@ -1058,6 +1243,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_chunk_accepts_configured_max_chunk_size() {
+        let manager = manager();
+        let declared_size = DEFAULT_RESUMABLE_CHUNK_SIZE * 2;
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929"
+                        .to_string(),
+                    size: declared_size,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        let status = manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                &format!(
+                    "bytes 0-{}/{}",
+                    DEFAULT_RESUMABLE_CHUNK_SIZE - 1,
+                    declared_size
+                ),
+                Bytes::from(vec![3u8; DEFAULT_RESUMABLE_CHUNK_SIZE as usize]),
+            )
+            .await
+            .expect("max-sized chunk upload");
+
+        assert_eq!(status.next_offset, DEFAULT_RESUMABLE_CHUNK_SIZE);
+        assert_eq!(status.chunk_size, DEFAULT_RESUMABLE_CHUNK_SIZE);
+    }
+
+    #[tokio::test]
     async fn put_session_chunk_rejects_non_contiguous_ranges() {
         let manager = manager();
         let response = manager
@@ -1100,5 +1326,67 @@ mod tests {
             .expect_err("non-contiguous chunk should fail");
 
         assert!(matches!(error, ResumableError::RangeNotSatisfiable(_)));
+    }
+
+    #[tokio::test]
+    async fn complete_session_returns_public_descriptor_fields() {
+        let manager = manager();
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                        .to_string(),
+                    size: 5,
+                    content_type: "video/mp4".to_string(),
+                    file_name: Some("hello.mp4".to_string()),
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+
+        manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .expect("final chunk");
+
+        let complete = manager
+            .complete_session(&response.upload_id, "owner_pubkey")
+            .await
+            .expect("complete session");
+        let json = serde_json::to_value(&complete).expect("serialize complete response");
+
+        assert_eq!(
+            complete.url,
+            "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(
+            complete.fallback_url.as_deref(),
+            Some(
+                "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
+        );
+        assert_eq!(
+            json.get("fallbackUrl").and_then(|value| value.as_str()),
+            Some(
+                "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
+        );
+        assert_eq!(
+            json.get("streaming")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("processing")
+        );
     }
 }

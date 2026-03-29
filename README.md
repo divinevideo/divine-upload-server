@@ -14,6 +14,12 @@ Rust upload data plane for Divine Blossom media uploads.
 
 It does not own the Blossom control plane. `divine-blossom` remains the Fastly-facing service that answers client control-plane requests such as `HEAD /upload`, validates Blossom auth, and proxies short `init` and `complete` calls to this service.
 
+In the approved Divine resumable flow:
+
+- `https://media.divine.video` is the client-facing control plane
+- `https://upload.divine.video` is the opaque resumable session data plane
+- `uploadUrl` values returned to clients are server-issued session URLs and must be treated as opaque
+
 ## Runtime Configuration
 
 The service reads configuration from environment variables:
@@ -27,6 +33,9 @@ The service reads configuration from environment variables:
 - `TRANSCRIBER_URL`
 - `RESUMABLE_SESSION_TTL_SECS`
 - `RESUMABLE_CHUNK_SIZE`
+- `RESUMABLE_MAX_REQUEST_BODY_SIZE`
+
+`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`, so the published chunk contract cannot exceed the actual request-body limit on `upload.divine.video`. The default route limit is `1048576` bytes, matching the current production nginx ingress behavior. `UPLOAD_ROUTE_MAX_BODY_SIZE` is also accepted as a compatibility alias.
 
 ## Development
 
