@@ -82,6 +82,13 @@ pub struct StreamingInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteUploadResponse {
+    pub sha256: String,
+    pub size: u64,
+    pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_url: Option<String>,
@@ -409,7 +416,11 @@ where
         }
 
         if let Some(finalized_object) = session.finalized_object.as_ref() {
-            return Ok(self.build_complete_upload_response(finalized_object, &session.content_type));
+            return Ok(self.build_complete_upload_response(
+                finalized_object,
+                session.declared_size,
+                &session.content_type,
+            ));
         }
 
         let (computed_hash, computed_size) = self
@@ -453,7 +464,11 @@ where
         session.finalized_object = Some(session.final_sha256.clone());
         self.store.save(&session).await.map_err(internal_error)?;
 
-        Ok(self.build_complete_upload_response(&session.final_sha256, &session.content_type))
+        Ok(self.build_complete_upload_response(
+            &session.final_sha256,
+            session.declared_size,
+            &session.content_type,
+        ))
     }
 
     pub async fn abort_session(
@@ -517,6 +532,7 @@ where
     fn build_complete_upload_response(
         &self,
         sha256: &str,
+        size: u64,
         content_type: &str,
     ) -> CompleteUploadResponse {
         let canonical_url = format!("{}/{}", self.cdn_base_url, sha256);
@@ -532,6 +548,11 @@ where
         };
 
         CompleteUploadResponse {
+            sha256: sha256.to_string(),
+            size,
+            content_type: content_type.to_string(),
+            thumbnail_url: None,
+            dim: None,
             url: canonical_url.clone(),
             fallback_url: Some(canonical_url),
             thumbnail: None,
@@ -1384,6 +1405,15 @@ mod tests {
         assert_eq!(
             complete.url,
             "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(
+            json.get("sha256").and_then(|value| value.as_str()),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        assert_eq!(json.get("size").and_then(|value| value.as_u64()), Some(5));
+        assert_eq!(
+            json.get("contentType").and_then(|value| value.as_str()),
+            Some("video/mp4")
         );
         assert_eq!(
             complete.fallback_url.as_deref(),
