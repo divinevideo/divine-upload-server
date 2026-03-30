@@ -655,6 +655,24 @@ impl GcsResumableBackend {
     }
 }
 
+fn final_copy_metadata_object(
+    bucket: &str,
+    destination_key: &str,
+    content_type: &str,
+    owner: &str,
+) -> Object {
+    let mut metadata_map = HashMap::new();
+    metadata_map.insert("owner".to_string(), owner.to_string());
+
+    Object {
+        bucket: bucket.to_string(),
+        name: destination_key.to_string(),
+        content_type: Some(content_type.to_string()),
+        metadata: Some(metadata_map),
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl ResumableBackend for GcsResumableBackend {
     async fn create_session(
@@ -766,9 +784,6 @@ impl ResumableBackend for GcsResumableBackend {
         content_type: &str,
         owner: &str,
     ) -> Result<()> {
-        let mut metadata_map = HashMap::new();
-        metadata_map.insert("owner".to_string(), owner.to_string());
-
         self.client
             .copy_object(&CopyObjectRequest {
                 source_bucket: self.bucket.clone(),
@@ -776,12 +791,12 @@ impl ResumableBackend for GcsResumableBackend {
                 destination_bucket: self.bucket.clone(),
                 destination_object: destination_key.to_string(),
                 if_generation_match: Some(0),
-                metadata: Some(Object {
-                    name: destination_key.to_string(),
-                    content_type: Some(content_type.to_string()),
-                    metadata: Some(metadata_map),
-                    ..Default::default()
-                }),
+                metadata: Some(final_copy_metadata_object(
+                    &self.bucket,
+                    destination_key,
+                    content_type,
+                    owner,
+                )),
                 ..Default::default()
             })
             .await
@@ -1387,6 +1402,28 @@ mod tests {
                 .and_then(|value| value.get("status"))
                 .and_then(|value| value.as_str()),
             Some("processing")
+        );
+    }
+
+    #[test]
+    fn final_copy_metadata_includes_destination_bucket() {
+        let metadata = final_copy_metadata_object(
+            "divine-blossom-media",
+            "deadbeef",
+            "video/mp4",
+            "owner_pubkey",
+        );
+
+        assert_eq!(metadata.bucket, "divine-blossom-media");
+        assert_eq!(metadata.name, "deadbeef");
+        assert_eq!(metadata.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(
+            metadata
+                .metadata
+                .as_ref()
+                .and_then(|map| map.get("owner"))
+                .map(String::as_str),
+            Some("owner_pubkey")
         );
     }
 }
