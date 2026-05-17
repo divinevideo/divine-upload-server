@@ -24,7 +24,7 @@ env:
 jobs:
   verify:
     name: Verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-16core
     permissions:
       contents: read
     steps:
@@ -60,7 +60,7 @@ jobs:
 
   docker:
     name: Publish Production Image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-16core
     needs: [verify]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
