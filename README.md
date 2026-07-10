@@ -63,3 +63,7 @@ The current media follow-up path still points at the existing transcoder endpoin
 The repository CI workflow builds and tests on pull requests, then publishes `divine-upload-server` to `us-central1-docker.pkg.dev/dv-platform-prod/containers-production` on pushes to `main`.
 
 `export-video-upload-hashes.py` queries both the legacy Cloud Run audit logs and the GKE `k8s_container` audit logs so historic exports continue to work across the migration.
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
