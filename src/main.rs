@@ -186,6 +186,22 @@ fn cors_exposed_upload_headers() -> Vec<HeaderName> {
     ]
 }
 
+/// Request headers the browser preflight must allow for uploads to succeed.
+///
+/// Blossom clients (BUD-02/06) send the blob hash in `x-sha256`; without it in
+/// the allow-list the CORS preflight blocks the upload ("Failed to fetch").
+/// Kept in sync with the main blossom server's allow-list so a client header is
+/// never accepted there but rejected here.
+fn cors_allowed_request_headers() -> Vec<HeaderName> {
+    vec![
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::CONTENT_RANGE,
+        HeaderName::from_static("x-sha256"),
+        HeaderName::from_static("x-request-id"),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -216,11 +232,7 @@ async fn main() -> Result<()> {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::CONTENT_RANGE,
-        ])
+        .allow_headers(cors_allowed_request_headers())
         .expose_headers(cors_exposed_upload_headers())
         .max_age(std::time::Duration::from_secs(86400));
 
@@ -1137,8 +1149,8 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        build_session_status_response, cors_exposed_upload_headers, media_source_candidates,
-        new_temp_media_path, resolve_resumable_chunk_size,
+        build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
+        media_source_candidates, new_temp_media_path, resolve_resumable_chunk_size,
     };
     use crate::resumable;
 
@@ -1187,6 +1199,25 @@ mod tests {
         assert!(cors_exposed_upload_headers()
             .iter()
             .any(|header| header.as_str() == "upload-expires-at"));
+    }
+
+    #[test]
+    fn cors_allows_blossom_upload_request_headers() {
+        let headers = cors_allowed_request_headers();
+        let allowed: Vec<&str> = headers.iter().map(|header| header.as_str()).collect();
+
+        for expected in [
+            "authorization",
+            "content-type",
+            "content-range",
+            "x-sha256",
+            "x-request-id",
+        ] {
+            assert!(
+                allowed.contains(&expected),
+                "missing CORS request header: {expected}",
+            );
+        }
     }
 
     #[test]
