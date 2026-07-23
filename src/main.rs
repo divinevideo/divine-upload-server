@@ -7,7 +7,7 @@ mod thumbnail;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, head, options, post, put},
@@ -258,6 +258,8 @@ async fn main() -> Result<()> {
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
+        .route("/transcribe", post(handle_transcribe))
+        .route("/transcribe", options(handle_cors_preflight))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", get(handle_landing))
@@ -1151,8 +1153,21 @@ mod tests {
     use super::{
         build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
         media_source_candidates, new_temp_media_path, resolve_resumable_chunk_size,
+        transcribe_audio_url,
     };
     use crate::resumable;
+
+    #[test]
+    fn transcribe_audio_url_appends_path_and_trims_trailing_slash() {
+        assert_eq!(
+            transcribe_audio_url("https://transcoder.example"),
+            "https://transcoder.example/transcribe/audio"
+        );
+        assert_eq!(
+            transcribe_audio_url("https://transcoder.example/"),
+            "https://transcoder.example/transcribe/audio"
+        );
+    }
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1402,6 +1417,122 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
         let body = response.text().await.unwrap_or_default();
         Err(anyhow!("Transcoder returned error {}: {}", status, body))
     }
+}
+
+/// Max audio body accepted by `POST /transcribe`. Matches the transcoder's own
+/// `/transcribe/audio` cap so we reject oversize bodies at the edge instead of
+/// buffering them just to have the transcoder refuse.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 100 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct TranscribeParams {
+    /// Optional BCP-47 recognition-language hint, forwarded to the transcoder.
+    language: Option<String>,
+}
+
+/// POST /transcribe — authenticated proxy for synchronous audio transcription.
+///
+/// The editor posts extracted clip audio here (Blossom kind-24242 auth,
+/// `t=media`) and gets WebVTT back. We forward the bytes to the private
+/// transcoder's `/transcribe/audio` (the same service the by-hash flow uses)
+/// and pass its response straight through.
+///
+/// NOTE (blocking, see PR): this path is **not** rate limited and the
+/// transcoder does not cache by audio hash — every call is an uncached,
+/// billable provider request. A per-pubkey throttle here plus an audio-hash
+/// result cache in the transcoder must land before this leaves draft.
+async fn handle_transcribe(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<TranscribeParams>,
+    body: Body,
+) -> Response {
+    if let Err(error) = validate_auth(&headers, "media") {
+        return auth_error_response(error);
+    }
+
+    let Some(transcriber_url) = state.config.transcriber_url.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Transcription is not configured",
+        )
+            .into_response();
+    };
+
+    let audio = match axum::body::to_bytes(body, MAX_TRANSCRIBE_AUDIO_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Audio exceeds {} bytes", MAX_TRANSCRIBE_AUDIO_BYTES),
+            )
+                .into_response()
+        }
+    };
+    if audio.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
+    }
+
+    match proxy_transcribe_audio(&transcriber_url, audio, params.language.as_deref()).await {
+        Ok((status, content_type, body)) => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            response
+        }
+        Err(error) => {
+            error!("Transcribe proxy failed: {}", error);
+            (StatusCode::BAD_GATEWAY, "Transcription service unavailable").into_response()
+        }
+    }
+}
+
+/// Builds the transcoder's `/transcribe/audio` URL, tolerating a trailing
+/// slash on the configured base URL.
+fn transcribe_audio_url(transcriber_url: &str) -> String {
+    format!("{}/transcribe/audio", transcriber_url.trim_end_matches('/'))
+}
+
+/// Forwards [audio] to the transcoder's `/transcribe/audio`, returning its
+/// status, content-type, and body verbatim so WebVTT (or an error) passes
+/// straight back to the caller.
+async fn proxy_transcribe_audio(
+    transcriber_url: &str,
+    audio: Bytes,
+    language: Option<&str>,
+) -> Result<(StatusCode, String, Bytes)> {
+    let url = transcribe_audio_url(transcriber_url);
+    let lang = language.map(str::trim).filter(|lang| !lang.is_empty());
+
+    let mut request = reqwest::Client::new()
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+        .body(audio);
+    if let Some(lang) = lang {
+        request = request.query(&[("language", lang)]);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to call transcriber: {}", e))?;
+
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/vtt; charset=utf-8")
+        .to_string();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("Failed to read transcriber response: {}", e))?;
+
+    Ok((status, content_type, body))
 }
 
 /// Trigger transcript generation for audio/video (fire-and-forget)
