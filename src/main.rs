@@ -53,6 +53,10 @@ struct Config {
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
     transcriber_url: Option<String>,
+    /// Shared secret the transcoder requires on `/transcribe/audio`. Injected
+    /// on every proxied transcription so the transcoder can trust the request
+    /// already passed this service's Nostr auth.
+    transcribe_shared_secret: Option<String>,
     resumable_session_ttl_secs: u64,
     resumable_chunk_size: u64,
 }
@@ -77,6 +81,10 @@ impl Config {
             transcriber_url: env::var("TRANSCRIBER_URL")
                 .ok()
                 .or_else(|| env::var("TRANSCODER_URL").ok()),
+            transcribe_shared_secret: env::var("TRANSCRIBE_SHARED_SECRET")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             resumable_session_ttl_secs: env::var("RESUMABLE_SESSION_TTL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1473,7 +1481,14 @@ async fn handle_transcribe(
         return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
     }
 
-    match proxy_transcribe_audio(&transcriber_url, audio, params.language.as_deref()).await {
+    match proxy_transcribe_audio(
+        &transcriber_url,
+        state.config.transcribe_shared_secret.as_deref(),
+        audio,
+        params.language.as_deref(),
+    )
+    .await
+    {
         Ok((status, content_type, body)) => {
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
@@ -1495,11 +1510,20 @@ fn transcribe_audio_url(transcriber_url: &str) -> String {
     format!("{}/transcribe/audio", transcriber_url.trim_end_matches('/'))
 }
 
+/// Header carrying the shared secret the transcoder requires on
+/// `/transcribe/audio` (that service is `--allow-unauthenticated`).
+const TRANSCRIBE_SECRET_HEADER: &str = "X-Divine-Transcribe-Secret";
+
 /// Forwards [audio] to the transcoder's `/transcribe/audio`, returning its
 /// status, content-type, and body verbatim so WebVTT (or an error) passes
 /// straight back to the caller.
+///
+/// [secret] is injected as the transcoder's shared-secret header; this is what
+/// lets the transcoder trust that the request already passed this service's
+/// Nostr auth. When it is `None` the transcoder fails closed (503).
 async fn proxy_transcribe_audio(
     transcriber_url: &str,
+    secret: Option<&str>,
     audio: Bytes,
     language: Option<&str>,
 ) -> Result<(StatusCode, String, Bytes)> {
@@ -1512,6 +1536,9 @@ async fn proxy_transcribe_audio(
         .body(audio);
     if let Some(lang) = lang {
         request = request.query(&[("language", lang)]);
+    }
+    if let Some(secret) = secret {
+        request = request.header(TRANSCRIBE_SECRET_HEADER, secret);
     }
 
     let response = request
