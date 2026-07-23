@@ -127,6 +127,9 @@ fn resolve_resumable_chunk_size(
 struct AppState {
     gcs_client: GcsClient,
     config: Config,
+    /// Shared HTTP client with explicit timeouts, so a stalled downstream
+    /// (e.g. the transcoder) can't pin an inbound request indefinitely.
+    http_client: reqwest::Client,
 }
 
 // Nostr auth event structure
@@ -227,7 +230,17 @@ async fn main() -> Result<()> {
     let gcs_config = ClientConfig::default().with_auth().await?;
     let gcs_client = GcsClient::new(gcs_config);
 
-    let state = Arc::new(AppState { gcs_client, config });
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let state = Arc::new(AppState {
+        gcs_client,
+        config,
+        http_client,
+    });
 
     // CORS configuration
     let cors = CorsLayer::new()
@@ -1427,10 +1440,11 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
     }
 }
 
-/// Max audio body accepted by `POST /transcribe`. Matches the transcoder's own
-/// `/transcribe/audio` cap so we reject oversize bodies at the edge instead of
-/// buffering them just to have the transcoder refuse.
-const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 100 * 1024 * 1024;
+/// Max audio body accepted by `POST /transcribe`. Bounded by the production
+/// NGINX ingress (`client_max_body_size 16m`): anything larger is rejected
+/// before it reaches this handler, so a higher limit here would be a lie.
+/// Editor clip audio (16 kHz mono PCM, ~32 KB/s) is far under this.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct TranscribeParams {
@@ -1455,8 +1469,19 @@ async fn handle_transcribe(
     Query(params): Query<TranscribeParams>,
     body: Body,
 ) -> Response {
-    if let Err(error) = validate_auth(&headers, "media") {
-        return auth_error_response(error);
+    let auth_event = match validate_auth(&headers, "media") {
+        Ok(event) => event,
+        Err(error) => return auth_error_response(error),
+    };
+    // BUD-11: a transcription token must expire. `validate_auth` only checks
+    // the `expiration` tag when present, so a token without one would be valid
+    // forever — reject it here on this billable route.
+    if get_tag_value(&auth_event.tags, "expiration").is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Authorization must include an expiration tag",
+        )
+            .into_response();
     }
 
     let Some(transcriber_url) = state.config.transcriber_url.clone() else {
@@ -1482,6 +1507,7 @@ async fn handle_transcribe(
     }
 
     match proxy_transcribe_audio(
+        &state.http_client,
         &transcriber_url,
         state.config.transcribe_shared_secret.as_deref(),
         audio,
@@ -1522,6 +1548,7 @@ const TRANSCRIBE_SECRET_HEADER: &str = "X-Divine-Transcribe-Secret";
 /// lets the transcoder trust that the request already passed this service's
 /// Nostr auth. When it is `None` the transcoder fails closed (503).
 async fn proxy_transcribe_audio(
+    client: &reqwest::Client,
     transcriber_url: &str,
     secret: Option<&str>,
     audio: Bytes,
@@ -1530,7 +1557,7 @@ async fn proxy_transcribe_audio(
     let url = transcribe_audio_url(transcriber_url);
     let lang = language.map(str::trim).filter(|lang| !lang.is_empty());
 
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "audio/wav")
         .body(audio);
