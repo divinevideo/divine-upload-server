@@ -27,7 +27,8 @@ use google_cloud_storage::{
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use k256::schnorr::{
-    signature::hazmat::PrehashVerifier, signature::Signer, Signature, SigningKey, VerifyingKey,
+    signature::hazmat::{PrehashSigner, PrehashVerifier},
+    Signature, SigningKey, VerifyingKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1189,12 +1190,94 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
-        decode_auth_event, media_source_candidates, new_temp_media_path, proxy_transcribe_audio,
-        resolve_resumable_chunk_size, server_tag_host, transcribe_audio_url,
-        transcribe_server_tag_allowed,
+        build_session_status_response, compute_event_id, cors_allowed_request_headers,
+        cors_exposed_upload_headers, decode_auth_event, handle_transcribe, media_source_candidates,
+        new_temp_media_path, proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
+        transcribe_audio_url, transcribe_server_tag_allowed, AppState, Config, GcsClient,
+        NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
     use crate::resumable;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{header, HeaderValue, StatusCode};
+    use google_cloud_storage::client::ClientConfig;
+    use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
+        Arc::new(AppState {
+            gcs_client: GcsClient::new(ClientConfig::default().anonymous()),
+            config: Config {
+                gcs_bucket: "test-bucket".to_string(),
+                cdn_base_url: "https://media.divine.video".to_string(),
+                upload_base_url: "https://upload.divine.video".to_string(),
+                port: 0,
+                migration_nsec: None,
+                transcoder_url: None,
+                transcriber_url: transcriber_url.map(str::to_string),
+                transcribe_shared_secret: Some("secret".to_string()),
+                resumable_session_ttl_secs: resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+                resumable_chunk_size: resumable::DEFAULT_RESUMABLE_CHUNK_SIZE,
+            },
+            http_client: reqwest::Client::new(),
+            transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
+        })
+    }
+
+    fn transcribe_auth_header(extra_tags: Vec<Vec<String>>) -> axum::http::HeaderMap {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]).expect("test signing key");
+        let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+        let mut tags = vec![vec!["t".to_string(), "media".to_string()]];
+        tags.extend(extra_tags);
+        let mut event = NostrEvent {
+            id: String::new(),
+            pubkey,
+            created_at: 1,
+            kind: BLOSSOM_AUTH_KIND,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        event.id = compute_event_id(&event).expect("compute test event id");
+        let id_bytes = hex::decode(&event.id).expect("hex event id");
+        event.sig = hex::encode(
+            signing_key
+                .sign_prehash(&id_bytes)
+                .expect("sign test event")
+                .to_bytes(),
+        );
+
+        let event_json = serde_json::to_string(&serde_json::json!({
+            "id": event.id,
+            "pubkey": event.pubkey,
+            "created_at": event.created_at,
+            "kind": event.kind,
+            "tags": event.tags,
+            "content": event.content,
+            "sig": event.sig,
+        }))
+        .expect("serialize test event");
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, event_json);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Nostr {encoded}"))
+                .expect("auth header value"),
+        );
+        headers
+    }
+
+    fn future_expiration_tag() -> Vec<String> {
+        let expiration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs()
+            + 300;
+        vec!["expiration".to_string(), expiration.to_string()]
+    }
 
     #[test]
     fn transcribe_audio_url_appends_path_and_trims_trailing_slash() {
@@ -1442,12 +1525,71 @@ mod tests {
         assert_eq!(captured.language.as_deref(), Some("en-US"));
         assert_eq!(captured.body, audio.to_vec());
     }
+
+    #[tokio::test]
+    async fn handle_transcribe_requires_expiration_tag() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_rejects_disallowed_server_tag() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![
+                future_expiration_tag(),
+                vec!["server".to_string(), "https://evil.example".to_string()],
+            ]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_rejects_empty_body() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![future_expiration_tag()]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_sheds_when_admission_slots_are_exhausted() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 0)),
+            transcribe_auth_header(vec![future_expiration_tag()]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static(TRANSCRIBE_SHED_RETRY_AFTER))
+        );
+    }
 }
 
 /// Decodes a Blossom auth event, accepting either encoding: BUD-11 specifies
 /// URL-safe unpadded Base64, while the current Divine client emits standard
-/// padded Base64. Trying every combination keeps both working across the
-/// migration instead of 401-ing a compliant `-`/`_`/unpadded token.
+/// padded Base64. Accepting both keeps deployed clients working while allowing
+/// compliant `-`/`_`/unpadded tokens.
 fn decode_auth_event(encoded: &str) -> Result<Vec<u8>> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine;
@@ -2132,7 +2274,9 @@ fn create_blossom_auth(nsec: &str, action: &str, _url: &str) -> Result<String> {
 
     // Sign the event ID
     let id_bytes = hex::decode(&event_id)?;
-    let signature = signing_key.sign(&id_bytes);
+    let signature = signing_key
+        .sign_prehash(&id_bytes)
+        .map_err(|e| anyhow!("Signing error: {}", e))?;
     let sig_hex = hex::encode(signature.to_bytes());
 
     // Create full event
