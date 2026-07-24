@@ -200,6 +200,8 @@ fn cors_exposed_upload_headers() -> Vec<HeaderName> {
         HeaderName::from_static("upload-expires"),
         HeaderName::from_static("upload-expires-at"),
         HeaderName::from_static("x-divine-chunk-size"),
+        // Lets cross-origin callers read the /transcribe backoff hint on 503/429.
+        header::RETRY_AFTER,
     ]
 }
 
@@ -248,6 +250,14 @@ async fn main() -> Result<()> {
         http_client,
         transcribe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSCRIBE)),
     });
+
+    if state.config.transcriber_url.is_some() && state.config.transcribe_shared_secret.is_none() {
+        warn!(
+            "TRANSCRIBER_URL is set but TRANSCRIBE_SHARED_SECRET is not; \
+             /transcribe requests are forwarded without the shared-secret header \
+             and the transcoder is expected to reject them"
+        );
+    }
 
     // CORS configuration
     let cors = CorsLayer::new()
@@ -1180,7 +1190,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::{
         build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
-        decode_auth_event, media_source_candidates, new_temp_media_path,
+        decode_auth_event, media_source_candidates, new_temp_media_path, proxy_transcribe_audio,
         resolve_resumable_chunk_size, server_tag_host, transcribe_audio_url,
         transcribe_server_tag_allowed,
     };
@@ -1315,6 +1325,15 @@ mod tests {
             server_tag_host("HTTPS://Media.Divine.Video/"),
             "media.divine.video"
         );
+        // Crafted values must resolve to the real authority, not a decoy tail.
+        assert_eq!(
+            server_tag_host("https://evil.example/x://media.divine.video"),
+            "evil.example"
+        );
+        assert_eq!(
+            server_tag_host("https://media.divine.video:x@evil.com"),
+            "evil.com"
+        );
     }
 
     #[test]
@@ -1323,6 +1342,105 @@ mod tests {
         assert!(transcribe_server_tag_allowed("upload.divine.video"));
         assert!(!transcribe_server_tag_allowed("https://evil.example.com"));
         assert!(!transcribe_server_tag_allowed("cdn.divine.video"));
+        assert!(!transcribe_server_tag_allowed(
+            "https://evil.example/x://media.divine.video"
+        ));
+        assert!(!transcribe_server_tag_allowed(
+            "https://media.divine.video:x@evil.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_transcribe_audio_forwards_request_and_returns_response() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Captured {
+            content_type: Option<String>,
+            secret: Option<String>,
+            language: Option<String>,
+            body: Vec<u8>,
+        }
+
+        async fn capture(
+            axum::extract::State(store): axum::extract::State<
+                std::sync::Arc<std::sync::Mutex<Option<Captured>>>,
+            >,
+            headers: axum::http::HeaderMap,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: bytes::Bytes,
+        ) -> axum::response::Response {
+            *store.lock().unwrap() = Some(Captured {
+                content_type: headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                secret: headers
+                    .get("x-divine-transcribe-secret")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                language: params.get("language").cloned(),
+                body: body.to_vec(),
+            });
+            let mut response = axum::response::Response::new(axum::body::Body::from(
+                "WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n",
+            ));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/vtt; charset=utf-8"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("7"),
+            );
+            response
+        }
+
+        let store: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/transcribe/audio", post(capture))
+            .with_state(store.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", addr);
+        let audio = bytes::Bytes::from_static(b"RIFF....fake-wav");
+
+        let (status, content_type, retry_after, vtt) = proxy_transcribe_audio(
+            &client,
+            &base,
+            Some("s3cr3t"),
+            audio.clone(),
+            Some("  en-US  "),
+        )
+        .await
+        .expect("proxy call succeeds");
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(content_type, "text/vtt; charset=utf-8");
+        assert_eq!(retry_after.as_deref(), Some("7"));
+        assert!(String::from_utf8_lossy(&vtt).starts_with("WEBVTT"));
+
+        let captured = store
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server captured the forwarded request");
+        assert_eq!(captured.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(captured.secret.as_deref(), Some("s3cr3t"));
+        // Language is forwarded once, trimmed.
+        assert_eq!(captured.language.as_deref(), Some("en-US"));
+        assert_eq!(captured.body, audio.to_vec());
     }
 }
 
@@ -1510,28 +1628,45 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
 const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 
 /// Concurrent `/transcribe` requests admitted before shedding load. Caps the
-/// buffered-audio memory this process can hold at
-/// `MAX_CONCURRENT_TRANSCRIBE * MAX_TRANSCRIBE_AUDIO_BYTES` (~128 MiB). Tune to
-/// the pod's memory limit; the transcoder's own semaphore is a separate cap.
+/// buffered *inbound* audio at
+/// `MAX_CONCURRENT_TRANSCRIBE * MAX_TRANSCRIBE_AUDIO_BYTES` (~128 MiB). The
+/// downstream transcoder response is buffered separately and uncapped — a
+/// trusted internal service returning small WebVTT — so it is not counted
+/// here. Tune to the pod's memory limit; the transcoder's own semaphore is a
+/// separate cap.
 const MAX_CONCURRENT_TRANSCRIBE: usize = 8;
+
+/// Retry-After (seconds, as sent) advertised when the local admission
+/// semaphore sheds an over-capacity `/transcribe` request.
+const TRANSCRIBE_SHED_RETRY_AFTER: &str = "5";
+
+/// Content-Type stamped on the body forwarded to the transcoder. Editor clips
+/// are extracted as 16 kHz mono WAV, so every inbound body is relabeled WAV
+/// regardless of the client's declared type.
+const TRANSCRIBE_FORWARD_CONTENT_TYPE: &str = "audio/wav";
 
 /// Divine hosts a `t=media` transcription token may be `server`-scoped to
 /// (BUD-11). A token carrying a `server` tag for any other domain is being
 /// replayed from elsewhere and is rejected on this route.
 const TRANSCRIBE_ALLOWED_SERVER_HOSTS: [&str; 2] = ["media.divine.video", "upload.divine.video"];
 
-/// Reduces a BUD-11 `server` tag value to a bare lowercase host, tolerating a
-/// scheme, path, and port (`https://media.divine.video:443/x` -> `media.divine.video`).
+/// Reduces a BUD-11 `server` tag value to a bare lowercase host. Parses with
+/// `url::Url` so the authority is extracted correctly — dropping userinfo,
+/// path, and port — rather than a hand-rolled split that a crafted value such
+/// as `https://evil.example/x://media.divine.video` or
+/// `https://media.divine.video:x@evil.com` could slip past. Bare hosts (no
+/// scheme) are supported by prepending `https://` before parsing.
 fn server_tag_host(value: &str) -> String {
-    let after_scheme = value.rsplit("://").next().unwrap_or(value);
-    let host = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or(after_scheme)
-        .split(':')
-        .next()
-        .unwrap_or(after_scheme);
-    host.trim().to_ascii_lowercase()
+    let trimmed = value.trim();
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    url::Url::parse(&candidate)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
 }
 
 /// Whether a `server` tag value targets this service (BUD-11 domain match).
@@ -1605,7 +1740,7 @@ async fn handle_transcribe(
         Err(_) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
+                [(header::RETRY_AFTER, TRANSCRIBE_SHED_RETRY_AFTER)],
                 "Transcription is busy; retry shortly",
             )
                 .into_response();
@@ -1614,12 +1749,18 @@ async fn handle_transcribe(
 
     let audio = match axum::body::to_bytes(body, MAX_TRANSCRIBE_AUDIO_BYTES).await {
         Ok(bytes) => bytes,
-        Err(_) => {
+        Err(error) => {
+            // axum's `to_bytes` error is opaque: it fires both on oversize and
+            // on a genuine mid-body stream failure (client disconnect, HTTP/2
+            // RST, ingress read timeout). Log it so transient failures aren't
+            // invisible; 413 stays the best-guess status since this cap mirrors
+            // the ingress `client_max_body_size`.
+            error!("Transcribe body read failed: {}", error);
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Audio exceeds {} bytes", MAX_TRANSCRIBE_AUDIO_BYTES),
             )
-                .into_response()
+                .into_response();
         }
     };
     if audio.is_empty() {
@@ -1671,7 +1812,8 @@ const TRANSCRIBE_SECRET_HEADER: &str = "X-Divine-Transcribe-Secret";
 ///
 /// [secret] is injected as the transcoder's shared-secret header; this is what
 /// lets the transcoder trust that the request already passed this service's
-/// Nostr auth. When it is `None` the transcoder fails closed (503).
+/// Nostr auth. When it is `None` the header is omitted and the transcoder is
+/// expected to reject the request; a startup `warn!` flags that misconfig.
 async fn proxy_transcribe_audio(
     client: &reqwest::Client,
     transcriber_url: &str,
@@ -1684,7 +1826,10 @@ async fn proxy_transcribe_audio(
 
     let mut request = client
         .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            TRANSCRIBE_FORWARD_CONTENT_TYPE,
+        )
         .body(audio);
     if let Some(lang) = lang {
         request = request.query(&[("language", lang)]);
