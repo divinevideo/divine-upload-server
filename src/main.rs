@@ -130,6 +130,12 @@ struct AppState {
     /// Shared HTTP client with explicit timeouts, so a stalled downstream
     /// (e.g. the transcoder) can't pin an inbound request indefinitely.
     http_client: reqwest::Client,
+    /// Bounds concurrent `/transcribe` requests. Each holds its buffered audio
+    /// (up to `MAX_TRANSCRIBE_AUDIO_BYTES`) for the whole downstream call, so
+    /// without this an authenticated flood on the directly-reachable host could
+    /// exhaust memory — the edge limiter and the transcoder semaphore don't
+    /// protect this process. `MAX_CONCURRENT_TRANSCRIBE` slots cap the buffers.
+    transcribe_slots: Arc<tokio::sync::Semaphore>,
 }
 
 // Nostr auth event structure
@@ -240,6 +246,7 @@ async fn main() -> Result<()> {
         gcs_client,
         config,
         http_client,
+        transcribe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSCRIBE)),
     });
 
     // CORS configuration
@@ -1173,8 +1180,9 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::{
         build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
-        media_source_candidates, new_temp_media_path, resolve_resumable_chunk_size,
-        transcribe_audio_url,
+        decode_auth_event, media_source_candidates, new_temp_media_path,
+        resolve_resumable_chunk_size, server_tag_host, transcribe_audio_url,
+        transcribe_server_tag_allowed,
     };
     use crate::resumable;
 
@@ -1271,6 +1279,66 @@ mod tests {
             512 * 1024
         );
     }
+
+    #[test]
+    fn decode_auth_event_accepts_standard_and_url_safe() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        // All-0xff bytes force index-63 chars (`/` vs `_`); five bytes force
+        // standard padding that url-safe-unpadded omits — so both encodings
+        // differ and both must decode back.
+        let raw: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0xff];
+        let standard = STANDARD.encode(raw);
+        let url_safe = URL_SAFE_NO_PAD.encode(raw);
+        assert_ne!(standard, url_safe);
+        assert_eq!(decode_auth_event(&standard).unwrap(), raw);
+        assert_eq!(decode_auth_event(&url_safe).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_auth_event_rejects_non_base64() {
+        assert!(decode_auth_event("@ not base64 @").is_err());
+    }
+
+    #[test]
+    fn server_tag_host_strips_scheme_port_and_path() {
+        assert_eq!(server_tag_host("media.divine.video"), "media.divine.video");
+        assert_eq!(
+            server_tag_host("https://media.divine.video"),
+            "media.divine.video"
+        );
+        assert_eq!(
+            server_tag_host("https://media.divine.video:443/upload"),
+            "media.divine.video"
+        );
+        assert_eq!(
+            server_tag_host("HTTPS://Media.Divine.Video/"),
+            "media.divine.video"
+        );
+    }
+
+    #[test]
+    fn transcribe_server_tag_allows_divine_hosts_only() {
+        assert!(transcribe_server_tag_allowed("https://media.divine.video"));
+        assert!(transcribe_server_tag_allowed("upload.divine.video"));
+        assert!(!transcribe_server_tag_allowed("https://evil.example.com"));
+        assert!(!transcribe_server_tag_allowed("cdn.divine.video"));
+    }
+}
+
+/// Decodes a Blossom auth event, accepting either encoding: BUD-11 specifies
+/// URL-safe unpadded Base64, while the current Divine client emits standard
+/// padded Base64. Trying every combination keeps both working across the
+/// migration instead of 401-ing a compliant `-`/`_`/unpadded token.
+fn decode_auth_event(encoded: &str) -> Result<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    for engine in [STANDARD, URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD] {
+        if let Ok(bytes) = engine.decode(encoded) {
+            return Ok(bytes);
+        }
+    }
+    Err(anyhow!("Invalid base64 authorization event"))
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
@@ -1284,12 +1352,7 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
         return Err(anyhow!("Authorization must start with 'Nostr '"));
     }
 
-    // Decode base64 event
-    let event_json = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &auth_header[6..],
-    )
-    .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    let event_json = decode_auth_event(&auth_header[6..])?;
 
     let event: NostrEvent =
         serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
@@ -1446,6 +1509,36 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
 /// Editor clip audio (16 kHz mono PCM, ~32 KB/s) is far under this.
 const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 
+/// Concurrent `/transcribe` requests admitted before shedding load. Caps the
+/// buffered-audio memory this process can hold at
+/// `MAX_CONCURRENT_TRANSCRIBE * MAX_TRANSCRIBE_AUDIO_BYTES` (~128 MiB). Tune to
+/// the pod's memory limit; the transcoder's own semaphore is a separate cap.
+const MAX_CONCURRENT_TRANSCRIBE: usize = 8;
+
+/// Divine hosts a `t=media` transcription token may be `server`-scoped to
+/// (BUD-11). A token carrying a `server` tag for any other domain is being
+/// replayed from elsewhere and is rejected on this route.
+const TRANSCRIBE_ALLOWED_SERVER_HOSTS: [&str; 2] = ["media.divine.video", "upload.divine.video"];
+
+/// Reduces a BUD-11 `server` tag value to a bare lowercase host, tolerating a
+/// scheme, path, and port (`https://media.divine.video:443/x` -> `media.divine.video`).
+fn server_tag_host(value: &str) -> String {
+    let after_scheme = value.rsplit("://").next().unwrap_or(value);
+    let host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .split(':')
+        .next()
+        .unwrap_or(after_scheme);
+    host.trim().to_ascii_lowercase()
+}
+
+/// Whether a `server` tag value targets this service (BUD-11 domain match).
+fn transcribe_server_tag_allowed(server: &str) -> bool {
+    TRANSCRIBE_ALLOWED_SERVER_HOSTS.contains(&server_tag_host(server).as_str())
+}
+
 #[derive(Debug, Deserialize)]
 struct TranscribeParams {
     /// Optional BCP-47 recognition-language hint, forwarded to the transcoder.
@@ -1459,10 +1552,11 @@ struct TranscribeParams {
 /// transcoder's `/transcribe/audio` (the same service the by-hash flow uses)
 /// and pass its response straight through.
 ///
-/// NOTE (blocking, see PR): this path is **not** rate limited and the
-/// transcoder does not cache by audio hash — every call is an uncached,
-/// billable provider request. A per-pubkey throttle here plus an audio-hash
-/// result cache in the transcoder must land before this leaves draft.
+/// Rate limiting lives at the edge (`media.divine.video`, divine-blossom). This
+/// directly-reachable host adds local admission control (`transcribe_slots`) to
+/// bound buffered-audio memory, not a per-pubkey throttle. An audio-hash result
+/// cache in the transcoder remains a deferred optimization — every call is still
+/// an uncached, billable provider request.
 async fn handle_transcribe(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1484,12 +1578,38 @@ async fn handle_transcribe(
             .into_response();
     }
 
+    // BUD-11: honor an explicit `server` scope. A token scoped to another
+    // domain is being replayed here — `validate_auth` never inspects it.
+    if let Some(server) = get_tag_value(&auth_event.tags, "server") {
+        if !transcribe_server_tag_allowed(&server) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Authorization server tag does not match this host",
+            )
+                .into_response();
+        }
+    }
+
     let Some(transcriber_url) = state.config.transcriber_url.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Transcription is not configured",
         )
             .into_response();
+    };
+
+    // Admission control: cap concurrent buffered-audio memory. Acquired before
+    // reading the body so an over-limit request is shed without buffering it.
+    let _permit = match state.transcribe_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+                "Transcription is busy; retry shortly",
+            )
+                .into_response();
+        }
     };
 
     let audio = match axum::body::to_bytes(body, MAX_TRANSCRIBE_AUDIO_BYTES).await {
