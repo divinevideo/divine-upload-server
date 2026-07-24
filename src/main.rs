@@ -1515,11 +1515,16 @@ async fn handle_transcribe(
     )
     .await
     {
-        Ok((status, content_type, body)) => {
+        Ok((status, content_type, retry_after, body)) => {
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
             if let Ok(value) = HeaderValue::from_str(&content_type) {
                 response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            if let Some(retry_after) = retry_after {
+                if let Ok(value) = HeaderValue::from_str(&retry_after) {
+                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                }
             }
             response
         }
@@ -1553,7 +1558,7 @@ async fn proxy_transcribe_audio(
     secret: Option<&str>,
     audio: Bytes,
     language: Option<&str>,
-) -> Result<(StatusCode, String, Bytes)> {
+) -> Result<(StatusCode, String, Option<String>, Bytes)> {
     let url = transcribe_audio_url(transcriber_url);
     let lang = language.map(str::trim).filter(|lang| !lang.is_empty());
 
@@ -1581,12 +1586,19 @@ async fn proxy_transcribe_audio(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("text/vtt; charset=utf-8")
         .to_string();
+    // Forward a throttle backoff verbatim if the transcoder ever emits one
+    // (429/503), so the caller isn't left guessing when to retry.
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response
         .bytes()
         .await
         .map_err(|e| anyhow!("Failed to read transcriber response: {}", e))?;
 
-    Ok((status, content_type, body))
+    Ok((status, content_type, retry_after, body))
 }
 
 /// Trigger transcript generation for audio/video (fire-and-forget)
