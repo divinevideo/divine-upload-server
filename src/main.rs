@@ -7,7 +7,7 @@ mod thumbnail;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, head, options, post, put},
@@ -27,7 +27,8 @@ use google_cloud_storage::{
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use k256::schnorr::{
-    signature::hazmat::PrehashVerifier, signature::Signer, Signature, SigningKey, VerifyingKey,
+    signature::hazmat::{PrehashSigner, PrehashVerifier},
+    Signature, SigningKey, VerifyingKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +54,10 @@ struct Config {
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
     transcriber_url: Option<String>,
+    /// Shared secret the transcoder requires on `/transcribe/audio`. Injected
+    /// on every proxied transcription so the transcoder can trust the request
+    /// already passed this service's Nostr auth.
+    transcribe_shared_secret: Option<String>,
     resumable_session_ttl_secs: u64,
     resumable_chunk_size: u64,
 }
@@ -77,6 +82,10 @@ impl Config {
             transcriber_url: env::var("TRANSCRIBER_URL")
                 .ok()
                 .or_else(|| env::var("TRANSCODER_URL").ok()),
+            transcribe_shared_secret: env::var("TRANSCRIBE_SHARED_SECRET")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             resumable_session_ttl_secs: env::var("RESUMABLE_SESSION_TTL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -119,6 +128,15 @@ fn resolve_resumable_chunk_size(
 struct AppState {
     gcs_client: GcsClient,
     config: Config,
+    /// Shared HTTP client with explicit timeouts, so a stalled downstream
+    /// (e.g. the transcoder) can't pin an inbound request indefinitely.
+    http_client: reqwest::Client,
+    /// Bounds concurrent `/transcribe` requests. Each holds its buffered audio
+    /// (up to `MAX_TRANSCRIBE_AUDIO_BYTES`) for the whole downstream call, so
+    /// without this an authenticated flood on the directly-reachable host could
+    /// exhaust memory — the edge limiter and the transcoder semaphore don't
+    /// protect this process. `MAX_CONCURRENT_TRANSCRIBE` slots cap the buffers.
+    transcribe_slots: Arc<tokio::sync::Semaphore>,
 }
 
 // Nostr auth event structure
@@ -183,6 +201,8 @@ fn cors_exposed_upload_headers() -> Vec<HeaderName> {
         HeaderName::from_static("upload-expires"),
         HeaderName::from_static("upload-expires-at"),
         HeaderName::from_static("x-divine-chunk-size"),
+        // Lets cross-origin callers read the /transcribe backoff hint on 503/429.
+        header::RETRY_AFTER,
     ]
 }
 
@@ -219,7 +239,26 @@ async fn main() -> Result<()> {
     let gcs_config = ClientConfig::default().with_auth().await?;
     let gcs_client = GcsClient::new(gcs_config);
 
-    let state = Arc::new(AppState { gcs_client, config });
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let state = Arc::new(AppState {
+        gcs_client,
+        config,
+        http_client,
+        transcribe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSCRIBE)),
+    });
+
+    if state.config.transcriber_url.is_some() && state.config.transcribe_shared_secret.is_none() {
+        warn!(
+            "TRANSCRIBER_URL is set but TRANSCRIBE_SHARED_SECRET is not; \
+             /transcribe requests are forwarded without the shared-secret header \
+             and the transcoder is expected to reject them"
+        );
+    }
 
     // CORS configuration
     let cors = CorsLayer::new()
@@ -258,6 +297,8 @@ async fn main() -> Result<()> {
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
+        .route("/transcribe", post(handle_transcribe))
+        .route("/transcribe", options(handle_cors_preflight))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", get(handle_landing))
@@ -1149,10 +1190,106 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        build_session_status_response, cors_allowed_request_headers, cors_exposed_upload_headers,
-        media_source_candidates, new_temp_media_path, resolve_resumable_chunk_size,
+        build_session_status_response, compute_event_id, cors_allowed_request_headers,
+        cors_exposed_upload_headers, decode_auth_event, handle_transcribe, media_source_candidates,
+        new_temp_media_path, proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
+        transcribe_audio_url, transcribe_server_tag_allowed, AppState, Config, GcsClient,
+        NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
     use crate::resumable;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{header, HeaderValue, StatusCode};
+    use google_cloud_storage::client::ClientConfig;
+    use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
+        Arc::new(AppState {
+            gcs_client: GcsClient::new(ClientConfig::default().anonymous()),
+            config: Config {
+                gcs_bucket: "test-bucket".to_string(),
+                cdn_base_url: "https://media.divine.video".to_string(),
+                upload_base_url: "https://upload.divine.video".to_string(),
+                port: 0,
+                migration_nsec: None,
+                transcoder_url: None,
+                transcriber_url: transcriber_url.map(str::to_string),
+                transcribe_shared_secret: Some("secret".to_string()),
+                resumable_session_ttl_secs: resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+                resumable_chunk_size: resumable::DEFAULT_RESUMABLE_CHUNK_SIZE,
+            },
+            http_client: reqwest::Client::new(),
+            transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
+        })
+    }
+
+    fn transcribe_auth_header(extra_tags: Vec<Vec<String>>) -> axum::http::HeaderMap {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]).expect("test signing key");
+        let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+        let mut tags = vec![vec!["t".to_string(), "media".to_string()]];
+        tags.extend(extra_tags);
+        let mut event = NostrEvent {
+            id: String::new(),
+            pubkey,
+            created_at: 1,
+            kind: BLOSSOM_AUTH_KIND,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        event.id = compute_event_id(&event).expect("compute test event id");
+        let id_bytes = hex::decode(&event.id).expect("hex event id");
+        event.sig = hex::encode(
+            signing_key
+                .sign_prehash(&id_bytes)
+                .expect("sign test event")
+                .to_bytes(),
+        );
+
+        let event_json = serde_json::to_string(&serde_json::json!({
+            "id": event.id,
+            "pubkey": event.pubkey,
+            "created_at": event.created_at,
+            "kind": event.kind,
+            "tags": event.tags,
+            "content": event.content,
+            "sig": event.sig,
+        }))
+        .expect("serialize test event");
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, event_json);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Nostr {encoded}"))
+                .expect("auth header value"),
+        );
+        headers
+    }
+
+    fn future_expiration_tag() -> Vec<String> {
+        let expiration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs()
+            + 300;
+        vec!["expiration".to_string(), expiration.to_string()]
+    }
+
+    #[test]
+    fn transcribe_audio_url_appends_path_and_trims_trailing_slash() {
+        assert_eq!(
+            transcribe_audio_url("https://transcoder.example"),
+            "https://transcoder.example/transcribe/audio"
+        );
+        assert_eq!(
+            transcribe_audio_url("https://transcoder.example/"),
+            "https://transcoder.example/transcribe/audio"
+        );
+    }
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1235,6 +1372,233 @@ mod tests {
             512 * 1024
         );
     }
+
+    #[test]
+    fn decode_auth_event_accepts_standard_and_url_safe() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        // All-0xff bytes force index-63 chars (`/` vs `_`); five bytes force
+        // standard padding that url-safe-unpadded omits — so both encodings
+        // differ and both must decode back.
+        let raw: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0xff];
+        let standard = STANDARD.encode(raw);
+        let url_safe = URL_SAFE_NO_PAD.encode(raw);
+        assert_ne!(standard, url_safe);
+        assert_eq!(decode_auth_event(&standard).unwrap(), raw);
+        assert_eq!(decode_auth_event(&url_safe).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_auth_event_rejects_non_base64() {
+        assert!(decode_auth_event("@ not base64 @").is_err());
+    }
+
+    #[test]
+    fn server_tag_host_strips_scheme_port_and_path() {
+        assert_eq!(server_tag_host("media.divine.video"), "media.divine.video");
+        assert_eq!(
+            server_tag_host("https://media.divine.video"),
+            "media.divine.video"
+        );
+        assert_eq!(
+            server_tag_host("https://media.divine.video:443/upload"),
+            "media.divine.video"
+        );
+        assert_eq!(
+            server_tag_host("HTTPS://Media.Divine.Video/"),
+            "media.divine.video"
+        );
+        // Crafted values must resolve to the real authority, not a decoy tail.
+        assert_eq!(
+            server_tag_host("https://evil.example/x://media.divine.video"),
+            "evil.example"
+        );
+        assert_eq!(
+            server_tag_host("https://media.divine.video:x@evil.com"),
+            "evil.com"
+        );
+    }
+
+    #[test]
+    fn transcribe_server_tag_allows_divine_hosts_only() {
+        assert!(transcribe_server_tag_allowed("https://media.divine.video"));
+        assert!(transcribe_server_tag_allowed("upload.divine.video"));
+        assert!(!transcribe_server_tag_allowed("https://evil.example.com"));
+        assert!(!transcribe_server_tag_allowed("cdn.divine.video"));
+        assert!(!transcribe_server_tag_allowed(
+            "https://evil.example/x://media.divine.video"
+        ));
+        assert!(!transcribe_server_tag_allowed(
+            "https://media.divine.video:x@evil.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_transcribe_audio_forwards_request_and_returns_response() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Captured {
+            content_type: Option<String>,
+            secret: Option<String>,
+            language: Option<String>,
+            body: Vec<u8>,
+        }
+
+        async fn capture(
+            axum::extract::State(store): axum::extract::State<
+                std::sync::Arc<std::sync::Mutex<Option<Captured>>>,
+            >,
+            headers: axum::http::HeaderMap,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            body: bytes::Bytes,
+        ) -> axum::response::Response {
+            *store.lock().unwrap() = Some(Captured {
+                content_type: headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                secret: headers
+                    .get("x-divine-transcribe-secret")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                language: params.get("language").cloned(),
+                body: body.to_vec(),
+            });
+            let mut response = axum::response::Response::new(axum::body::Body::from(
+                "WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n",
+            ));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/vtt; charset=utf-8"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("7"),
+            );
+            response
+        }
+
+        let store: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/transcribe/audio", post(capture))
+            .with_state(store.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", addr);
+        let audio = bytes::Bytes::from_static(b"RIFF....fake-wav");
+
+        let (status, content_type, retry_after, vtt) = proxy_transcribe_audio(
+            &client,
+            &base,
+            Some("s3cr3t"),
+            audio.clone(),
+            Some("  en-US  "),
+        )
+        .await
+        .expect("proxy call succeeds");
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(content_type, "text/vtt; charset=utf-8");
+        assert_eq!(retry_after.as_deref(), Some("7"));
+        assert!(String::from_utf8_lossy(&vtt).starts_with("WEBVTT"));
+
+        let captured = store
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server captured the forwarded request");
+        assert_eq!(captured.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(captured.secret.as_deref(), Some("s3cr3t"));
+        // Language is forwarded once, trimmed.
+        assert_eq!(captured.language.as_deref(), Some("en-US"));
+        assert_eq!(captured.body, audio.to_vec());
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_requires_expiration_tag() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_rejects_disallowed_server_tag() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![
+                future_expiration_tag(),
+                vec!["server".to_string(), "https://evil.example".to_string()],
+            ]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_rejects_empty_body() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 1)),
+            transcribe_auth_header(vec![future_expiration_tag()]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_transcribe_sheds_when_admission_slots_are_exhausted() {
+        let response = handle_transcribe(
+            State(test_state(Some("http://127.0.0.1:9"), 0)),
+            transcribe_auth_header(vec![future_expiration_tag()]),
+            axum::extract::Query(TranscribeParams { language: None }),
+            Body::from("audio"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static(TRANSCRIBE_SHED_RETRY_AFTER))
+        );
+    }
+}
+
+/// Decodes a Blossom auth event, accepting either encoding: BUD-11 specifies
+/// URL-safe unpadded Base64, while the current Divine client emits standard
+/// padded Base64. Accepting both keeps deployed clients working while allowing
+/// compliant `-`/`_`/unpadded tokens.
+fn decode_auth_event(encoded: &str) -> Result<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    for engine in [STANDARD, URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD] {
+        if let Ok(bytes) = engine.decode(encoded) {
+            return Ok(bytes);
+        }
+    }
+    Err(anyhow!("Invalid base64 authorization event"))
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
@@ -1248,12 +1612,7 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
         return Err(anyhow!("Authorization must start with 'Nostr '"));
     }
 
-    // Decode base64 event
-    let event_json = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &auth_header[6..],
-    )
-    .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    let event_json = decode_auth_event(&auth_header[6..])?;
 
     let event: NostrEvent =
         serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
@@ -1402,6 +1761,251 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
         let body = response.text().await.unwrap_or_default();
         Err(anyhow!("Transcoder returned error {}: {}", status, body))
     }
+}
+
+/// Max audio body accepted by `POST /transcribe`. Bounded by the production
+/// NGINX ingress (`client_max_body_size 16m`): anything larger is rejected
+/// before it reaches this handler, so a higher limit here would be a lie.
+/// Editor clip audio (16 kHz mono PCM, ~32 KB/s) is far under this.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+
+/// Concurrent `/transcribe` requests admitted before shedding load. Caps the
+/// buffered *inbound* audio at
+/// `MAX_CONCURRENT_TRANSCRIBE * MAX_TRANSCRIBE_AUDIO_BYTES` (~128 MiB). The
+/// downstream transcoder response is buffered separately and uncapped — a
+/// trusted internal service returning small WebVTT — so it is not counted
+/// here. Tune to the pod's memory limit; the transcoder's own semaphore is a
+/// separate cap.
+const MAX_CONCURRENT_TRANSCRIBE: usize = 8;
+
+/// Retry-After (seconds, as sent) advertised when the local admission
+/// semaphore sheds an over-capacity `/transcribe` request.
+const TRANSCRIBE_SHED_RETRY_AFTER: &str = "5";
+
+/// Content-Type stamped on the body forwarded to the transcoder. Editor clips
+/// are extracted as 16 kHz mono WAV, so every inbound body is relabeled WAV
+/// regardless of the client's declared type.
+const TRANSCRIBE_FORWARD_CONTENT_TYPE: &str = "audio/wav";
+
+/// Divine hosts a `t=media` transcription token may be `server`-scoped to
+/// (BUD-11). A token carrying a `server` tag for any other domain is being
+/// replayed from elsewhere and is rejected on this route.
+const TRANSCRIBE_ALLOWED_SERVER_HOSTS: [&str; 2] = ["media.divine.video", "upload.divine.video"];
+
+/// Reduces a BUD-11 `server` tag value to a bare lowercase host. Parses with
+/// `url::Url` so the authority is extracted correctly — dropping userinfo,
+/// path, and port — rather than a hand-rolled split that a crafted value such
+/// as `https://evil.example/x://media.divine.video` or
+/// `https://media.divine.video:x@evil.com` could slip past. Bare hosts (no
+/// scheme) are supported by prepending `https://` before parsing.
+fn server_tag_host(value: &str) -> String {
+    let trimmed = value.trim();
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    url::Url::parse(&candidate)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
+}
+
+/// Whether a `server` tag value targets this service (BUD-11 domain match).
+fn transcribe_server_tag_allowed(server: &str) -> bool {
+    TRANSCRIBE_ALLOWED_SERVER_HOSTS.contains(&server_tag_host(server).as_str())
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscribeParams {
+    /// Optional BCP-47 recognition-language hint, forwarded to the transcoder.
+    language: Option<String>,
+}
+
+/// POST /transcribe — authenticated proxy for synchronous audio transcription.
+///
+/// The editor posts extracted clip audio here (Blossom kind-24242 auth,
+/// `t=media`) and gets WebVTT back. We forward the bytes to the private
+/// transcoder's `/transcribe/audio` (the same service the by-hash flow uses)
+/// and pass its response straight through.
+///
+/// Rate limiting lives at the edge (`media.divine.video`, divine-blossom). This
+/// directly-reachable host adds local admission control (`transcribe_slots`) to
+/// bound buffered-audio memory, not a per-pubkey throttle. An audio-hash result
+/// cache in the transcoder remains a deferred optimization — every call is still
+/// an uncached, billable provider request.
+async fn handle_transcribe(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<TranscribeParams>,
+    body: Body,
+) -> Response {
+    let auth_event = match validate_auth(&headers, "media") {
+        Ok(event) => event,
+        Err(error) => return auth_error_response(error),
+    };
+    // BUD-11: a transcription token must expire. `validate_auth` only checks
+    // the `expiration` tag when present, so a token without one would be valid
+    // forever — reject it here on this billable route.
+    if get_tag_value(&auth_event.tags, "expiration").is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Authorization must include an expiration tag",
+        )
+            .into_response();
+    }
+
+    // BUD-11: honor an explicit `server` scope. A token scoped to another
+    // domain is being replayed here — `validate_auth` never inspects it.
+    if let Some(server) = get_tag_value(&auth_event.tags, "server") {
+        if !transcribe_server_tag_allowed(&server) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Authorization server tag does not match this host",
+            )
+                .into_response();
+        }
+    }
+
+    let Some(transcriber_url) = state.config.transcriber_url.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Transcription is not configured",
+        )
+            .into_response();
+    };
+
+    // Admission control: cap concurrent buffered-audio memory. Acquired before
+    // reading the body so an over-limit request is shed without buffering it.
+    let _permit = match state.transcribe_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, TRANSCRIBE_SHED_RETRY_AFTER)],
+                "Transcription is busy; retry shortly",
+            )
+                .into_response();
+        }
+    };
+
+    let audio = match axum::body::to_bytes(body, MAX_TRANSCRIBE_AUDIO_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // axum's `to_bytes` error is opaque: it fires both on oversize and
+            // on a genuine mid-body stream failure (client disconnect, HTTP/2
+            // RST, ingress read timeout). Log it so transient failures aren't
+            // invisible; 413 stays the best-guess status since this cap mirrors
+            // the ingress `client_max_body_size`.
+            error!("Transcribe body read failed: {}", error);
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Audio exceeds {} bytes", MAX_TRANSCRIBE_AUDIO_BYTES),
+            )
+                .into_response();
+        }
+    };
+    if audio.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
+    }
+
+    match proxy_transcribe_audio(
+        &state.http_client,
+        &transcriber_url,
+        state.config.transcribe_shared_secret.as_deref(),
+        audio,
+        params.language.as_deref(),
+    )
+    .await
+    {
+        Ok((status, content_type, retry_after, body)) => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            if let Some(retry_after) = retry_after {
+                if let Ok(value) = HeaderValue::from_str(&retry_after) {
+                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                }
+            }
+            response
+        }
+        Err(error) => {
+            error!("Transcribe proxy failed: {}", error);
+            (StatusCode::BAD_GATEWAY, "Transcription service unavailable").into_response()
+        }
+    }
+}
+
+/// Builds the transcoder's `/transcribe/audio` URL, tolerating a trailing
+/// slash on the configured base URL.
+fn transcribe_audio_url(transcriber_url: &str) -> String {
+    format!("{}/transcribe/audio", transcriber_url.trim_end_matches('/'))
+}
+
+/// Header carrying the shared secret the transcoder requires on
+/// `/transcribe/audio` (that service is `--allow-unauthenticated`).
+const TRANSCRIBE_SECRET_HEADER: &str = "X-Divine-Transcribe-Secret";
+
+/// Forwards [audio] to the transcoder's `/transcribe/audio`, returning its
+/// status, content-type, and body verbatim so WebVTT (or an error) passes
+/// straight back to the caller.
+///
+/// [secret] is injected as the transcoder's shared-secret header; this is what
+/// lets the transcoder trust that the request already passed this service's
+/// Nostr auth. When it is `None` the header is omitted and the transcoder is
+/// expected to reject the request; a startup `warn!` flags that misconfig.
+async fn proxy_transcribe_audio(
+    client: &reqwest::Client,
+    transcriber_url: &str,
+    secret: Option<&str>,
+    audio: Bytes,
+    language: Option<&str>,
+) -> Result<(StatusCode, String, Option<String>, Bytes)> {
+    let url = transcribe_audio_url(transcriber_url);
+    let lang = language.map(str::trim).filter(|lang| !lang.is_empty());
+
+    let mut request = client
+        .post(&url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            TRANSCRIBE_FORWARD_CONTENT_TYPE,
+        )
+        .body(audio);
+    if let Some(lang) = lang {
+        request = request.query(&[("language", lang)]);
+    }
+    if let Some(secret) = secret {
+        request = request.header(TRANSCRIBE_SECRET_HEADER, secret);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to call transcriber: {}", e))?;
+
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/vtt; charset=utf-8")
+        .to_string();
+    // Forward a throttle backoff verbatim if the transcoder ever emits one
+    // (429/503), so the caller isn't left guessing when to retry.
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("Failed to read transcriber response: {}", e))?;
+
+    Ok((status, content_type, retry_after, body))
 }
 
 /// Trigger transcript generation for audio/video (fire-and-forget)
@@ -1670,7 +2274,9 @@ fn create_blossom_auth(nsec: &str, action: &str, _url: &str) -> Result<String> {
 
     // Sign the event ID
     let id_bytes = hex::decode(&event_id)?;
-    let signature = signing_key.sign(&id_bytes);
+    let signature = signing_key
+        .sign_prehash(&id_bytes)
+        .map_err(|e| anyhow!("Signing error: {}", e))?;
     let sig_hex = hex::encode(signature.to_bytes());
 
     // Create full event
