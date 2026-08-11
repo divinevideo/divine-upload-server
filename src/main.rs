@@ -879,7 +879,7 @@ fn spawn_nsfw_scan(state: &Arc<AppState>, sha256: &str, content_type: &str, newl
 
     tokio::spawn(async move {
         match trigger_nsfw_scan(&client, &detector_base_url, &video_url, &hash, &mime_type).await {
-            Ok(state) => info!("NSFW scan completed for {}: {}", hash, state),
+            Ok(signal_state) => info!("NSFW scan for {} returned {}", hash, signal_state),
             Err(error) => warn!("NSFW scan failed for {}: {}", hash, error),
         }
     });
@@ -922,7 +922,10 @@ async fn trigger_nsfw_scan(
         .ok_or_else(|| anyhow!("detector response omitted signals.nsfw.state"))?;
 
     match signal_state {
-        "detected" | "absent" => Ok(signal_state.to_string()),
+        // `skipped` is the detector's documented answer for a signal whose
+        // model is not configured. It is explicitly not an error there, so it
+        // must not be reported as a failed scan here.
+        "detected" | "absent" | "skipped" => Ok(signal_state.to_string()),
         other => Err(anyhow!("detector NSFW signal returned {}", other)),
     }
 }
@@ -1370,6 +1373,66 @@ mod tests {
         assert_eq!(payload["sha256"], hash);
         assert_eq!(payload["mime_type"], "video/mp4");
         assert_eq!(payload["signals"], serde_json::json!(["nsfw"]));
+    }
+
+    /// Serve one canned `/detect` response and return the fixture's base URL.
+    async fn detector_fixture(state: &'static str) -> String {
+        let app = Router::new().route(
+            "/detect",
+            post(move || async move {
+                Json(serde_json::json!({
+                    "signals": { "nsfw": { "state": state } }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind detector fixture");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve detector fixture");
+        });
+        format!("http://{address}")
+    }
+
+    async fn scan_against(base_url: &str) -> anyhow::Result<String> {
+        let hash = "5322a546ac6f5f79f70050a2550cda08a7070ddd531a15a7d81cab992d6fd600";
+        trigger_nsfw_scan(
+            &reqwest::Client::new(),
+            base_url,
+            &format!("https://media.divine.video/{hash}"),
+            hash,
+            "video/mp4",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unconfigured_detector_model_is_not_a_failed_scan() {
+        // The detector answers `skipped` when a signal's model is not
+        // configured, and documents that as explicitly not an error. Folding it
+        // into the error arm would log a failed scan for every single upload.
+        let base_url = detector_fixture("skipped").await;
+
+        assert_eq!(
+            scan_against(&base_url)
+                .await
+                .expect("skipped is not an error"),
+            "skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn detector_signal_error_is_reported_as_a_failure() {
+        let base_url = detector_fixture("error").await;
+
+        let message = scan_against(&base_url)
+            .await
+            .expect_err("error state must surface as a failure")
+            .to_string();
+        assert!(message.contains("error"), "unexpected message: {message}");
     }
 
     fn transcribe_auth_header(extra_tags: Vec<Vec<String>>) -> axum::http::HeaderMap {
