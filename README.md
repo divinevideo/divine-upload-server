@@ -84,7 +84,7 @@ Without GCS credentials the storage-backed routes will fail, but the server star
 
 ## Configuration
 
-All configuration comes from environment variables. Defaults reflect production values.
+All configuration comes from environment variables. The table below lists the code defaults, which are not always what production deploys — see the note under the table.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
