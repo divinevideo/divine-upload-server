@@ -103,7 +103,7 @@ All configuration comes from environment variables. The table below lists the co
 
 `RESUMABLE_MAX_REQUEST_BODY_SIZE` is **not** an enforced request-body limit, despite the name — it is consumed only by that clamp. Inbound chunk size is bounded by the ingress: the `divine-upload-server` HTTPRoute attaches the `upload-body-size` SnippetsFilter (`client_max_body_size 16m`), a location-context directive that overrides the 100 MiB gateway-wide `ClientSettingsPolicy`.
 
-The server itself never rejects a chunk for being too large. On a chunk `PUT` it checks that the `Content-Range` start equals the session's next offset, that the `Content-Range` length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size therefore cannot reject clients that keep sending larger chunks, as long as they start at the expected offset and stay 256 KiB-aligned.
+The server itself enforces no request-body limit of its own. What a chunk `PUT` must satisfy is that the `Content-Range` total equals the session's declared size, that the range lies inside that size, that the range start equals the session's next offset, that the range length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size therefore cannot reject clients that keep sending larger chunks, as long as those chunks stay within the declared size, start at the expected offset, and are 256 KiB-aligned.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 
