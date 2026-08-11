@@ -43,7 +43,7 @@ futures = "0.3"
 bytes = "1"
 
 # HTTP client for migration
-reqwest = { version = "0.11", features = ["stream", "rustls-tls"], default-features = false }
+reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"], default-features = false }
 url = "2"
 
 # Error handling
