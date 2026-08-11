@@ -96,10 +96,14 @@ All configuration comes from environment variables. Defaults reflect production 
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
 | `RESUMABLE_SESSION_TTL_SECS` | `86400` | Resumable session lifetime (24h). |
-| `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to the request-body limit. |
-| `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Per-request body limit (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
+| `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE`. |
+| `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Upper bound on the *advertised* chunk size (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
 
-`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`, so the published chunk contract can never exceed the actual request-body limit on `upload.divine.video`. The default limit of `1048576` bytes matches the production ingress.
+`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`.
+
+`RESUMABLE_MAX_REQUEST_BODY_SIZE` is **not** an enforced request-body limit, despite the name — it is consumed only by that clamp. Inbound chunk size is bounded by the production gateway's client body limit (100 MiB), and the server validates chunk *placement* — the `Content-Range` start must equal the session's next offset — never chunk length. Lowering the advertised chunk size therefore cannot reject clients that are still sending larger chunks from the correct offset.
+
+These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 
 ## Deployment
 

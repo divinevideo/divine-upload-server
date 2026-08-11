@@ -1763,9 +1763,9 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
     }
 }
 
-/// Max audio body accepted by `POST /transcribe`. Bounded by the production
-/// NGINX ingress (`client_max_body_size 16m`): anything larger is rejected
-/// before it reaches this handler, so a higher limit here would be a lie.
+/// Max audio body accepted by `POST /transcribe`, and the binding limit for
+/// this route: the production gateway's client body limit is far larger
+/// (100 MiB), so nothing upstream rejects an oversized body first.
 /// Editor clip audio (16 kHz mono PCM, ~32 KB/s) is far under this.
 const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 
