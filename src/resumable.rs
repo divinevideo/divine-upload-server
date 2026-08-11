@@ -96,6 +96,11 @@ pub struct CompleteUploadResponse {
     pub thumbnail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming: Option<StreamingInfo>,
+    /// Internal delivery guard. It is deliberately absent from the public
+    /// Blossom response and prevents repeated completion calls from firing
+    /// downstream hooks more than once.
+    #[serde(skip)]
+    pub newly_stored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +425,7 @@ where
                 finalized_object,
                 session.declared_size,
                 &session.content_type,
+                false,
             ));
         }
 
@@ -442,12 +448,12 @@ where
             )));
         }
 
-        if !self
+        let object_already_exists = self
             .backend
             .object_exists(&session.final_sha256)
             .await
-            .map_err(internal_error)?
-        {
+            .map_err(internal_error)?;
+        if !object_already_exists {
             self.backend
                 .copy_to_final(
                     &session.temp_object,
@@ -468,6 +474,7 @@ where
             &session.final_sha256,
             session.declared_size,
             &session.content_type,
+            !object_already_exists,
         ))
     }
 
@@ -534,6 +541,7 @@ where
         sha256: &str,
         size: u64,
         content_type: &str,
+        newly_stored: bool,
     ) -> CompleteUploadResponse {
         let canonical_url = format!("{}/{}", self.cdn_base_url, sha256);
         let streaming = if is_video_content_type(content_type) {
@@ -557,6 +565,7 @@ where
             fallback_url: Some(canonical_url),
             thumbnail: None,
             streaming,
+            newly_stored,
         }
     }
 
@@ -1402,6 +1411,9 @@ mod tests {
             .expect("complete session");
         let json = serde_json::to_value(&complete).expect("serialize complete response");
 
+        assert!(complete.newly_stored);
+        assert!(json.get("newlyStored").is_none());
+
         assert_eq!(
             complete.url,
             "https://media.divine.video/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -1433,6 +1445,12 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("processing")
         );
+
+        let repeated = manager
+            .complete_session(&response.upload_id, "owner_pubkey")
+            .await
+            .expect("repeated completion is idempotent");
+        assert!(!repeated.newly_stored);
     }
 
     #[test]

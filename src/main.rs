@@ -54,6 +54,9 @@ struct Config {
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
     transcriber_url: Option<String>,
+    /// Self-hosted detector invoked for every newly stored video. The request
+    /// is best-effort and runs off the upload response path.
+    ai_detector_base_url: Option<String>,
     /// Shared secret the transcoder requires on `/transcribe/audio`. Injected
     /// on every proxied transcription so the transcoder can trust the request
     /// already passed this service's Nostr auth.
@@ -82,6 +85,10 @@ impl Config {
             transcriber_url: env::var("TRANSCRIBER_URL")
                 .ok()
                 .or_else(|| env::var("TRANSCODER_URL").ok()),
+            ai_detector_base_url: env::var("AI_DETECTOR_BASE_URL")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty()),
             transcribe_shared_secret: env::var("TRANSCRIBE_SHARED_SECRET")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -577,7 +584,15 @@ async fn handle_resumable_complete(
         .complete_session(&upload_id, &auth_event.pubkey)
         .await
     {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => {
+            spawn_nsfw_scan(
+                &state,
+                &response.sha256,
+                &response.content_type,
+                response.newly_stored,
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(error) => resumable_error_response(error),
     }
 }
@@ -618,7 +633,7 @@ async fn process_upload(
         .to_string();
 
     // Stream body while hashing (with owner metadata for durability)
-    let (sha256_hash, size, all_bytes) = stream_to_gcs_with_hash(
+    let (sha256_hash, size, all_bytes, newly_stored) = stream_to_gcs_with_hash(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &content_type,
@@ -706,6 +721,8 @@ async fn process_upload(
         }
     }
 
+    spawn_nsfw_scan(&state, &sha256_hash, &content_type, newly_stored);
+
     // Build response
     let extension = get_extension(&content_type);
     let uploaded = SystemTime::now()
@@ -733,7 +750,7 @@ async fn stream_to_gcs_with_hash(
     content_type: &str,
     body: Body,
     owner: &str,
-) -> Result<(String, u64, Vec<u8>)> {
+) -> Result<(String, u64, Vec<u8>, bool)> {
     let mut original_bytes = Vec::new();
 
     // Collect body stream first; original bytes remain the source of truth for hashing/storage.
@@ -788,7 +805,7 @@ async fn stream_to_gcs_with_hash(
 
     if exists {
         info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size, derivative_bytes));
+        return Ok((sha256_hash, total_size, derivative_bytes, false));
     }
 
     // Upload to GCS
@@ -823,7 +840,91 @@ async fn stream_to_gcs_with_hash(
         "Uploaded {} bytes as {} (owner: {})",
         total_size, sha256_hash, owner
     );
-    Ok((sha256_hash, total_size, derivative_bytes))
+    Ok((sha256_hash, total_size, derivative_bytes, true))
+}
+
+#[derive(Debug, Serialize)]
+struct DetectorRequest<'a> {
+    url: &'a str,
+    mime_type: &'a str,
+    sha256: &'a str,
+    signals: [&'static str; 1],
+}
+
+/// Start one evidence-only NSFW scan after a new video is durably stored.
+///
+/// Repeated direct uploads and repeated resumable completion calls do not
+/// resubmit the same content. The detector computes the hash again before it
+/// publishes evidence, so the upload server's claim is never trusted blindly.
+fn spawn_nsfw_scan(state: &Arc<AppState>, sha256: &str, content_type: &str, newly_stored: bool) {
+    if !newly_stored || !thumbnail::is_video_type(content_type) {
+        return;
+    }
+    let Some(detector_base_url) = state.config.ai_detector_base_url.clone() else {
+        info!(
+            "AI_DETECTOR_BASE_URL not configured, skipping NSFW scan for {}",
+            sha256
+        );
+        return;
+    };
+
+    let video_url = format!(
+        "{}/{}",
+        state.config.cdn_base_url.trim_end_matches('/'),
+        sha256
+    );
+    let hash = sha256.to_string();
+    let mime_type = content_type.to_string();
+    let client = state.http_client.clone();
+
+    tokio::spawn(async move {
+        match trigger_nsfw_scan(&client, &detector_base_url, &video_url, &hash, &mime_type).await {
+            Ok(state) => info!("NSFW scan completed for {}: {}", hash, state),
+            Err(error) => warn!("NSFW scan failed for {}: {}", hash, error),
+        }
+    });
+}
+
+async fn trigger_nsfw_scan(
+    client: &reqwest::Client,
+    detector_base_url: &str,
+    video_url: &str,
+    sha256: &str,
+    mime_type: &str,
+) -> Result<String> {
+    let response = client
+        .post(format!(
+            "{}/detect",
+            detector_base_url.trim_end_matches('/')
+        ))
+        .json(&DetectorRequest {
+            url: video_url,
+            mime_type,
+            sha256,
+            signals: ["nsfw"],
+        })
+        .send()
+        .await
+        .map_err(|error| anyhow!("detector request failed: {}", error))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("detector returned HTTP {}", status));
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| anyhow!("detector returned invalid JSON: {}", error))?;
+    let signal_state = payload
+        .pointer("/signals/nsfw/state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("detector response omitted signals.nsfw.state"))?;
+
+    match signal_state {
+        "detected" | "absent" => Ok(signal_state.to_string()),
+        other => Err(anyhow!("detector NSFW signal returned {}", other)),
+    }
 }
 
 /// Extract thumbnail from video and upload to GCS
@@ -1193,13 +1294,14 @@ mod tests {
         build_session_status_response, compute_event_id, cors_allowed_request_headers,
         cors_exposed_upload_headers, decode_auth_event, handle_transcribe, media_source_candidates,
         new_temp_media_path, proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
-        transcribe_audio_url, transcribe_server_tag_allowed, AppState, Config, GcsClient,
-        NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
+        transcribe_audio_url, transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config,
+        GcsClient, NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
     use crate::resumable;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{header, HeaderValue, StatusCode};
+    use axum::{routing::post, Json, Router};
     use google_cloud_storage::client::ClientConfig;
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
@@ -1216,6 +1318,7 @@ mod tests {
                 migration_nsec: None,
                 transcoder_url: None,
                 transcriber_url: transcriber_url.map(str::to_string),
+                ai_detector_base_url: None,
                 transcribe_shared_secret: Some("secret".to_string()),
                 resumable_session_ttl_secs: resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS,
                 resumable_chunk_size: resumable::DEFAULT_RESUMABLE_CHUNK_SIZE,
@@ -1223,6 +1326,50 @@ mod tests {
             http_client: reqwest::Client::new(),
             transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
         })
+    }
+
+    #[tokio::test]
+    async fn detector_request_uses_verified_hash_url_and_nsfw_only() {
+        let (payload_tx, mut payload_rx) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/detect",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let payload_tx = payload_tx.clone();
+                async move {
+                    payload_tx.send(payload).await.expect("capture request");
+                    Json(serde_json::json!({
+                        "signals": { "nsfw": { "state": "absent" } }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind detector fixture");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve detector fixture");
+        });
+
+        let hash = "5322a546ac6f5f79f70050a2550cda08a7070ddd531a15a7d81cab992d6fd600";
+        let state = trigger_nsfw_scan(
+            &reqwest::Client::new(),
+            &format!("http://{address}/"),
+            &format!("https://media.divine.video/{hash}"),
+            hash,
+            "video/mp4",
+        )
+        .await
+        .expect("detector scan");
+
+        assert_eq!(state, "absent");
+        let payload = payload_rx.recv().await.expect("captured request");
+        assert_eq!(payload["url"], format!("https://media.divine.video/{hash}"));
+        assert_eq!(payload["sha256"], hash);
+        assert_eq!(payload["mime_type"], "video/mp4");
+        assert_eq!(payload["signals"], serde_json::json!(["nsfw"]));
     }
 
     fn transcribe_auth_header(extra_tags: Vec<Vec<String>>) -> axum::http::HeaderMap {

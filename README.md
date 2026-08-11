@@ -61,7 +61,7 @@ Google Cloud Storage is the only backend (bucket default `divine-blossom-media`)
 
 ### How it fits Divine's media stack
 
-`divine-blossom` (Fastly) is the client-facing Blossom control plane; this service is the data plane behind `upload.divine.video`. Finalized blobs and thumbnails are served from the CDN at `media.divine.video`. Video uploads hand off to the transcoder (`TRANSCODER_URL`) for HLS and to the transcription service (`TRANSCRIBER_URL`); these calls are best-effort and asynchronous, so upload latency is unaffected and a downstream outage does not lose the blob.
+`divine-blossom` (Fastly) is the client-facing Blossom control plane; this service is the data plane behind `upload.divine.video`. Finalized blobs and thumbnails are served from the CDN at `media.divine.video`. Video uploads hand off to the transcoder (`TRANSCODER_URL`) for HLS, the transcription service (`TRANSCRIBER_URL`), and the self-hosted detector (`AI_DETECTOR_BASE_URL`) for evidence-only NSFW scanning. These calls are best-effort and asynchronous, so upload latency is unaffected and a downstream outage does not lose the blob. Repeated uploads of an already stored hash do not resubmit detector evidence.
 
 ## Getting started
 
@@ -95,6 +95,7 @@ All configuration comes from environment variables. Defaults reflect production 
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
+| `AI_DETECTOR_BASE_URL` | — | Self-hosted detector base URL. Newly stored videos request the `nsfw` signal asynchronously; unset disables the hook. |
 | `RESUMABLE_SESSION_TTL_SECS` | `86400` | Resumable session lifetime (24h). |
 | `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to the request-body limit. |
 | `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Per-request body limit (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
