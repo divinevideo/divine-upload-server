@@ -97,7 +97,7 @@ pub fn extract_thumbnail(video_data: &[u8]) -> Result<ThumbnailResult> {
 /// Check if a content type is a video type that can have thumbnails extracted
 pub fn is_video_type(content_type: &str) -> bool {
     matches!(
-        content_type,
+        crate::media_type::normalize(content_type).as_str(),
         "video/mp4"
             | "video/webm"
             | "video/quicktime"
@@ -119,5 +119,38 @@ mod tests {
         assert!(!is_video_type("image/png"));
         assert!(!is_video_type("application/json"));
         assert!(!is_video_type("audio/mp3"));
+    }
+
+    #[test]
+    fn video_type_matching_ignores_case() {
+        // Media types are case-insensitive, and browsers and SDKs do send
+        // capitalised forms.
+        assert!(is_video_type("VIDEO/MP4"));
+        assert!(is_video_type("Video/QuickTime"));
+        assert!(!is_video_type("IMAGE/PNG"));
+    }
+
+    #[test]
+    fn video_type_matching_ignores_parameters() {
+        // A codecs parameter is part of a well-formed Content-Type and does not
+        // change which media type was sent.
+        assert!(is_video_type("video/mp4;codecs=\"avc1.42E01E\""));
+        assert!(is_video_type("video/webm; codecs=vp9"));
+        assert!(!is_video_type("image/png; foo=bar"));
+    }
+
+    #[test]
+    fn video_type_matching_ignores_surrounding_whitespace() {
+        assert!(is_video_type("  video/mp4  "));
+        assert!(is_video_type("video/mp4 ; codecs=avc1"));
+    }
+
+    #[test]
+    fn undeclared_types_are_still_not_videos() {
+        // Deciding these from the bytes is tracked separately; normalisation
+        // must not quietly turn an unknown type into a video.
+        assert!(!is_video_type("application/octet-stream"));
+        assert!(!is_video_type(""));
+        assert!(!is_video_type(";codecs=avc1"));
     }
 }
