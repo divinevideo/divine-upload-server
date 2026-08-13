@@ -1293,8 +1293,9 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::{
         build_session_status_response, compute_event_id, cors_allowed_request_headers,
-        cors_exposed_upload_headers, decode_auth_event, handle_transcribe, media_source_candidates,
-        new_temp_media_path, proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
+        cors_exposed_upload_headers, decode_auth_event, get_extension, handle_transcribe,
+        is_transcribable_type, media_source_candidates, new_temp_media_path,
+        proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
         transcribe_audio_url, transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config,
         GcsClient, NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
@@ -1327,6 +1328,37 @@ mod tests {
             http_client: reqwest::Client::new(),
             transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
         })
+    }
+
+    #[test]
+    fn extension_matching_ignores_case_and_parameters() {
+        // The extension lands in the response `url`, which is published as the
+        // Blossom descriptor, so a video that took the video path must not be
+        // handed back as `.bin`.
+        assert_eq!(get_extension("video/mp4"), "mp4");
+        assert_eq!(get_extension("VIDEO/MP4"), "mp4");
+        assert_eq!(get_extension("video/mp4;codecs=\"avc1.42E01E\""), "mp4");
+        assert_eq!(get_extension("Video/QuickTime"), "mov");
+        assert_eq!(get_extension("IMAGE/PNG"), "png");
+        assert_eq!(get_extension("audio/mpeg; rate=44100"), "mp3");
+    }
+
+    #[test]
+    fn undeclared_types_still_get_the_fallback_extension() {
+        assert_eq!(get_extension("application/octet-stream"), "bin");
+        assert_eq!(get_extension(""), "bin");
+        assert_eq!(get_extension(";codecs=avc1"), "bin");
+    }
+
+    #[test]
+    fn transcribable_matching_ignores_case_and_parameters() {
+        assert!(is_transcribable_type("video/mp4"));
+        assert!(is_transcribable_type("VIDEO/MP4"));
+        assert!(is_transcribable_type("Audio/MPEG"));
+        assert!(is_transcribable_type("audio/ogg; codecs=opus"));
+        assert!(!is_transcribable_type("image/png"));
+        assert!(!is_transcribable_type("application/octet-stream"));
+        assert!(!is_transcribable_type(""));
     }
 
     #[tokio::test]
@@ -1860,7 +1892,7 @@ fn verify_signature(event: &NostrEvent) -> Result<()> {
 }
 
 fn get_extension(content_type: &str) -> &'static str {
-    match content_type {
+    match media_type::normalize(content_type).as_str() {
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
@@ -1876,7 +1908,8 @@ fn get_extension(content_type: &str) -> &'static str {
 }
 
 fn is_transcribable_type(content_type: &str) -> bool {
-    content_type.starts_with("video/") || content_type.starts_with("audio/")
+    let normalized = media_type::normalize(content_type);
+    normalized.starts_with("video/") || normalized.starts_with("audio/")
 }
 
 /// Trigger HLS transcoding for a video (fire-and-forget)
