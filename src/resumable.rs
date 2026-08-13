@@ -939,7 +939,7 @@ fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
 }
 
 fn is_video_content_type(content_type: &str) -> bool {
-    content_type.starts_with("video/")
+    crate::media_type::normalize(content_type).starts_with("video/")
 }
 
 fn internal_error(error: anyhow::Error) -> ResumableError {
@@ -957,6 +957,15 @@ mod tests {
     use futures::stream;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
+
+    #[test]
+    fn video_content_type_matching_ignores_case() {
+        assert!(is_video_content_type("video/mp4"));
+        assert!(is_video_content_type("VIDEO/MP4"));
+        assert!(is_video_content_type("Video/WebM; codecs=vp9"));
+        assert!(!is_video_content_type("image/png"));
+        assert!(!is_video_content_type("application/octet-stream"));
+    }
 
     #[derive(Clone, Default)]
     struct InMemoryStore {

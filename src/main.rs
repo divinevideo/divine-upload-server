@@ -1,6 +1,7 @@
 // ABOUTME: Rust upload service for Blossom blob uploads
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
+mod media_type;
 mod resumable;
 mod thumbnail;
 
