@@ -2,6 +2,7 @@
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
 mod media_type;
+mod request_log;
 mod resumable;
 mod thumbnail;
 
@@ -230,6 +231,40 @@ fn cors_allowed_request_headers() -> Vec<HeaderName> {
     ]
 }
 
+/// Emit one structured access-log line per request.
+///
+/// This is what makes the edge's upload records joinable: the divine-blossom
+/// edge sets `X-Request-Id` on every proxied upload request, and the same value
+/// is logged here as `req_id`. An edge record whose send timed out with no
+/// matching line here means the request never completed at origin; a matching
+/// line means origin did see it, and shows how long it took.
+async fn log_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let req_id = request_log::correlation_id(req.headers());
+    let content_length = request_log::declared_content_length(req.headers());
+
+    let response = next.run(req).await;
+
+    info!(
+        "{}",
+        request_log::format_request_log(&request_log::RequestLogFields {
+            req_id,
+            method,
+            path,
+            status: response.status().as_u16(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            content_length,
+        })
+    );
+
+    response
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -313,6 +348,7 @@ async fn main() -> Result<()> {
         .route("/", put(handle_upload))
         .route("/", options(handle_cors_preflight))
         .layer(cors)
+        .layer(axum::middleware::from_fn(log_request))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
