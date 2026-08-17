@@ -2,6 +2,7 @@
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
 mod media_type;
+mod request_log;
 mod resumable;
 mod thumbnail;
 
@@ -42,6 +43,7 @@ use tempfile::NamedTempFile;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
+use tracing_subscriber::filter::Directive;
 
 const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
 
@@ -230,13 +232,146 @@ fn cors_allowed_request_headers() -> Vec<HeaderName> {
     ]
 }
 
+/// Emit one structured access-log line per request.
+///
+/// This is what makes the edge's upload records joinable: the divine-blossom
+/// edge sets `X-Request-Id` on every proxied upload request, and the same value
+/// is logged here as `req_id`. An edge record whose send timed out with no
+/// matching line here means the request never completed at origin; a matching
+/// line means origin did see it, and shows how long it took.
+async fn log_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut entry = RequestLogEntry::starting(&req);
+
+    let response = next.run(req).await;
+    entry.responded(response.status().as_u16());
+
+    response
+}
+
+/// Holds one request's log fields and emits the line when it is dropped.
+///
+/// Emitting from `Drop` rather than after the `await` is what keeps abandoned
+/// requests on the record. When the edge gives up at its timeout the connection
+/// goes away, hyper drops the in-flight future, and code after the `await`
+/// never runs — so the requests this instrumentation exists to explain would be
+/// the only ones producing no origin line at all. They now log with `status=-`,
+/// which separates "origin had it and was still working after N ms" from "no
+/// line at all", meaning origin never saw the request.
+struct RequestLogEntry {
+    started: std::time::Instant,
+    req_id: String,
+    method: String,
+    path: String,
+    content_length: Option<u64>,
+    status: Option<u16>,
+}
+
+impl RequestLogEntry {
+    fn starting(req: &axum::extract::Request) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            req_id: request_log::correlation_id(req.headers()),
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+            content_length: request_log::declared_content_length(req.headers()),
+            status: None,
+        }
+    }
+
+    fn responded(&mut self, status: u16) {
+        self.status = Some(status);
+    }
+}
+
+impl Drop for RequestLogEntry {
+    fn drop(&mut self) {
+        info!(
+            "{}",
+            request_log::format_request_log(&request_log::RequestLogFields {
+                req_id: std::mem::take(&mut self.req_id),
+                method: std::mem::take(&mut self.method),
+                path: std::mem::take(&mut self.path),
+                status: self.status,
+                duration_ms: self.started.elapsed().as_millis() as u64,
+                content_length: self.content_length,
+            })
+        );
+    }
+}
+
+/// Assemble every route, the CORS layer, and the access log around them.
+///
+/// Extracted from `main` so tests can drive a real request through the real
+/// layer stack, which is the only way to prove the access log is actually
+/// wired in front of the routes rather than merely defined.
+fn build_router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::PUT,
+            Method::POST,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(cors_allowed_request_headers())
+        .expose_headers(cors_exposed_upload_headers())
+        .max_age(std::time::Duration::from_secs(86400));
+
+    Router::new()
+        .route("/upload", put(handle_upload))
+        .route("/upload", options(handle_cors_preflight))
+        .route("/upload/init", post(handle_resumable_init))
+        .route("/upload/init", options(handle_cors_preflight))
+        .route(
+            "/upload/:upload_id/complete",
+            post(handle_resumable_complete),
+        )
+        .route(
+            "/upload/:upload_id/complete",
+            options(handle_cors_preflight),
+        )
+        .route("/upload/:upload_id", delete(handle_resumable_abort))
+        .route("/upload/:upload_id", options(handle_cors_preflight))
+        .route("/sessions/:upload_id", put(handle_session_chunk))
+        .route("/sessions/:upload_id", head(handle_session_head))
+        .route("/sessions/:upload_id", options(handle_cors_preflight))
+        .route("/migrate", post(handle_migrate))
+        .route("/migrate", options(handle_cors_preflight))
+        .route("/audit", post(handle_audit_log))
+        .route("/transcribe", post(handle_transcribe))
+        .route("/transcribe", options(handle_cors_preflight))
+        .route("/thumbnail/:hash", get(handle_thumbnail_generate))
+        .route("/thumbnail/:hash", options(handle_cors_preflight))
+        .route("/", get(handle_landing))
+        .route("/", put(handle_upload))
+        .route("/", options(handle_cors_preflight))
+        .layer(cors)
+        .layer(axum::middleware::from_fn(log_request))
+        .with_state(state)
+}
+
+/// `info`-level filter directive for this service's own logs.
+///
+/// Derived from the crate name rather than spelled out. A directive naming a
+/// crate that does not exist matches nothing, and an `EnvFilter` left with no
+/// matching directive falls back to `ERROR` — which silently drops every
+/// `info!` and `warn!` the service emits, access-log lines included.
+fn service_log_directive() -> Result<Directive> {
+    Ok(format!("{}=info", env!("CARGO_CRATE_NAME")).parse()?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("blossom_upload=info".parse()?),
+                .add_directive(service_log_directive()?),
         )
         .init();
 
@@ -268,52 +403,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // CORS configuration
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::HEAD,
-            Method::PUT,
-            Method::POST,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers(cors_allowed_request_headers())
-        .expose_headers(cors_exposed_upload_headers())
-        .max_age(std::time::Duration::from_secs(86400));
-
-    // Build router
-    let app = Router::new()
-        .route("/upload", put(handle_upload))
-        .route("/upload", options(handle_cors_preflight))
-        .route("/upload/init", post(handle_resumable_init))
-        .route("/upload/init", options(handle_cors_preflight))
-        .route(
-            "/upload/:upload_id/complete",
-            post(handle_resumable_complete),
-        )
-        .route(
-            "/upload/:upload_id/complete",
-            options(handle_cors_preflight),
-        )
-        .route("/upload/:upload_id", delete(handle_resumable_abort))
-        .route("/upload/:upload_id", options(handle_cors_preflight))
-        .route("/sessions/:upload_id", put(handle_session_chunk))
-        .route("/sessions/:upload_id", head(handle_session_head))
-        .route("/sessions/:upload_id", options(handle_cors_preflight))
-        .route("/migrate", post(handle_migrate))
-        .route("/migrate", options(handle_cors_preflight))
-        .route("/audit", post(handle_audit_log))
-        .route("/transcribe", post(handle_transcribe))
-        .route("/transcribe", options(handle_cors_preflight))
-        .route("/thumbnail/:hash", get(handle_thumbnail_generate))
-        .route("/thumbnail/:hash", options(handle_cors_preflight))
-        .route("/", get(handle_landing))
-        .route("/", put(handle_upload))
-        .route("/", options(handle_cors_preflight))
-        .layer(cors)
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting HTTP/2 server on {}", addr);
@@ -1295,22 +1385,26 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        build_session_status_response, compute_event_id, cors_allowed_request_headers,
-        cors_exposed_upload_headers, decode_auth_event, get_extension, handle_transcribe,
-        is_transcribable_type, media_source_candidates, new_temp_media_path,
-        proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
-        transcribe_audio_url, transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config,
-        GcsClient, NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
+        build_router, build_session_status_response, compute_event_id,
+        cors_allowed_request_headers, cors_exposed_upload_headers, decode_auth_event,
+        get_extension, handle_transcribe, is_transcribable_type, log_request,
+        media_source_candidates, new_temp_media_path, proxy_transcribe_audio,
+        resolve_resumable_chunk_size, server_tag_host, service_log_directive, transcribe_audio_url,
+        transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config, GcsClient, NostrEvent,
+        TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
+    use crate::request_log;
     use crate::resumable;
     use axum::body::Body;
     use axum::extract::State;
-    use axum::http::{header, HeaderValue, StatusCode};
-    use axum::{routing::post, Json, Router};
+    use axum::http::{header, HeaderValue, Request, StatusCode};
+    use axum::{routing::get, routing::post, Json, Router};
     use google_cloud_storage::client::ClientConfig;
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+    use tracing_subscriber::EnvFilter;
 
     fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
         Arc::new(AppState {
@@ -1331,6 +1425,193 @@ mod tests {
             http_client: reqwest::Client::new(),
             transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
         })
+    }
+
+    /// Collects everything the `tracing` subscriber writes, so a test can
+    /// assert on the log line a request actually produced.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Subscribe with the service's own directive and an empty `RUST_LOG`,
+    /// which is how the deployed container runs.
+    fn capture_service_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("").add_directive(service_log_directive().unwrap()))
+            .with_writer(capture.clone())
+            .finish();
+
+        (
+            capture.clone(),
+            tracing::subscriber::set_default(subscriber),
+        )
+    }
+
+    #[test]
+    fn the_service_log_directive_lets_this_crates_info_lines_through() {
+        // A directive naming a crate that does not exist matches nothing, and
+        // `EnvFilter` then falls back to ERROR — which mutes every access-log
+        // line the service emits. Deriving the target from the crate name is
+        // only worth anything if it actually resolves, so pin that here.
+        let (capture, _guard) = capture_service_logs();
+
+        tracing::info!("info level reaches the subscriber");
+
+        assert!(
+            capture
+                .contents()
+                .contains("info level reaches the subscriber"),
+            "expected an info line, got: {}",
+            capture.contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_through_the_router_logs_the_edge_correlation_id() {
+        // The formatting functions are unit-tested in `request_log`; what this
+        // covers is the wiring — that the layer sits in front of the routes and
+        // reads the correlation ID, method, path, and final status off a real
+        // request/response pair.
+        let (capture, _guard) = capture_service_logs();
+
+        let response = build_router(test_state(None, 1))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header(request_log::REQUEST_ID_HEADER, "edge-id-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains("[REQUEST] req_id=edge-id-123"),
+            "expected the edge correlation ID, got: {logged}"
+        );
+        assert!(logged.contains("method=GET"), "got: {logged}");
+        assert!(logged.contains("path=/"), "got: {logged}");
+        assert!(logged.contains("status=200"), "got: {logged}");
+    }
+
+    #[tokio::test]
+    async fn the_logged_status_is_the_response_status() {
+        // Guards against a line that always reports 200: an unmatched route is
+        // the cheapest response this service produces that is not a success,
+        // and it also shows the layer covers requests no route handles.
+        let (capture, _guard) = capture_service_logs();
+
+        let response = build_router(test_state(None, 1))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/no-such-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            capture.contents().contains("status=404"),
+            "got: {}",
+            capture.contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_an_edge_correlation_id_still_logs() {
+        // Resumable chunk appends go straight to this service and carry no edge
+        // header. They are the one path with no edge record, so an origin
+        // record is all there is.
+        let (capture, _guard) = capture_service_logs();
+
+        build_router(test_state(None, 1))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            capture.contents().contains("[REQUEST] req_id=-"),
+            "got: {}",
+            capture.contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_is_still_logged() {
+        // What the edge giving up at its timeout looks like from here: the
+        // future is dropped mid-flight and code after the `await` never runs.
+        // Without a line for these, the requests under investigation are the
+        // only ones leaving no origin record, and "no line" could not tell
+        // "origin never saw it" from "origin was still working on it".
+        let (capture, _guard) = capture_service_logs();
+
+        let app = Router::new()
+            .route(
+                "/never-completes",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(axum::middleware::from_fn(log_request));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/never-completes")
+                    .header(request_log::REQUEST_ID_HEADER, "abandoned-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the request should not have completed");
+
+        let logged = capture.contents();
+        assert!(logged.contains("req_id=abandoned-id"), "got: {logged}");
+        assert!(logged.contains("status=-"), "got: {logged}");
+        assert!(logged.contains("path=/never-completes"), "got: {logged}");
     }
 
     #[test]
