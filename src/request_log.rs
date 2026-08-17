@@ -19,14 +19,22 @@ pub struct RequestLogFields {
     pub req_id: String,
     pub method: String,
     pub path: String,
-    pub status: u16,
-    /// Time from the request's headers arriving to its response being ready.
+    /// Response status, or `None` when the request was dropped before one
+    /// existed.
+    ///
+    /// `None` is what the edge giving up at its timeout looks like from here:
+    /// the connection goes away, hyper drops the in-flight future, and no
+    /// response is ever produced. Those requests are the population under
+    /// investigation, so the line records them rather than omitting them.
+    pub status: Option<u16>,
+    /// Time from the request's headers arriving to its response being ready,
+    /// or to the request being dropped when no response was produced.
     ///
     /// This spans receiving the request body as well as handling it, so it is
     /// not by itself a measure of processing cost. Its value is comparative:
-    /// an edge record that timed out with no matching line here means origin
-    /// never completed the request, while a matching line means origin did see
-    /// it and this is how long it took.
+    /// a `status=-` line means origin had the request in hand and was still
+    /// working on it after this long, while no line at all means the request
+    /// never reached origin.
     pub duration_ms: u64,
     pub content_length: Option<u64>,
 }
@@ -81,13 +89,17 @@ pub fn format_request_log(fields: &RequestLogFields) -> String {
         fields.req_id,
         fields.method,
         fields.path,
-        fields.status,
+        or_absent(fields.status),
         fields.duration_ms,
-        fields
-            .content_length
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| ABSENT.to_string()),
+        or_absent(fields.content_length),
     )
+}
+
+/// Render an optional field, so every line carries every field.
+fn or_absent<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| ABSENT.to_string())
 }
 
 #[cfg(test)]
@@ -151,7 +163,7 @@ mod tests {
             req_id: "5602d9b23c24".into(),
             method: "PUT".into(),
             path: "/upload".into(),
-            status: 200,
+            status: Some(200),
             duration_ms: 3200,
             content_length: Some(6_517_922),
         });
@@ -173,7 +185,7 @@ mod tests {
             req_id: "abc".into(),
             method: "PUT".into(),
             path: "/upload".into(),
-            status: 200,
+            status: Some(200),
             duration_ms: 119_500,
             content_length: Some(6_517_922),
         });
@@ -187,7 +199,7 @@ mod tests {
             req_id: "abc".into(),
             method: "POST".into(),
             path: "/upload/init".into(),
-            status: 200,
+            status: Some(200),
             duration_ms: 12,
             content_length: None,
         });
@@ -201,12 +213,31 @@ mod tests {
             req_id: "abc".into(),
             method: "PUT".into(),
             path: "/upload".into(),
-            status: 500,
+            status: Some(500),
             duration_ms: 1,
             content_length: None,
         });
 
         assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn an_abandoned_request_renders_a_placeholder_status() {
+        // This is the shape a request the edge gave up on produces: hyper drops
+        // the in-flight future, so there is no response and no status, but the
+        // line still shows origin had the request and how long it had held it.
+        let line = format_request_log(&RequestLogFields {
+            req_id: "5602d9b23c24".into(),
+            method: "PUT".into(),
+            path: "/upload".into(),
+            status: None,
+            duration_ms: 120_000,
+            content_length: Some(6_517_922),
+        });
+
+        assert!(line.contains("status=-"));
+        assert!(line.contains("duration_ms=120000"));
+        assert!(line.contains("content_length=6517922"));
     }
 
     #[test]

@@ -243,27 +243,63 @@ async fn log_request(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let started = std::time::Instant::now();
-    let method = req.method().as_str().to_string();
-    let path = req.uri().path().to_string();
-    let req_id = request_log::correlation_id(req.headers());
-    let content_length = request_log::declared_content_length(req.headers());
+    let mut entry = RequestLogEntry::starting(&req);
 
     let response = next.run(req).await;
-
-    info!(
-        "{}",
-        request_log::format_request_log(&request_log::RequestLogFields {
-            req_id,
-            method,
-            path,
-            status: response.status().as_u16(),
-            duration_ms: started.elapsed().as_millis() as u64,
-            content_length,
-        })
-    );
+    entry.responded(response.status().as_u16());
 
     response
+}
+
+/// Holds one request's log fields and emits the line when it is dropped.
+///
+/// Emitting from `Drop` rather than after the `await` is what keeps abandoned
+/// requests on the record. When the edge gives up at its timeout the connection
+/// goes away, hyper drops the in-flight future, and code after the `await`
+/// never runs — so the requests this instrumentation exists to explain would be
+/// the only ones producing no origin line at all. They now log with `status=-`,
+/// which separates "origin had it and was still working after N ms" from "no
+/// line at all", meaning origin never saw the request.
+struct RequestLogEntry {
+    started: std::time::Instant,
+    req_id: String,
+    method: String,
+    path: String,
+    content_length: Option<u64>,
+    status: Option<u16>,
+}
+
+impl RequestLogEntry {
+    fn starting(req: &axum::extract::Request) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            req_id: request_log::correlation_id(req.headers()),
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+            content_length: request_log::declared_content_length(req.headers()),
+            status: None,
+        }
+    }
+
+    fn responded(&mut self, status: u16) {
+        self.status = Some(status);
+    }
+}
+
+impl Drop for RequestLogEntry {
+    fn drop(&mut self) {
+        info!(
+            "{}",
+            request_log::format_request_log(&request_log::RequestLogFields {
+                req_id: std::mem::take(&mut self.req_id),
+                method: std::mem::take(&mut self.method),
+                path: std::mem::take(&mut self.path),
+                status: self.status,
+                duration_ms: self.started.elapsed().as_millis() as u64,
+                content_length: self.content_length,
+            })
+        );
+    }
 }
 
 /// Assemble every route, the CORS layer, and the access log around them.
@@ -1351,18 +1387,18 @@ mod tests {
     use super::{
         build_router, build_session_status_response, compute_event_id,
         cors_allowed_request_headers, cors_exposed_upload_headers, decode_auth_event,
-        get_extension, handle_transcribe, is_transcribable_type, media_source_candidates,
-        new_temp_media_path, proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
-        service_log_directive, transcribe_audio_url, transcribe_server_tag_allowed,
-        trigger_nsfw_scan, AppState, Config, GcsClient, NostrEvent, TranscribeParams,
-        BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
+        get_extension, handle_transcribe, is_transcribable_type, log_request,
+        media_source_candidates, new_temp_media_path, proxy_transcribe_audio,
+        resolve_resumable_chunk_size, server_tag_host, service_log_directive, transcribe_audio_url,
+        transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config, GcsClient, NostrEvent,
+        TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
     use crate::request_log;
     use crate::resumable;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{header, HeaderValue, Request, StatusCode};
-    use axum::{routing::post, Json, Router};
+    use axum::{routing::get, routing::post, Json, Router};
     use google_cloud_storage::client::ClientConfig;
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
@@ -1536,6 +1572,46 @@ mod tests {
             "got: {}",
             capture.contents()
         );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_is_still_logged() {
+        // What the edge giving up at its timeout looks like from here: the
+        // future is dropped mid-flight and code after the `await` never runs.
+        // Without a line for these, the requests under investigation are the
+        // only ones leaving no origin record, and "no line" could not tell
+        // "origin never saw it" from "origin was still working on it".
+        let (capture, _guard) = capture_service_logs();
+
+        let app = Router::new()
+            .route(
+                "/never-completes",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(axum::middleware::from_fn(log_request));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/never-completes")
+                    .header(request_log::REQUEST_ID_HEADER, "abandoned-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the request should not have completed");
+
+        let logged = capture.contents();
+        assert!(logged.contains("req_id=abandoned-id"), "got: {logged}");
+        assert!(logged.contains("status=-"), "got: {logged}");
+        assert!(logged.contains("path=/never-completes"), "got: {logged}");
     }
 
     #[test]
