@@ -43,6 +43,7 @@ use tempfile::NamedTempFile;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
+use tracing_subscriber::filter::Directive;
 
 const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
 
@@ -265,13 +266,23 @@ async fn log_request(
     response
 }
 
+/// `info`-level filter directive for this service's own logs.
+///
+/// Derived from the crate name rather than spelled out. A directive naming a
+/// crate that does not exist matches nothing, and an `EnvFilter` left with no
+/// matching directive falls back to `ERROR` — which silently drops every
+/// `info!` and `warn!` the service emits, access-log lines included.
+fn service_log_directive() -> Result<Directive> {
+    Ok(format!("{}=info", env!("CARGO_CRATE_NAME")).parse()?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("blossom_upload=info".parse()?),
+                .add_directive(service_log_directive()?),
         )
         .init();
 
@@ -1335,8 +1346,9 @@ mod tests {
         cors_exposed_upload_headers, decode_auth_event, get_extension, handle_transcribe,
         is_transcribable_type, media_source_candidates, new_temp_media_path,
         proxy_transcribe_audio, resolve_resumable_chunk_size, server_tag_host,
-        transcribe_audio_url, transcribe_server_tag_allowed, trigger_nsfw_scan, AppState, Config,
-        GcsClient, NostrEvent, TranscribeParams, BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
+        service_log_directive, transcribe_audio_url, transcribe_server_tag_allowed,
+        trigger_nsfw_scan, AppState, Config, GcsClient, NostrEvent, TranscribeParams,
+        BLOSSOM_AUTH_KIND, TRANSCRIBE_SHED_RETRY_AFTER,
     };
     use crate::resumable;
     use axum::body::Body;
@@ -1347,6 +1359,7 @@ mod tests {
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tracing_subscriber::EnvFilter;
 
     fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
         Arc::new(AppState {
@@ -1367,6 +1380,70 @@ mod tests {
             http_client: reqwest::Client::new(),
             transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),
         })
+    }
+
+    /// Collects everything the `tracing` subscriber writes, so a test can
+    /// assert on the log line a request actually produced.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Subscribe with the service's own directive and an empty `RUST_LOG`,
+    /// which is how the deployed container runs.
+    fn capture_service_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("").add_directive(service_log_directive().unwrap()))
+            .with_writer(capture.clone())
+            .finish();
+
+        (
+            capture.clone(),
+            tracing::subscriber::set_default(subscriber),
+        )
+    }
+
+    #[test]
+    fn the_service_log_directive_lets_this_crates_info_lines_through() {
+        // A directive naming a crate that does not exist matches nothing, and
+        // `EnvFilter` then falls back to ERROR — which mutes every access-log
+        // line the service emits. Deriving the target from the crate name is
+        // only worth anything if it actually resolves, so pin that here.
+        let (capture, _guard) = capture_service_logs();
+
+        tracing::info!("info level reaches the subscriber");
+
+        assert!(
+            capture
+                .contents()
+                .contains("info level reaches the subscriber"),
+            "expected an info line, got: {}",
+            capture.contents()
+        );
     }
 
     #[test]
