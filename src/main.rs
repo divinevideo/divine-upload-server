@@ -2288,9 +2288,12 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
     }
 }
 
-/// Max audio body accepted by `POST /transcribe`. Bounded by the production
-/// NGINX ingress (`client_max_body_size 16m`): anything larger is rejected
-/// before it reaches this handler, so a higher limit here would be a lie.
+/// Max audio body accepted by `POST /transcribe`. Matches the production ingress
+/// limit for this host: the `divine-upload-server` HTTPRoute attaches the
+/// `upload-body-size` SnippetsFilter (`client_max_body_size 16m`), which is a
+/// location-context directive and so overrides the 100 MiB gateway-wide
+/// `ClientSettingsPolicy`. Anything larger is rejected before it reaches this
+/// handler, so a higher limit here would be a lie.
 /// Editor clip audio (16 kHz mono PCM, ~32 KB/s) is far under this.
 const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 

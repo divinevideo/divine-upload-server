@@ -84,7 +84,7 @@ Without GCS credentials the storage-backed routes will fail, but the server star
 
 ## Configuration
 
-All configuration comes from environment variables. Defaults reflect production values.
+All configuration comes from environment variables. The table below lists the code defaults, which are not always what production deploys — see the note under the table.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -97,10 +97,16 @@ All configuration comes from environment variables. Defaults reflect production 
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
 | `AI_DETECTOR_BASE_URL` | — | Self-hosted detector base URL. Newly stored videos request the `nsfw` signal asynchronously; unset disables the hook. |
 | `RESUMABLE_SESSION_TTL_SECS` | `86400` | Resumable session lifetime (24h). |
-| `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to the request-body limit. |
-| `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Per-request body limit (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
+| `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE`. |
+| `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Upper bound on the *advertised* chunk size (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
 
-`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`, so the published chunk contract can never exceed the actual request-body limit on `upload.divine.video`. The default limit of `1048576` bytes matches the production ingress.
+`RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`.
+
+`RESUMABLE_MAX_REQUEST_BODY_SIZE` is **not** an enforced request-body limit, despite the name — it is consumed only by that clamp. Inbound chunk size is bounded by the ingress: the `divine-upload-server` HTTPRoute attaches the `upload-body-size` SnippetsFilter (`client_max_body_size 16m`), a location-context directive that overrides the 100 MiB gateway-wide `ClientSettingsPolicy`.
+
+On the chunk `PUT` path the server enforces no request-body limit of its own. What a chunk `PUT` must satisfy is that the `Content-Range` total equals the session's declared size, that the range lies inside that size, that the range start equals the session's next offset, that the range length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size therefore cannot reject clients that keep sending larger chunks, as long as those chunks stay within the declared size, start at the expected offset, and are 256 KiB-aligned.
+
+These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 
 ## Deployment
 
