@@ -1,116 +1,106 @@
-# Image publication and production promotion
+# GitOps image-update sender
 
-## Enable only after the receiver is ready
+This code prepares a production image-update request. It does not provision
+credentials, configure GitHub Environments, enable promotion, merge a PR, or
+perform a controlled rollout. Those actions require separate authorization.
 
-The sender targets only the existing upload-server **production** overlay in
-`divinevideo/divine-iac-coreconfig`. It adds no environment and does not change
-the production approval policy. Before enabling it, a Platform maintainer must:
+## Prerequisites before enabling
 
-1. Merge the upload-server companion receiver changes: its application/image
-   allowlist entry, digest-pinned image handling and upload-server-specific
-   post-merge sync/verification path.
-   The existing production overlay must continue to use
-   `us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server`.
-2. Verify the public `https://upload.divine.video/` route actually reaches that
-   workload and check the running image, not just the desired-state overlay.
-3. Confirm the receiver's production approval rule remains enforced. The sender
-   uses `internal: true`, **never** `hotfix` or `auto_promote`. The receiver may
-   enable auto-merge on its PR; that is distinct from bypassing required approval.
-4. Make `APP_ID` and `APP_PRIVATE_KEY` available to this repository's Actions
-   runner through the approved credential-management process. These are the
-   GitHub App credentials used to mint a short-lived token, not GCP credentials.
-   The App installation must cover **only the required receiver repository**
-   (`divine-iac-coreconfig`) with Contents write permission for
-   `repository_dispatch` (and implicit Metadata read). The token request scopes
-   itself to that repository and permission. The sender's ordinary `GITHUB_TOKEN`
-   remains Contents read and is used only to verify the source main tip. The
-   receiver keeps its own existing credentials for creating promotion PRs.
-5. The companion receiver has its own default-off Actions variable,
-   `UPLOAD_SERVER_GITOPS_ENABLED`. Set that receiver variable and this sender's
-   `GITOPS_DEPLOY_ENABLED` to `true` only after those prerequisites and the
-   rollout authorization are in place. Enabling the sender alone is insufficient.
+A Platform administrator must complete and verify these prerequisites through
+the approved operational process, **before** making credentials available or
+setting this repository's `GITOPS_DEPLOY_ENABLED` variable to `true`:
 
-Neither merging sender code nor a successful PR check provisions credentials,
-enables that variable, authorizes a rollout, or proves the receiver is ready.
-Missing credentials fail the enabled promotion job; there is no silent fallback
-to a laptop deployment or production bypass.
+1. The companion receiver for
+   [coreconfig issue 2338](https://github.com/divinevideo/divine-iac-coreconfig/issues/2338)
+   is merged, reviewed and ready for the payload below. Its
+   `UPLOAD_SERVER_GITOPS_ENABLED` opt-in is separately controlled. Sender code
+   alone does not establish receiver readiness or authorize either opt-in.
+2. Create/configure the GitHub Environment **`production-gitops`** with a custom
+   deployment-branch policy allowing **only the branch `main`**, not tags or
+   arbitrary protected branches. The workflow references that environment;
+   the reference alone does not create or prove the required restrictions.
+   Leave the sender disabled if that environment or its policy is absent.
+3. Supply the existing dispatch App credentials as **environment secrets** in
+   `production-gitops`: `CORECONFIG_DISPATCH_APP_ID` and
+   `CORECONFIG_DISPATCH_APP_PRIVATE_KEY`. Do not expose them as repository-wide
+   secrets or make organization-level copies accessible to every branch in this
+   repository. Reuse the established App through the approved process rather
+   than creating a new credential. Never print or commit values.
+4. Verify the App installation can dispatch to `divine-iac-coreconfig` with
+   Contents write (and implicit Metadata read). The minted token explicitly
+   requests only that repository and permission. The ordinary `GITHUB_TOKEN`
+   remains Contents read and checks the source main tip only. The environment's
+   branch restriction, rather than workflow self-checks alone, controls access
+   to the dispatch credential.
+5. Verify the serving destination and obtain rollout authorization using the
+   [private receiver runbook](https://github.com/divinevideo/divine-iac-coreconfig/blob/main/docs/how-to/companion-image-deploy.md).
+   That runbook owns cluster access, production approval, serving-image checks,
+   and operational rollback. No such validation is performed by sender PR CI.
 
-## What runs automatically
+Missing credentials fail the enabled promotion job; there is no fallback to a
+manual deployment or a weaker approval path.
 
-Only a **push to main** can publish and request promotion. The promotion job
-depends on successful Verify and Publish Production Image jobs. Pull requests,
-other branches, and `workflow_dispatch` do not publish or deploy. The helper also
-checks the event, source repository, ref, full SHA and digest, then reads the
-current source `main` through GitHub before dispatching. A rerun of a superseded
-main commit fails instead of requesting an older version.
+## Sender contract
 
-The image tag is the full source SHA. The exact build digest is included in
-`images[].digest` for the companion receiver to pin in the production overlay,
-and as `image_digest` provenance in the dispatch and in the build and promotion
-job summaries. The receiver must preserve the full GAR image name, write
-`digest: sha256:…` and remove `newTag`, rather than deploying the mutable SHA
-tag. Rebuilding the same source can change the image, so a different digest
-still needs its own production PR/approval. Retain the build summary and verify
-the running digest against it after promotion. Do not treat a tag alone as
-proof of the image being served.
+Only a successful **push to main** can publish and request promotion. The
+promotion job depends on Verify and Publish Production Image for the same SHA.
+Pull requests, other branches and `workflow_dispatch` cannot publish or deploy.
+`dispatch-image.py --check-source` checks the current main tip before image
+publication; the default helper mode repeats the tip check before dispatch.
+A superseded main rerun fails instead of deliberately moving old registry tags
+or requesting an older release. The checks cannot recall requests already sent.
 
-## Controlled rollout and evidence
+The receiver event is `image-deploy`, with this `client_payload`:
 
-Perform this only with separate rollout approval and existing read access.
-Record the source workflow run URL, source SHA, image digest, receiver
-`image-deploy` run, generated production PR, its approval/merge, and the
-`post-merge-sync` run. Before approving the generated PR, confirm the SHA is the
-intended release, the registry tag resolves to the recorded digest, and the PR
-changes only the intended production image. A newer main push after dispatch
-does not recall an already-created PR; compare pending promotion PRs and do not
-approve an older request over a newer release.
-
-After the approved promotion merges, check ArgoCD sync and health and inspect
-the Deployment and every serving pod's image ID. For existing Connect Gateway
-access to the production cluster, read-only examples are:
-
-```sh
-kubectl --context=connectgateway_dv-platform-prod_us-central1_gke-production-membership \
-  -n media get deployment divine-upload-server \
-  -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}{.status.availableReplicas}{"\n"}'
-kubectl --context=connectgateway_dv-platform-prod_us-central1_gke-production-membership \
-  -n media get pods -l app=divine-upload-server \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.containerStatuses[*].imageID}{"\n"}{end}'
-curl --fail --show-error https://upload.divine.video/
+```json
+{
+  "application": "divine-upload-server",
+  "environments": ["production"],
+  "images": [{"name": "divine-upload-server", "tag": "<full-source-sha>", "digest": "sha256:<64-hex>"}],
+  "internal": true,
+  "hotfix": false,
+  "auto_promote": false,
+  "source_repo": "divinevideo/divine-upload-server",
+  "source_sha": "<same-full-source-sha>",
+  "source_ref": "main",
+  "image_digest": "sha256:<same-64-hex>"
+}
 ```
 
-Check that the Deployment image is pinned to the intended build digest, all
-desired replicas are ready, and **all** serving pod digests equal that digest. Public
-landing-page success alone establishes neither readiness nor image identity.
-Use an authorized synthetic upload smoke test for application-level verification;
-do not use private media or real creator identifiers in evidence. Do not call the
-rollout complete until these checks succeed. No controlled rollout is performed
-by the sender PR's validation.
+Both digest fields are required by the companion contract and must match.
+There are ten payload properties, the API limit; do not add another without
+coordinating a receiver contract change. SHA tags provide source identity;
+the receiver must **deploy by digest**, not by mutable tag. A same-source
+rebuild can produce different content and requires its own digest-specific
+production update and approval. Short-SHA tags remain published for existing
+manual consumers but are not used by this sender's payload.
 
-## Recovery, reruns and rollback
+Build and promotion summaries record the full source SHA, image path and
+digest. Retain both run URLs with the receiver run and generated PR. The image
+path in the promotion summary comes from the publishing job's output, not a
+second hard-coded registry path. A successful dispatch means only that GitHub
+accepted a request; it is not proof of a receiver PR, approval, healthy rollout,
+or serving image. Complete those checks using the private runbook.
 
-- If Verify or publication fails, no promotion job runs. Fix the failing step
-  and rerun the failed job/dependent jobs on the **current main push** in Actions.
-- If token creation or dispatch fails, inspect the receiver's run list and open
-  image-update PRs before retrying: a lost response can still have created a
-  request. Retry only after establishing that no matching SHA request exists.
-  A successful dispatch can still fail receiver validation, so inspect its run.
-- For a receiver rejection, repair the receiver prerequisite through its normal
-  review path, then rerun only the current-main promotion job. Do not weaken
-  allowlists, registry checks or production approval to recover.
-- To repeat verification manually, use `workflow_dispatch` on `main`; it runs
-  Verify only, in a separate concurrency group from push runs so it cannot
-  cancel an in-flight publication/promotion. It intentionally cannot force
-  publication or promotion. Re-running
-  the original current-main **push** is the supported promotion recovery path;
-  arbitrary refs and stale main pushes remain rejected.
-- For rollback, choose a previously verified SHA and digest in the production
-  registry, open a receiver PR reverting the upload-server overlay to that digest,
-  obtain normal production approval, and follow post-merge sync and the same
-  serving-image/health checks. Do not rerun an old source workflow to roll back,
-  patch the live Deployment, or deploy `latest`. Coordinate pending newer
-  promotion PRs so they do not immediately undo the approved rollback.
+## Failure recovery and reruns
 
-Credential changes, enabling/disabling the dispatch variable, merging promotion
-PRs and live rollback are operational actions with their own authorization;
-these instructions do not grant it.
+- Failed verification/publication prevents promotion. Inspect the failed step
+  before rerunning the failed job/dependent jobs on the **current main push**.
+- HTTP errors report their status and a diagnostic category. Do not log raw
+  response bodies or credentials to diagnose access or payload problems.
+- A lost response can still have accepted a dispatch. Check receiver runs and
+  open image-update PRs for the same SHA/digest before retrying. A successful
+  dispatch can also fail receiver validation; inspect its run, not just the
+  sender summary. Never weaken receiver checks or production approval to retry.
+- `workflow_dispatch` on `main` repeats **Verify only**, in a separate concurrency
+  group from push runs, so it cannot cancel publication/promotion. Rerunning the
+  original current-main push is the promotion recovery path; arbitrary refs and
+  stale main pushes are rejected.
+- Rebuilding current main may move its tags to a different digest. Do not approve
+  an older pending update whose registry-tag/digest comparison no longer holds;
+  reconcile it with the newly built request. An already approved digest remains
+  pinned even if tags move.
+- Roll back through an approved receiver PR selecting a previously verified
+  digest, then verify the serving image and health as the private runbook says.
+  Do not rerun an old source build, deploy `latest`, patch a live workload, or
+  assume a pending newer promotion will not overwrite the rollback.

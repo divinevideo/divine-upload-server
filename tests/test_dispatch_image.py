@@ -1,13 +1,15 @@
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "dispatch-image.py"
+SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "dispatch-image.py"
 SPEC = importlib.util.spec_from_file_location("dispatch_image", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -56,9 +58,9 @@ class DispatchTests(unittest.TestCase):
             environment = dict(GITHUB_SHA=SHA, IMAGE_DIGEST=DIGEST, GITHUB_EVENT_NAME="push",
                                GITHUB_REF="refs/heads/main", GITHUB_REPOSITORY=MODULE.SOURCE_REPO,
                                GITHUB_TOKEN="synthetic-source", DEPLOY_TOKEN="synthetic-dispatch",
-                               GITHUB_STEP_SUMMARY=str(summary))
+                               GITHUB_STEP_SUMMARY=str(summary), PUBLISHED_IMAGE="example.invalid/service")
             with mock.patch.dict(os.environ, environment, clear=True), \
-                    mock.patch.object(MODULE, "api", side_effect=[{"sha": tip}, None]) as api:
+                    mock.patch.object(MODULE, "api", side_effect=[{"object": {"sha": tip}}, None]) as api:
                 if tip != SHA:
                     with self.assertRaisesRegex(RuntimeError, "no longer the main tip"):
                         MODULE.main()
@@ -67,17 +69,47 @@ class DispatchTests(unittest.TestCase):
                 else:
                     MODULE.main()
                     self.assertEqual(api.call_args_list[0].args,
-                                     (MODULE.SOURCE_REPO + "/commits/main", "synthetic-source"))
+                                     (MODULE.SOURCE_REPO + "/git/ref/heads/main", "synthetic-source"))
                     self.assertEqual(api.call_args_list[1].args,
                                      (MODULE.TARGET_REPO + "/dispatches", "synthetic-dispatch", self.payload()))
                     self.assertIn("not rollout completion", summary.read_text())
                     self.assertIn(DIGEST, summary.read_text())
+                    self.assertIn("example.invalid/service@" + DIGEST, summary.read_text())
 
     def test_current_main_dispatches_once(self):
         self.run_main(SHA)
 
     def test_stale_rerun_cannot_dispatch(self):
         self.run_main("c" * 40)
+
+    def test_prepublication_guard_needs_no_dispatch_credentials_or_image(self):
+        environment = dict(GITHUB_SHA=SHA, GITHUB_EVENT_NAME="push", GITHUB_REF="refs/heads/main",
+                           GITHUB_REPOSITORY=MODULE.SOURCE_REPO, GITHUB_TOKEN="synthetic-source")
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(MODULE, "api", return_value={"object": {"sha": SHA}}) as api:
+            MODULE.main(check_only=True)
+            self.assertEqual(api.call_count, 1)
+            api.return_value = {"object": {"sha": "c" * 40}}
+            with self.assertRaisesRegex(RuntimeError, "no longer the main tip"):
+                MODULE.main(check_only=True)
+
+    def test_api_get_reads_lightweight_ref_response(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(json.dumps({"object": {"sha": SHA}}).encode())
+        with mock.patch.object(MODULE.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertEqual(MODULE.api(MODULE.SOURCE_REPO + "/git/ref/heads/main", "synthetic"),
+                             {"object": {"sha": SHA}})
+            self.assertEqual(urlopen.call_args.args[0].get_method(), "GET")
+
+    def test_api_http_errors_report_status_without_response_bodies(self):
+        for status in (401, 403, 404, 422, 429, 500):
+            error = urllib.error.HTTPError("https://api.github.com/", status, "synthetic", {},
+                                           io.BytesIO(b'{"message":"synthetic-private-input"}'))
+            with self.subTest(status=status), \
+                    mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, f"GitHub HTTP {status}") as raised:
+                    MODULE.api(MODULE.TARGET_REPO + "/dispatches", "synthetic", self.payload())
+                self.assertNotIn("synthetic-private-input", str(raised.exception))
 
     def test_api_uses_separate_request_and_requires_acceptance(self):
         response = mock.MagicMock()
