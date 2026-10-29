@@ -23,7 +23,7 @@ def make_payload(event, ref, repository, sha, digest):
         "client_payload": {
             "application": "divine-upload-server",
             "environments": ["production"],
-            "images": [{"name": "divine-upload-server", "tag": sha}],
+            "images": [{"name": "divine-upload-server", "tag": sha, "digest": digest}],
             "internal": True,
             "hotfix": False,
             "auto_promote": False,

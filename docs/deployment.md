@@ -7,7 +7,8 @@ The sender targets only the existing upload-server **production** overlay in
 the production approval policy. Before enabling it, a Platform maintainer must:
 
 1. Merge the upload-server companion receiver changes: its application/image
-   allowlist entry and upload-server-specific post-merge sync/verification path.
+   allowlist entry, digest-pinned image handling and upload-server-specific
+   post-merge sync/verification path.
    The existing production overlay must continue to use
    `us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server`.
 2. Verify the public `https://upload.divine.video/` route actually reaches that
@@ -24,8 +25,10 @@ the production approval policy. Before enabling it, a Platform maintainer must:
    itself to that repository and permission. The sender's ordinary `GITHUB_TOKEN`
    remains Contents read and is used only to verify the source main tip. The
    receiver keeps its own existing credentials for creating promotion PRs.
-5. Set the repository Actions variable `GITOPS_DEPLOY_ENABLED` to `true` only
-   after those prerequisites and the rollout authorization are in place.
+5. The companion receiver has its own default-off Actions variable,
+   `UPLOAD_SERVER_GITOPS_ENABLED`. Set that receiver variable and this sender's
+   `GITOPS_DEPLOY_ENABLED` to `true` only after those prerequisites and the
+   rollout authorization are in place. Enabling the sender alone is insufficient.
 
 Neither merging sender code nor a successful PR check provisions credentials,
 enables that variable, authorizes a rollout, or proves the receiver is ready.
@@ -41,12 +44,14 @@ checks the event, source repository, ref, full SHA and digest, then reads the
 current source `main` through GitHub before dispatching. A rerun of a superseded
 main commit fails instead of requesting an older version.
 
-The image tag is the full source SHA; the receiver's existing ordinary-image
-contract writes that tag into the overlay. The exact build digest is included
-as `image_digest` provenance in the dispatch and in the build and promotion job
-summaries. It is **not** an instruction to pin a digest in the manifest: the
-current receiver updates `newTag`. Retain the build summary and verify the
-running digest against it after promotion. Do not treat a mutable tag alone as
+The image tag is the full source SHA. The exact build digest is included in
+`images[].digest` for the companion receiver to pin in the production overlay,
+and as `image_digest` provenance in the dispatch and in the build and promotion
+job summaries. The receiver must preserve the full GAR image name, write
+`digest: sha256:…` and remove `newTag`, rather than deploying the mutable SHA
+tag. Rebuilding the same source can change the image, so a different digest
+still needs its own production PR/approval. Retain the build summary and verify
+the running digest against it after promotion. Do not treat a tag alone as
 proof of the image being served.
 
 ## Controlled rollout and evidence
@@ -74,8 +79,8 @@ kubectl --context=connectgateway_dv-platform-prod_us-central1_gke-production-mem
 curl --fail --show-error https://upload.divine.video/
 ```
 
-Check that the image tag equals the intended full SHA, all desired replicas are
-ready, and **all** serving pod digests equal the recorded build digest. Public
+Check that the Deployment image is pinned to the intended build digest, all
+desired replicas are ready, and **all** serving pod digests equal that digest. Public
 landing-page success alone establishes neither readiness nor image identity.
 Use an authorized synthetic upload smoke test for application-level verification;
 do not use private media or real creator identifiers in evidence. Do not call the
@@ -94,11 +99,13 @@ by the sender PR's validation.
   review path, then rerun only the current-main promotion job. Do not weaken
   allowlists, registry checks or production approval to recover.
 - To repeat verification manually, use `workflow_dispatch` on `main`; it runs
-  Verify only. It intentionally cannot force publication or promotion. Re-running
+  Verify only, in a separate concurrency group from push runs so it cannot
+  cancel an in-flight publication/promotion. It intentionally cannot force
+  publication or promotion. Re-running
   the original current-main **push** is the supported promotion recovery path;
   arbitrary refs and stale main pushes remain rejected.
 - For rollback, choose a previously verified SHA and digest in the production
-  registry, open a receiver PR reverting the upload-server overlay to that tag,
+  registry, open a receiver PR reverting the upload-server overlay to that digest,
   obtain normal production approval, and follow post-merge sync and the same
   serving-image/health checks. Do not rerun an old source workflow to roll back,
   patch the live Deployment, or deploy `latest`. Coordinate pending newer

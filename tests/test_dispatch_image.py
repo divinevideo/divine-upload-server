@@ -27,7 +27,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(payload["event_type"], "image-deploy")
         client = payload["client_payload"]
         self.assertEqual(client["environments"], ["production"])
-        self.assertEqual(client["images"], [{"name": "divine-upload-server", "tag": SHA}])
+        self.assertEqual(client["images"], [{"name": "divine-upload-server", "tag": SHA,
+                                            "digest": DIGEST}])
         self.assertEqual(client["source_sha"], SHA)
         self.assertEqual(client["image_digest"], DIGEST)
         self.assertIs(client["internal"], True)
@@ -41,6 +42,13 @@ class DispatchTests(unittest.TestCase):
                         {"sha": "latest"}, {"digest": ""}, {"digest": "sha256:bad"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.payload(**changes)
+
+    def test_same_source_with_new_build_retains_distinct_deployment_digest(self):
+        rebuilt = self.payload(digest="sha256:" + "c" * 64)["client_payload"]
+        original = self.payload()["client_payload"]
+        self.assertEqual(original["images"][0]["tag"], rebuilt["images"][0]["tag"])
+        self.assertNotEqual(original["images"][0]["digest"], rebuilt["images"][0]["digest"])
+        self.assertEqual(rebuilt["images"][0]["digest"], rebuilt["image_digest"])
 
     def run_main(self, tip):
         with tempfile.TemporaryDirectory() as folder:
