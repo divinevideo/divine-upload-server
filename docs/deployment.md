@@ -25,7 +25,9 @@ setting this repository's `GITOPS_DEPLOY_ENABLED` variable to `true`:
    `CORECONFIG_DISPATCH_APP_PRIVATE_KEY`. Do not expose them as repository-wide
    secrets or make organization-level copies accessible to every branch in this
    repository. Reuse the established App through the approved process rather
-   than creating a new credential. Never print or commit values.
+   than creating a new credential. Before enabling, confirm neither name is
+   already available to this repository from repository or organization secrets.
+   Never print or commit values.
 4. Verify the App installation can dispatch to `divine-iac-coreconfig` with
    Contents write (and implicit Metadata read). The minted token explicitly
    requests only that repository and permission. The ordinary `GITHUB_TOKEN`
