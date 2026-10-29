@@ -112,7 +112,9 @@ These are code defaults. Deployed values differ per environment and live in the 
 
 The service is packaged as a multi-stage Docker image (Rust build stage, Debian slim runtime with `ca-certificates` and `ffmpeg`) and runs on production GKE behind `https://upload.divine.video`.
 
-CI (`.github/workflows/ci.yml`) checks formatting, runs `clippy` with warnings denied, and runs the Rust and Python test suites on every pull request. On pushes to `main` it authenticates to Google Cloud via Workload Identity Federation and publishes `divine-upload-server` to `us-central1-docker.pkg.dev/dv-platform-prod/containers-production`, tagged `latest` and the short commit SHA.
+CI (`.github/workflows/ci.yml`) checks formatting, runs `clippy` with warnings denied, and runs the Rust and Python test suites on every pull request. On pushes to `main` it authenticates to Google Cloud via Workload Identity Federation and publishes `divine-upload-server` to `us-central1-docker.pkg.dev/dv-platform-prod/containers-production`, tagged `latest` and the **full** source commit SHA. The build summary records that SHA and the pushed image digest; deployment never selects `latest`.
+
+The optional GitOps promotion job requests a production image-update PR in `divinevideo/divine-iac-coreconfig` after both verification and image publication succeed. It uses the existing `image-deploy` contract with `internal: true`, `hotfix: false`, and `auto_promote: false`: production stays on the receiver's approval-respecting PR path, not its bypass-merge path. Dispatch acceptance is **not** deployment completion. See [the deployment runbook](docs/deployment.md) for prerequisites, verification, reruns, and rollback.
 
 Video follow-up currently points at the existing transcoder endpoint through `TRANSCODER_URL`. `export-video-upload-hashes.py` reads both the legacy Cloud Run audit logs and the GKE `k8s_container` audit logs, so historic exports keep working across the platform migration.
 
