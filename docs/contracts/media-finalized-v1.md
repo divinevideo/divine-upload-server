@@ -62,6 +62,8 @@ owner, content type, write mode and exact destination bucket mapping. It only
 marks that intent complete in the transaction that records a processing event
 for all verified destinations. A retry always attempts this transaction even if
 the object already existed, repairing a lost finalization acknowledgement.
+The first intent's content type is retained when the same owner retries the same
+bytes with another MIME declaration; this does not permanently reject that hash.
 
 Outbox workers claim jobs through PostgreSQL `FOR UPDATE SKIP LOCKED`, with a
 60-second lease. Delivery is at least once: a crash after consumer acceptance but
@@ -74,6 +76,9 @@ A bounded reconciliation pass can queue an interrupted finalization only after
 independently reading and checking the full SHA-256 and length of every intended
 destination. It uses the intent's pinned mode and destination mapping. Changed
 configuration never retargets an unresolved intent to another bucket. Background
+reconciliation first checks metadata for all destinations; a missing replica
+leaves the intent pending without downloading the surviving copy on every pass.
+Background
 reconciliation never copies or repairs media from a surviving replica: that could
 race erasure. A partial dual write remains pending for an explicit client retry
 or operator investigation. Automatic copy repair requires the shared Blossom

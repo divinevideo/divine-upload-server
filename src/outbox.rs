@@ -59,9 +59,8 @@ impl ProcessingOutbox {
         let gcs_bucket = storage.gcs_bucket();
         let b2_bucket = storage.b2_bucket();
         let client = self.database.lock().await;
-        let row=client.query_one("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO UPDATE SET updated_at=now(), write_mode=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.write_mode ELSE upload_processing_intents.write_mode END, gcs_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.gcs_bucket ELSE upload_processing_intents.gcs_bucket END, b2_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.b2_bucket ELSE upload_processing_intents.b2_bucket END, completed=upload_processing_intents.completed AND upload_processing_intents.write_mode=EXCLUDED.write_mode AND upload_processing_intents.gcs_bucket=EXCLUDED.gcs_bucket AND upload_processing_intents.b2_bucket IS NOT DISTINCT FROM EXCLUDED.b2_bucket WHERE upload_processing_intents.size=EXCLUDED.size AND upload_processing_intents.content_type=EXCLUDED.content_type RETURNING size,content_type,write_mode,gcs_bucket,b2_bucket",&[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
+        let row=client.query_one("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO UPDATE SET updated_at=now(), write_mode=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.write_mode ELSE upload_processing_intents.write_mode END, gcs_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.gcs_bucket ELSE upload_processing_intents.gcs_bucket END, b2_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.b2_bucket ELSE upload_processing_intents.b2_bucket END, completed=upload_processing_intents.completed AND upload_processing_intents.write_mode=EXCLUDED.write_mode AND upload_processing_intents.gcs_bucket=EXCLUDED.gcs_bucket AND upload_processing_intents.b2_bucket IS NOT DISTINCT FROM EXCLUDED.b2_bucket WHERE upload_processing_intents.size=EXCLUDED.size RETURNING size,content_type,write_mode,gcs_bucket,b2_bucket",&[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
         if row.get::<_, i64>(0) != size
-            || row.get::<_, String>(1) != content_type
             || row.get::<_, String>(2) != mode
             || row.get::<_, String>(3) != gcs_bucket
             || row.get::<_, Option<String>>(4).as_deref() != b2_bucket
@@ -75,7 +74,7 @@ impl ProcessingOutbox {
         &self,
         hash: &str,
         size: u64,
-        content_type: &str,
+        _content_type: &str,
         owner: &str,
         mut objects: Vec<ObjectRef>,
     ) -> Result<()> {
@@ -84,21 +83,29 @@ impl ProcessingOutbox {
         if objects.is_empty() {
             bail!("processing requires a verified storage object");
         }
-        // Storage orders the currently authoritative source first. Replicas are durable
-        // additional copies, never additional processing jobs for the same upload.
-        let source = objects.remove(0);
-        let mut event = MediaFinalizedV1::new(hash, size, content_type, owner, source)?;
-        for replica in &objects {
-            MediaFinalizedV1::new(hash, size, content_type, owner, replica.clone())?;
-        }
-        event.replicas = objects;
-        event.refresh_job_id()?;
-        let payload = serde_json::to_value(&event)?;
         let mut client = self.database.lock().await;
         let transaction = client
             .transaction()
             .await
             .map_err(|_| anyhow!("processing transaction failed"))?;
+        // MIME declarations may change on a retry of identical content. Retain
+        // the first intent's metadata instead of rejecting a valid hash forever.
+        let intent = transaction.query_opt(
+            "SELECT content_type FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND size=$3 FOR UPDATE",
+            &[&hash, &owner, &stored_size],
+        ).await.map_err(|_| anyhow!("upload intent lookup failed"))?
+            .ok_or_else(|| anyhow!("processing event has no matching upload intent"))?;
+        let content_type: String = intent.get(0);
+        // Storage orders the currently authoritative source first. Replicas are durable
+        // additional copies, never additional processing jobs for the same upload.
+        let source = objects.remove(0);
+        let mut event = MediaFinalizedV1::new(hash, size, &content_type, owner, source)?;
+        for replica in &objects {
+            MediaFinalizedV1::new(hash, size, &content_type, owner, replica.clone())?;
+        }
+        event.replicas = objects;
+        event.refresh_job_id()?;
+        let payload = serde_json::to_value(&event)?;
         transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
         let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
         if updated != 1 {
@@ -160,11 +167,11 @@ impl ProcessingOutbox {
                 WriteMode::B2 => vec![WriteMode::B2],
                 WriteMode::Dual => vec![WriteMode::Gcs, WriteMode::B2],
             };
-            let mut objects = Vec::new();
+            // Discover all required copies before reading any bodies. A partial
+            // dual write can remain pending indefinitely; repeatedly hashing its
+            // surviving copy cannot advance it and creates unbounded read cost.
+            let mut candidates = Vec::new();
             for destination in &modes {
-                if intent.size > budget {
-                    break;
-                }
                 let Ok(reader) = pinned.with_mode(*destination) else {
                     break;
                 };
@@ -174,8 +181,17 @@ impl ProcessingOutbox {
                 if object.size != intent.size {
                     break;
                 }
+                candidates.push((reader, object.reference));
+            }
+            if candidates.len() != modes.len()
+                || intent.size.saturating_mul(modes.len() as u64) > budget
+            {
+                continue;
+            }
+            let mut objects = Vec::new();
+            for (reader, reference) in candidates {
                 budget = budget.saturating_sub(intent.size);
-                let Ok(mut stream) = reader.stream_ref(&object.reference).await else {
+                let Ok(mut stream) = reader.stream_ref(&reference).await else {
                     break;
                 };
                 let mut hasher = Sha256::new();
@@ -198,7 +214,7 @@ impl ProcessingOutbox {
                 {
                     break;
                 }
-                objects.push(object.reference);
+                objects.push(reference);
             }
             // Background reconciliation never writes media: a lone surviving copy
             // could be racing erasure. Only an explicit upload retry may repair it.
@@ -442,6 +458,10 @@ mod tests {
             .begin_upload(&hash, 4, "video/mp4", &owner, &storage)
             .await
             .is_err());
+        outbox
+            .begin_upload(&hash, 3, "application/octet-stream", &owner, &storage)
+            .await
+            .expect("a MIME declaration change must not strand identical bytes");
         let object = ObjectRef {
             provider: StorageProvider::Gcs,
             bucket: "fixture-bucket".into(),
@@ -453,9 +473,25 @@ mod tests {
             .await
             .unwrap();
         outbox
-            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![object])
+            .enqueue_upload(&hash, 3, "application/octet-stream", &owner, vec![object])
             .await
             .unwrap();
+        {
+            let db = outbox.database.lock().await;
+            let payload: serde_json::Value = db
+                .query_one(
+                    "SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1",
+                    &[&hash],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(payload["content_type"], "video/mp4");
+        }
+        outbox
+            .begin_upload(&hash, 3, "video/quicktime", &owner, &storage)
+            .await
+            .expect("completed intents must also accept declaration changes");
         assert!(!outbox
             .pending_intents(1000)
             .await
@@ -634,6 +670,7 @@ mod tests {
         struct Fixture {
             b2_present: AtomicBool,
             writes: AtomicUsize,
+            reads: AtomicUsize,
         }
         let fixture = Arc::new(Fixture::default());
         let bytes = bytes::Bytes::from(format!("dual-original-{:032x}", rand::random::<u128>()));
@@ -646,10 +683,11 @@ mod tests {
             async move {
                 if method!=Method::HEAD && method!=Method::GET {f.writes.fetch_add(1,Ordering::SeqCst);return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
                 if uri.path().starts_with("/storage/") {
-                    if uri.query().unwrap_or_default().contains("alt=media"){return body.into_response();}
+                    if uri.query().unwrap_or_default().contains("alt=media"){f.reads.fetch_add(1,Ordering::SeqCst);return body.into_response();}
                     return Json(serde_json::json!({"name":hash,"bucket":"fixture-gcs","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"fixture","size":body.len().to_string(),"contentType":"video/mp4"})).into_response();
                 }
                 if !f.b2_present.load(Ordering::SeqCst){return StatusCode::NOT_FOUND.into_response();}
+                if method==Method::GET {f.reads.fetch_add(1,Ordering::SeqCst);}
                 let mut response=if method==Method::HEAD {"".into_response()}else{body.clone().into_response()};
                 response.headers_mut().insert("x-amz-version-id","fixture-v1".parse().unwrap());
                 response.headers_mut().insert("content-length",body.len().to_string().parse().unwrap());
@@ -696,6 +734,11 @@ mod tests {
             0
         );
         assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.reads.load(Ordering::SeqCst),
+            0,
+            "a partial write must not repeatedly download the surviving replica"
+        );
         fixture.b2_present.store(true, Ordering::SeqCst);
         assert_eq!(
             outbox
