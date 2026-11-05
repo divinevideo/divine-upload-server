@@ -747,7 +747,17 @@ async fn handle_session_chunk(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    let _permit = match resources::acquire() {
+    handle_session_chunk_admitted(state, upload_id, headers, body, resources::acquire()).await
+}
+
+async fn handle_session_chunk_admitted(
+    state: Arc<AppState>,
+    upload_id: String,
+    headers: axum::http::HeaderMap,
+    body: Body,
+    admission: Result<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let _permit = match admission {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1612,10 +1622,6 @@ mod tests {
     #[tokio::test]
     async fn maintenance_requests_cannot_take_upload_admission() {
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
-        let mut uploads = Vec::new();
-        while let Ok(permit) = crate::resources::acquire() {
-            uploads.push(permit);
-        }
         let maintenance =
             crate::resources::acquire_maintenance().expect("separate maintenance pool");
         let response = super::handle_migrate(
@@ -1638,26 +1644,20 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         drop(maintenance);
-        drop(uploads);
     }
 
     #[tokio::test]
     async fn chunk_admission_sheds_before_collecting_the_request_body() {
-        let _guard = ADMISSION_TEST_MUTEX.lock().await;
-        let mut permits = Vec::new();
-        while let Ok(permit) = crate::resources::acquire() {
-            permits.push(permit);
-        }
-        let response = super::handle_session_chunk(
-            State(test_state(None, 1)),
-            axum::extract::Path("fixture-session".to_string()),
+        let response = super::handle_session_chunk_admitted(
+            test_state(None, 1),
+            "fixture-session".to_string(),
             axum::http::HeaderMap::new(),
             Body::empty(),
+            Err(crate::resources::ResourceError::Busy.into()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
-        drop(permits);
     }
 
     #[tokio::test]

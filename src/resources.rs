@@ -1,6 +1,13 @@
 #[cfg(test)]
 mod tests {
     #[test]
+    fn maintenance_and_upload_admission_use_distinct_pools() {
+        assert!(!std::sync::Arc::ptr_eq(
+            &super::SLOTS,
+            &super::MAINTENANCE_SLOTS
+        ));
+    }
+    #[test]
     fn upload_size_limit_rejects_excess_without_allocation() {
         assert!(super::check_size_with_limit(1024, 1024).is_ok());
         assert!(super::check_size_with_limit(1025, 1024).is_err());
