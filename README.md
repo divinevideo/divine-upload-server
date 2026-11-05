@@ -55,8 +55,8 @@ The client then `PUT`s chunks to `/sessions/:upload_id` with a `Content-Range` h
 GCS is the default backend (bucket default `divine-blossom-media`); B2 and dual-write modes use the same public object keys:
 
 - Canonical blobs live at the object key `<sha256>` — content-addressed and deduplicated.
-- Resumable temp objects live under `__resumable/uploads/<upload_id>/blob`.
-- Session manifests are JSON at `__resumable/sessions/<upload_id>.json`, holding the owner, declared hash/size, offset, session URL, and token. Sessions expire after `RESUMABLE_SESSION_TTL_SECS`.
+- Resumable temp objects live under `__resumable/uploads/<upload_id>/blob`. In B2 and dual modes each chunk is instead stored as its own object under `__resumable/staged/<mode>/<hex GCS bucket>/<hex B2 bucket>/<upload_id>/chunks/`, and the chunks are assembled at completion.
+- Without `COORDINATION_DATABASE_URL`, session manifests are JSON at `__resumable/sessions/<upload_id>.json`, holding the owner, declared hash/size, offset, session URL, and token. With it, sessions are stored in PostgreSQL instead. Sessions expire after `RESUMABLE_SESSION_TTL_SECS`.
 - Thumbnails are stored alongside blobs as `<sha256>.jpg`.
 
 ### How it fits Divine's media stack
