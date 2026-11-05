@@ -779,6 +779,20 @@ async fn handle_session_chunk_admitted(
         }
     };
 
+    let manager = resumable_manager(state.as_ref());
+    // Validate the session before a slow body can occupy authenticated admission.
+    // upload_chunk rechecks under its mutation lock after collection.
+    if let Err(error) = manager
+        .head_session(
+            &upload_id,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .await
+    {
+        return resumable_error_response(error);
+    }
     let chunk = match collect_body_bytes(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -789,7 +803,6 @@ async fn handle_session_chunk_admitted(
         }
     };
 
-    let manager = resumable_manager(state.as_ref());
     match manager
         .upload_chunk(
             &upload_id,
@@ -1658,6 +1671,67 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    }
+
+    #[tokio::test]
+    async fn unknown_chunk_session_is_rejected_before_reading_body() {
+        use axum::{routing::any, Router};
+        let app = Router::new().route(
+            "/*path",
+            any(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        serde_json::json!({"error":{"code":404,"message":"Not Found","errors":[]}}),
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(gcs.clone()),
+            "fixture".into(),
+            None,
+        )
+        .unwrap();
+        let runtime = resumable::ResumableRuntime::new(storage, Some(gcs), "fixture".into(), None)
+            .await
+            .unwrap();
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("unverified session body must not be read")
+            },
+        ));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let response = super::handle_session_chunk_admitted(
+            state,
+            "missing".into(),
+            headers,
+            body,
+            Ok(permit),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
     }
 
     #[tokio::test]
