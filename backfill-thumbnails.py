@@ -2,6 +2,7 @@
 """Delete, regenerate, and revalidate thumbnails for a set of video hashes."""
 
 import argparse
+import os
 import concurrent.futures
 import subprocess
 import sys
@@ -71,7 +72,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate input and print planned count without changing anything.",
     )
-    return parser.parse_args()
+    parser.add_argument("--storage-provider", choices=("gcs", "b2", "dual"), default=os.environ.get("MEDIA_WRITE_PROVIDER", "gcs"), help="This maintenance tool supports GCS only.")
+    args = parser.parse_args()
+    if args.storage_provider != "gcs":
+        parser.error("Thumbnail deletion supports GCS only; use the provider-aware service workflow for B2/dual storage")
+    return args
 
 
 def load_hashes(args: argparse.Namespace) -> list[str]:

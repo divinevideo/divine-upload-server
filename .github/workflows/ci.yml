@@ -25,6 +25,22 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: upload_test
+          POSTGRES_PASSWORD: upload_test
+          POSTGRES_DB: upload_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U upload_test -d upload_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_COORDINATION_DATABASE_URL: postgres://upload_test:upload_test@127.0.0.1:5432/upload_test?sslmode=disable
     permissions:
       contents: read
     steps:

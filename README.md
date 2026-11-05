@@ -1,6 +1,6 @@
 # Divine Upload Server
 
-`divine-upload-server` is the Rust upload data plane for Divine Blossom media. It receives blob bytes, stores them content-addressed in Google Cloud Storage, and fires the media follow-up hooks (thumbnails, dimension probes, HLS transcoding, transcription) that turn a raw upload into a playable asset. It handles both single-request uploads and resumable, chunked sessions.
+`divine-upload-server` is the Rust upload data plane for Divine Blossom media. It receives blob bytes, stores them content-addressed in Google Cloud Storage, Backblaze B2, or both, and fires the media follow-up hooks (thumbnails, dimension probes, HLS transcoding, transcription) that turn a raw upload into a playable asset. It handles both single-request uploads and resumable, chunked sessions.
 
 It is the data plane only. The Fastly-facing Blossom control plane (`divine-blossom`) answers client control-plane requests such as `HEAD /upload`, validates Blossom auth, and proxies short `init` and `complete` calls to this service. In the Divine resumable flow:
 
@@ -52,7 +52,7 @@ The client then `PUT`s chunks to `/sessions/:upload_id` with a `Content-Range` h
 
 ### Storage
 
-Google Cloud Storage is the only backend (bucket default `divine-blossom-media`):
+GCS is the default backend (bucket default `divine-blossom-media`); B2 and dual-write modes use the same public object keys:
 
 - Canonical blobs live at the object key `<sha256>` — content-addressed and deduplicated.
 - Resumable temp objects live under `__resumable/uploads/<upload_id>/blob`.
@@ -107,6 +107,38 @@ All configuration comes from environment variables. The table below lists the co
 On the chunk `PUT` path the server enforces no request-body limit of its own. What a chunk `PUT` must satisfy is that the `Content-Range` total equals the session's declared size, that the range lies inside that size, that the range start equals the session's next offset, that the range length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size therefore cannot reject clients that keep sending larger chunks, as long as those chunks stay within the declared size, start at the expected offset, and are 256 KiB-aligned.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
+
+## B2 and dual-write transition
+
+`MEDIA_WRITE_PROVIDER` selects `gcs` (the default), `dual`, or `b2`. In `dual`
+mode every finalized original and locally generated thumbnail must be verified
+in both configured destinations before its storage operation succeeds. A failed
+second write is returned as an error; retrying repairs the missing copy. Public
+Blossom URLs stay on `CDN_BASE_URL`.
+
+B2 requires `B2_MEDIA_BUCKET`, `B2_REGION`, `B2_ACCESS_KEY_ID`, and
+`B2_SECRET_ACCESS_KEY`. Use the private authoritative media bucket agreed with
+Blossom, never the approved-only playback canary bucket. Credentials belong in
+secret bindings. B2-only startup does not require Google credentials. Set `GCS_COMPAT_ENABLED=true`
+when B2 mode still needs to finish old GCS sessions. When switching new writes
+back to GCS, retain B2 settings so existing B2 sessions can finish.
+
+B2 and dual modes also require `COORDINATION_DATABASE_URL`, `MEDIA_FINALIZED_URL`,
+and `MEDIA_FINALIZED_TOKEN`. The PostgreSQL database holds durable upload state
+and processing work. The HTTPS processing endpoint must implement the versioned
+[finalization contract](docs/contracts/media-finalized-v1.md); an ordinary
+transcoder endpoint is not a compatible substitute. Queue acceptance is distinct
+from completed thumbnail/transcode/transcript work. Deploy the companion consumer
+and verify B2 processing and erasure coordination before enabling these modes.
+
+Existing GCS sessions retain their backend. Keep their credentials available
+until they finish or expire; changing the new-upload mode does not migrate an
+active session. To stop creating B2 uploads, change admission back to GCS while
+retaining the B2-capable binary, workers, database, and credentials to drain work.
+Do not roll back to an older GCS-only image after accepting B2 uploads.
+
+The legacy `backfill-thumbnails.py` deletion helper supports GCS only and rejects
+B2/dual selection; it must not delete one copy while another remains cached.
 
 ## Deployment
 
