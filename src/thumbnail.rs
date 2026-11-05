@@ -10,11 +10,13 @@ pub struct ThumbnailResult {
     pub data: Vec<u8>,
 }
 
+pub const MAX_SYNC_VIDEO_BYTES: usize = 100 * 1024 * 1024;
+
 /// Extract thumbnail from video bytes using ffmpeg
 /// Returns JPEG image data on success
 pub fn extract_thumbnail(video_data: &[u8]) -> Result<ThumbnailResult> {
     // Skip extraction for very large videos (>100MB) to avoid slowdowns
-    if video_data.len() > 100 * 1024 * 1024 {
+    if video_data.len() > MAX_SYNC_VIDEO_BYTES {
         return Err(anyhow!("Video too large for sync thumbnail extraction"));
     }
 

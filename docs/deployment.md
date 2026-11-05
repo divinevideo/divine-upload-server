@@ -130,8 +130,11 @@ operations share four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024).
 Exhausted admission returns 503; oversized uploads return 413. Provision scratch
 disk for at least the configured maximum times the slot count plus operational
 reserve; disk-full errors fail the request and remove local temporary files.
-Resumable requests are capped at 16 MiB per chunk. Local derivative decoding is
-bounded to 64 MiB; larger assets use the durable asynchronous processing path.
+Resumable requests are capped at 16 MiB per chunk and share admission slots.
+Local thumbnail decoding retains the legacy 100 MiB input limit; larger assets
+require the durable asynchronous processing path for thumbnails. GCS mode without
+a durable consumer still probes dimensions from its disk spool for larger direct
+uploads; it does not promise synchronous thumbnails above that limit.
 Set measured limits before expanding concurrency; these defaults are bounds,
 not a capacity estimate.
 
