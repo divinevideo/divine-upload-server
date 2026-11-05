@@ -1,3 +1,5 @@
+#[path = "resumable_storage.rs"]
+mod provider;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,6 +18,7 @@ use google_cloud_storage::{
         resumable_upload_client::{ChunkSize, UploadStatus},
     },
 };
+pub use provider::{MediaResumableBackend, ProviderSessionStore, ResumableRuntime};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,6 +104,8 @@ pub struct CompleteUploadResponse {
     /// downstream hooks more than once.
     #[serde(skip)]
     pub newly_stored: bool,
+    #[serde(skip)]
+    pub objects: Vec<crate::storage::ObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +118,10 @@ pub struct UploadSessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadSession {
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub chunk_size: u64,
     pub upload_id: String,
     pub owner: String,
     pub final_sha256: String,
@@ -171,6 +180,10 @@ pub enum ResumableError {
     UnprocessableEntity(String),
     #[error("{0}")]
     Internal(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl ResumableError {
@@ -184,12 +197,17 @@ impl ResumableError {
             ResumableError::RangeNotSatisfiable(_) => axum::http::StatusCode::RANGE_NOT_SATISFIABLE,
             ResumableError::UnprocessableEntity(_) => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             ResumableError::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ResumableError::PayloadTooLarge(_) => axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            ResumableError::Unavailable(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
 
 #[async_trait]
 pub trait SessionStore: Clone + Send + Sync + 'static {
+    async fn lock(&self, _upload_id: &str) -> Result<Option<Box<dyn Send>>> {
+        Ok(None)
+    }
     async fn load(&self, upload_id: &str) -> Result<Option<UploadSession>>;
     async fn save(&self, session: &UploadSession) -> Result<()>;
     async fn delete(&self, upload_id: &str) -> Result<()>;
@@ -197,6 +215,41 @@ pub trait SessionStore: Clone + Send + Sync + 'static {
 
 #[async_trait]
 pub trait ResumableBackend: Clone + Send + Sync + 'static {
+    async fn is_committed_retry(
+        &self,
+        _session: &UploadSession,
+        _range: &ContentRange,
+        _chunk: &Bytes,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    async fn final_objects(
+        &self,
+        _session: &UploadSession,
+    ) -> Result<Vec<crate::storage::ObjectRef>> {
+        Ok(Vec::new())
+    }
+    async fn begin_finalization(
+        &self,
+        _session: &UploadSession,
+        _outbox: &crate::outbox::ProcessingOutbox,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn finalize(&self, session: &UploadSession) -> Result<bool> {
+        let exists = self.object_exists(&session.final_sha256).await?;
+        if !exists {
+            self.copy_to_final(
+                &session.temp_object,
+                &session.final_sha256,
+                &session.content_type,
+                &session.owner,
+            )
+            .await?;
+        }
+        Ok(!exists)
+    }
+
     async fn create_session(
         &self,
         upload_id: &str,
@@ -237,6 +290,7 @@ pub struct ResumableManager<B, S> {
     cdn_base_url: String,
     chunk_size: u64,
     session_ttl_secs: u64,
+    outbox: Option<crate::outbox::ProcessingOutbox>,
 }
 
 impl<B, S> ResumableManager<B, S>
@@ -259,7 +313,13 @@ where
             cdn_base_url: cdn_base_url.into().trim_end_matches('/').to_string(),
             chunk_size,
             session_ttl_secs,
+            outbox: None,
         }
+    }
+
+    pub fn with_outbox(mut self, outbox: Option<crate::outbox::ProcessingOutbox>) -> Self {
+        self.outbox = outbox;
+        self
     }
 
     pub async fn init_session(
@@ -267,6 +327,8 @@ where
         owner: &str,
         request: ResumableUploadInitRequest,
     ) -> std::result::Result<ResumableUploadInitResponse, ResumableError> {
+        crate::resources::check_size(request.size)
+            .map_err(|error| ResumableError::PayloadTooLarge(error.to_string()))?;
         validate_init_request(&request)?;
 
         let upload_id = format!("up_{}", random_hex(12));
@@ -279,6 +341,8 @@ where
         let expires_at_epoch_secs = now_epoch_secs().saturating_add(self.session_ttl_secs);
 
         let session = UploadSession {
+            revision: 0,
+            chunk_size: self.chunk_size,
             upload_id: upload_id.clone(),
             owner: owner.to_string(),
             final_sha256: request.sha256.to_lowercase(),
@@ -322,13 +386,18 @@ where
         upload_id: &str,
         authorization: Option<&str>,
     ) -> std::result::Result<UploadSessionStatus, ResumableError> {
+        let _guard = self.store.lock(upload_id).await.map_err(internal_error)?;
         let session = self.authorize_session(upload_id, authorization).await?;
 
         Ok(UploadSessionStatus {
             next_offset: session.next_offset,
             declared_size: session.declared_size,
             expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
-            chunk_size: self.chunk_size,
+            chunk_size: if session.chunk_size == 0 {
+                self.chunk_size
+            } else {
+                session.chunk_size
+            },
         })
     }
 
@@ -339,6 +408,7 @@ where
         content_range: &str,
         chunk: Bytes,
     ) -> std::result::Result<UploadSessionStatus, ResumableError> {
+        let _guard = self.store.lock(upload_id).await.map_err(internal_error)?;
         let mut session = self.authorize_session(upload_id, authorization).await?;
         if session.finalized_object.is_some() {
             return Err(ResumableError::Conflict(
@@ -348,6 +418,24 @@ where
 
         let range = parse_content_range(content_range, session.declared_size)?;
         if range.start != session.next_offset {
+            if range.end < session.next_offset
+                && self
+                    .backend
+                    .is_committed_retry(&session, &range, &chunk)
+                    .await
+                    .map_err(internal_error)?
+            {
+                return Ok(UploadSessionStatus {
+                    next_offset: session.next_offset,
+                    declared_size: session.declared_size,
+                    expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
+                    chunk_size: if session.chunk_size == 0 {
+                        self.chunk_size
+                    } else {
+                        session.chunk_size
+                    },
+                });
+            }
             return Err(ResumableError::RangeNotSatisfiable(format!(
                 "Expected next offset {}, got {}",
                 session.next_offset, range.start
@@ -386,7 +474,11 @@ where
             next_offset: session.next_offset,
             declared_size: session.declared_size,
             expires_at: format_epoch_secs_as_rfc3339(session.expires_at_epoch_secs),
-            chunk_size: self.chunk_size,
+            chunk_size: if session.chunk_size == 0 {
+                self.chunk_size
+            } else {
+                session.chunk_size
+            },
         })
     }
 
@@ -395,6 +487,7 @@ where
         upload_id: &str,
         owner: &str,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
+        let _guard = self.store.lock(upload_id).await.map_err(internal_error)?;
         let mut session = self
             .store
             .load(upload_id)
@@ -420,15 +513,14 @@ where
             )));
         }
 
-        if let Some(finalized_object) = session.finalized_object.as_ref() {
-            return Ok(self.build_complete_upload_response(
-                finalized_object,
-                session.declared_size,
-                &session.content_type,
-                false,
-            ));
+        if session.finalized_object.is_some() {
+            return self.completed_response(&session, false).await;
         }
 
+        crate::resources::check_size(session.declared_size)
+            .map_err(|error| ResumableError::PayloadTooLarge(error.to_string()))?;
+        let _resource_permit = crate::resources::acquire()
+            .map_err(|error| ResumableError::Unavailable(error.to_string()))?;
         let (computed_hash, computed_size) = self
             .hash_temp_object(&session.temp_object)
             .await
@@ -448,34 +540,25 @@ where
             )));
         }
 
-        let object_already_exists = self
-            .backend
-            .object_exists(&session.final_sha256)
-            .await
-            .map_err(internal_error)?;
-        if !object_already_exists {
+        if let Some(outbox) = &self.outbox {
             self.backend
-                .copy_to_final(
-                    &session.temp_object,
-                    &session.final_sha256,
-                    &session.content_type,
-                    &session.owner,
-                )
+                .begin_finalization(&session, outbox)
                 .await
                 .map_err(internal_error)?;
         }
 
-        let _ = self.backend.delete_object(&session.temp_object).await;
+        let newly_stored = self
+            .backend
+            .finalize(&session)
+            .await
+            .map_err(internal_error)?;
+
         session.storage_complete = true;
         session.finalized_object = Some(session.final_sha256.clone());
         self.store.save(&session).await.map_err(internal_error)?;
+        let _ = self.backend.delete_object(&session.temp_object).await;
 
-        Ok(self.build_complete_upload_response(
-            &session.final_sha256,
-            session.declared_size,
-            &session.content_type,
-            !object_already_exists,
-        ))
+        self.completed_response(&session, newly_stored).await
     }
 
     pub async fn abort_session(
@@ -483,6 +566,7 @@ where
         upload_id: &str,
         authorization: Option<&str>,
     ) -> std::result::Result<(), ResumableError> {
+        let _guard = self.store.lock(upload_id).await.map_err(internal_error)?;
         let session = self.authorize_session(upload_id, authorization).await?;
         if session.finalized_object.is_some() {
             return Err(ResumableError::Conflict(
@@ -497,6 +581,39 @@ where
         let _ = self.backend.delete_object(&session.temp_object).await;
         self.store.delete(upload_id).await.map_err(internal_error)?;
         Ok(())
+    }
+
+    async fn completed_response(
+        &self,
+        session: &UploadSession,
+        newly_stored: bool,
+    ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
+        let mut response = self.build_complete_upload_response(
+            &session.final_sha256,
+            session.declared_size,
+            &session.content_type,
+            newly_stored,
+        );
+        // Only the processing outbox consumes the object references. Without one,
+        // looking them up adds a failure after the bytes are already stored.
+        if let Some(outbox) = &self.outbox {
+            response.objects = self
+                .backend
+                .final_objects(session)
+                .await
+                .map_err(internal_error)?;
+            outbox
+                .enqueue_upload(
+                    &session.final_sha256,
+                    session.declared_size,
+                    &session.content_type,
+                    &session.owner,
+                    response.objects.clone(),
+                )
+                .await
+                .map_err(internal_error)?;
+        }
+        Ok(response)
     }
 
     async fn authorize_session(
@@ -529,9 +646,15 @@ where
     }
 
     async fn cleanup_expired_session(&self, session: &UploadSession) {
-        if session.finalized_object.is_none() {
-            let _ = self.backend.cancel_session(session).await;
-            let _ = self.backend.delete_object(&session.temp_object).await;
+        if session.finalized_object.is_none()
+            && (self.backend.cancel_session(session).await.is_err()
+                || self
+                    .backend
+                    .delete_object(&session.temp_object)
+                    .await
+                    .is_err())
+        {
+            return;
         }
         let _ = self.store.delete(&session.upload_id).await;
     }
@@ -566,6 +689,7 @@ where
             thumbnail: None,
             streaming,
             newly_stored,
+            objects: Vec::new(),
         }
     }
 
@@ -942,8 +1066,18 @@ fn is_video_content_type(content_type: &str) -> bool {
     crate::media_type::normalize(content_type).starts_with("video/")
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Upload session is busy; retry the request")]
+pub struct SessionBusy;
+
 fn internal_error(error: anyhow::Error) -> ResumableError {
-    ResumableError::Internal(error.to_string())
+    if error.is::<SessionBusy>() {
+        ResumableError::Unavailable(error.to_string())
+    } else if error.is::<crate::outbox::IntentConflict>() {
+        ResumableError::Conflict(error.to_string())
+    } else {
+        ResumableError::Internal(error.to_string())
+    }
 }
 
 fn is_not_found_error(error: &impl std::fmt::Display) -> bool {
@@ -965,6 +1099,79 @@ mod tests {
         assert!(is_video_content_type("Video/WebM; codecs=vp9"));
         assert!(!is_video_content_type("image/png"));
         assert!(!is_video_content_type("application/octet-stream"));
+    }
+
+    #[tokio::test]
+    async fn session_keeps_negotiated_chunk_size_after_configuration_change() {
+        let store = InMemoryStore::default();
+        let backend = FakeBackend::default();
+        let first = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            1024 * 1024,
+            86400,
+        );
+        let init = first
+            .init_session(
+                "owner",
+                ResumableUploadInitRequest {
+                    sha256: "a".repeat(64),
+                    size: 1024,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let changed = ResumableManager::new(
+            backend,
+            store,
+            "https://upload.example",
+            "https://media.example",
+            8 * 1024 * 1024,
+            86400,
+        );
+        let status = changed
+            .head_session(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.chunk_size, 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn init_rejects_oversized_declaration_before_creating_backend_state() {
+        let backend = FakeBackend::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            InMemoryStore::default(),
+            "https://upload.example",
+            "https://media.example",
+            1024 * 1024,
+            86400,
+        );
+        let response = manager
+            .init_session(
+                "owner",
+                ResumableUploadInitRequest {
+                    sha256: "a".repeat(64),
+                    size: u64::MAX,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            response.unwrap_err().status_code(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(backend.temp_objects.lock().await.is_empty());
     }
 
     #[derive(Clone, Default)]
@@ -996,10 +1203,21 @@ mod tests {
     struct FakeBackend {
         temp_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        fail_final_object_lookup: bool,
     }
 
     #[async_trait]
     impl ResumableBackend for FakeBackend {
+        async fn final_objects(
+            &self,
+            _session: &UploadSession,
+        ) -> Result<Vec<crate::storage::ObjectRef>> {
+            if self.fail_final_object_lookup {
+                return Err(anyhow!("final object lookup failed"));
+            }
+            Ok(Vec::new())
+        }
+
         async fn create_session(
             &self,
             upload_id: &str,
@@ -1460,6 +1678,57 @@ mod tests {
             .await
             .expect("repeated completion is idempotent");
         assert!(!repeated.newly_stored);
+    }
+
+    #[tokio::test]
+    async fn completion_without_processing_outbox_skips_final_object_lookup() {
+        // Without an outbox nothing consumes the object references, so a failed
+        // lookup must not turn a stored upload into an error. A retried
+        // completion would report newly_stored=false and skip the hooks gated on it.
+        let manager = ResumableManager::new(
+            FakeBackend {
+                fail_final_object_lookup: true,
+                ..FakeBackend::default()
+            },
+            InMemoryStore::default(),
+            "https://upload.divine.video",
+            "https://media.divine.video",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                        .to_string(),
+                    size: 5,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+        manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .expect("final chunk");
+
+        let complete = manager
+            .complete_session(&response.upload_id, "owner_pubkey")
+            .await
+            .expect("completion must not depend on an unused object lookup");
+        assert!(complete.newly_stored);
     }
 
     #[test]

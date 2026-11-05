@@ -1,9 +1,14 @@
 // ABOUTME: Rust upload service for Blossom blob uploads
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
+mod coordination;
 mod media_type;
+mod outbox;
+mod processing;
 mod request_log;
+mod resources;
 mod resumable;
+mod storage;
 mod thumbnail;
 
 use anyhow::{anyhow, Result};
@@ -17,15 +22,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use google_cloud_storage::{
-    client::{Client as GcsClient, ClientConfig},
-    http::objects::{
-        download::Range as DownloadRange,
-        get::GetObjectRequest,
-        upload::{Media, UploadObjectRequest, UploadType},
-        Object,
-    },
-};
+use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use k256::schnorr::{
@@ -51,6 +48,7 @@ const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
 #[derive(Clone)]
 struct Config {
     gcs_bucket: String,
+    media_write_provider: String,
     cdn_base_url: String,
     upload_base_url: String,
     port: u16,
@@ -71,6 +69,7 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         Self {
+            media_write_provider: env::var("MEDIA_WRITE_PROVIDER").unwrap_or_else(|_| "gcs".into()),
             gcs_bucket: env::var("GCS_BUCKET")
                 .unwrap_or_else(|_| "divine-blossom-media".to_string()),
             cdn_base_url: env::var("CDN_BASE_URL")
@@ -134,9 +133,24 @@ fn resolve_resumable_chunk_size(
     configured_chunk_size.min(upload_route_max_body_size)
 }
 
+fn gcs_compatibility(mode: storage::WriteMode, value: Option<&str>) -> Result<bool> {
+    let enabled = match value {
+        None => mode != storage::WriteMode::B2,
+        Some("true") => true,
+        Some("false") => false,
+        Some(_) => return Err(anyhow!("GCS_COMPAT_ENABLED must be true or false")),
+    };
+    if !enabled && mode != storage::WriteMode::B2 {
+        return Err(anyhow!("GCS writes require GCS compatibility"));
+    }
+    Ok(enabled)
+}
+
 // App state shared across handlers
 struct AppState {
-    gcs_client: GcsClient,
+    media_storage: storage::MediaStorage,
+    processing_outbox: Option<outbox::ProcessingOutbox>,
+    resumable_runtime: resumable::ResumableRuntime,
     config: Config,
     /// Shared HTTP client with explicit timeouts, so a stalled downstream
     /// (e.g. the transcoder) can't pin an inbound request indefinitely.
@@ -375,12 +389,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    resources::validate()?;
     let config = Config::from_env();
     let port = config.port;
 
     // Initialize GCS client
-    let gcs_config = ClientConfig::default().with_auth().await?;
-    let gcs_client = GcsClient::new(gcs_config);
+    let mode: storage::WriteMode = config.media_write_provider.parse()?;
+    let compatibility = gcs_compatibility(mode, env::var("GCS_COMPAT_ENABLED").ok().as_deref())?;
+    let gcs_client = if !compatibility {
+        None
+    } else {
+        Some(GcsClient::new(ClientConfig::default().with_auth().await?))
+    };
+    let b2 = if config.media_write_provider == "gcs" && env::var_os("B2_MEDIA_BUCKET").is_none() {
+        None
+    } else {
+        Some(storage::B2Store::from_env()?)
+    };
+    let media_storage =
+        storage::MediaStorage::new(mode, gcs_client.clone(), config.gcs_bucket.clone(), b2)?;
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -388,8 +415,83 @@ async fn main() -> Result<()> {
         .build()
         .expect("failed to build HTTP client");
 
+    let database_url = env::var("COORDINATION_DATABASE_URL").ok();
+    media_storage
+        .initialize_coordination(database_url.as_deref())
+        .await?;
+    let processing_outbox = match (
+        env::var("MEDIA_FINALIZED_URL").ok(),
+        env::var("MEDIA_FINALIZED_TOKEN").ok(),
+    ) {
+        (None, None) if config.media_write_provider == "gcs" => None,
+        (Some(endpoint), Some(token)) => Some(
+            outbox::ProcessingOutbox::connect(
+                database_url.as_deref().ok_or_else(|| {
+                    anyhow!("COORDINATION_DATABASE_URL required for durable processing")
+                })?,
+                &endpoint,
+                &token,
+            )
+            .await?,
+        ),
+        _ => {
+            return Err(anyhow!(
+                "MEDIA_FINALIZED_URL and MEDIA_FINALIZED_TOKEN required for B2 or dual writes"
+            ))
+        }
+    };
+    let resumable_runtime = resumable::ResumableRuntime::new(
+        media_storage.clone(),
+        gcs_client.clone(),
+        config.gcs_bucket.clone(),
+        database_url.as_deref(),
+    )
+    .await?;
+    let cleanup_runtime = resumable_runtime.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if cleanup_runtime.sweep_expired(100).await.is_err() {
+                warn!("Expired upload cleanup deferred");
+            }
+        }
+    });
+    if let Some(dispatcher) = processing_outbox.clone() {
+        let recovery_storage = media_storage.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if recovery_storage.sweep_stale_multipart(100).await.is_err() {
+                    warn!("Multipart cleanup deferred");
+                }
+                match dispatcher.pending_intents(1).await {
+                    Ok(pending) => {
+                        if let Some(intent) = pending.first() {
+                            let budget = intent.size.saturating_mul(2);
+                            if dispatcher
+                                .recover_intents(&recovery_storage, 1, budget)
+                                .await
+                                .is_err()
+                            {
+                                warn!("Upload intent recovery deferred");
+                            }
+                        }
+                    }
+                    Err(_) => warn!("Upload intent discovery deferred"),
+                }
+                if dispatcher.dispatch_once(20).await.is_err() {
+                    warn!("Processing dispatch failed; durable work will retry");
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
-        gcs_client,
+        media_storage,
+        processing_outbox,
+        resumable_runtime,
         config,
         http_client,
         transcribe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSCRIBE)),
@@ -457,20 +559,31 @@ fn auth_error_response(error: anyhow::Error) -> Response {
 }
 
 fn resumable_error_response(error: resumable::ResumableError) -> Response {
-    (
+    let retryable = matches!(error, resumable::ResumableError::Unavailable(_));
+    let mut response = (
         error.status_code(),
         Json(ErrorResponse {
             error: error.to_string(),
         }),
     )
-        .into_response()
+        .into_response();
+    if retryable {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    response
 }
 
 async fn collect_body_bytes(body: Body) -> Result<Bytes> {
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        bytes.extend_from_slice(&chunk.map_err(|error| anyhow!("Stream error: {}", error))?);
+        let chunk = chunk.map_err(|_| anyhow!("Failed to receive request bytes"))?;
+        if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
+            return Err(anyhow!("Chunk exceeds 16 MiB request limit"));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(bytes))
 }
@@ -534,11 +647,25 @@ async fn handle_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
+    let _permit = match resources::acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response()
+        }
+    };
     match process_upload(state, headers, body).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Upload error: {}", e);
-            let status = if e.to_string().contains("auth") || e.to_string().contains("Auth") {
+            let status = if e.is::<outbox::IntentConflict>() {
+                StatusCode::CONFLICT
+            } else if e.downcast_ref::<resources::ResourceError>().is_some() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else if e.to_string().contains("auth") || e.to_string().contains("Auth") {
                 StatusCode::UNAUTHORIZED
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -556,18 +683,17 @@ async fn handle_upload(
 
 fn resumable_manager(
     state: &AppState,
-) -> resumable::ResumableManager<resumable::GcsResumableBackend, resumable::GcsSessionStore> {
+) -> resumable::ResumableManager<resumable::MediaResumableBackend, resumable::ProviderSessionStore>
+{
     resumable::ResumableManager::new(
-        resumable::GcsResumableBackend::new(
-            state.gcs_client.clone(),
-            state.config.gcs_bucket.clone(),
-        ),
-        resumable::GcsSessionStore::new(state.gcs_client.clone(), state.config.gcs_bucket.clone()),
+        state.resumable_runtime.backend.clone(),
+        state.resumable_runtime.store.clone(),
         state.config.upload_base_url.clone(),
         state.config.cdn_base_url.clone(),
         state.config.resumable_chunk_size,
         state.config.resumable_session_ttl_secs,
     )
+    .with_outbox(state.processing_outbox.clone())
 }
 
 async fn handle_resumable_init(
@@ -621,6 +747,26 @@ async fn handle_session_chunk(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
+    handle_session_chunk_admitted(state, upload_id, headers, body, resources::acquire()).await
+}
+
+async fn handle_session_chunk_admitted(
+    state: Arc<AppState>,
+    upload_id: String,
+    headers: axum::http::HeaderMap,
+    body: Body,
+    admission: Result<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let _permit = match admission {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response()
+        }
+    };
     let content_range = match headers
         .get(header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -633,6 +779,20 @@ async fn handle_session_chunk(
         }
     };
 
+    let manager = resumable_manager(state.as_ref());
+    // Validate the session before a slow body can occupy authenticated admission.
+    // upload_chunk rechecks under its mutation lock after collection.
+    if let Err(error) = manager
+        .head_session(
+            &upload_id,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .await
+    {
+        return resumable_error_response(error);
+    }
     let chunk = match collect_body_bytes(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -643,7 +803,6 @@ async fn handle_session_chunk(
         }
     };
 
-    let manager = resumable_manager(state.as_ref());
     match manager
         .upload_chunk(
             &upload_id,
@@ -676,12 +835,14 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            spawn_nsfw_scan(
-                &state,
-                &response.sha256,
-                &response.content_type,
-                response.newly_stored,
-            );
+            if state.processing_outbox.is_none() {
+                spawn_nsfw_scan(
+                    &state,
+                    &response.sha256,
+                    &response.content_type,
+                    response.newly_stored,
+                );
+            }
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => resumable_error_response(error),
@@ -724,9 +885,9 @@ async fn process_upload(
         .to_string();
 
     // Stream body while hashing (with owner metadata for durability)
-    let (sha256_hash, size, all_bytes, newly_stored) = stream_to_gcs_with_hash(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
+    let (sha256_hash, size, all_bytes, newly_stored, spooled_dimensions) = stream_to_gcs_with_hash(
+        &state.media_storage,
+        state.processing_outbox.as_ref(),
         &content_type,
         body,
         &auth_event.pubkey,
@@ -734,10 +895,9 @@ async fn process_upload(
     .await?;
 
     // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
-    let thumbnail_url = if thumbnail::is_video_type(&content_type) {
+    let thumbnail_url = if thumbnail::is_video_type(&content_type) && !all_bytes.is_empty() {
         match extract_and_upload_thumbnail(
-            &state.gcs_client,
-            &state.config.gcs_bucket,
+            &state.media_storage,
             &state.config.cdn_base_url,
             &sha256_hash,
             &all_bytes,
@@ -758,7 +918,9 @@ async fn process_upload(
     };
 
     // Probe video dimensions (non-blocking - failures don't fail the upload)
-    let dim = if thumbnail::is_video_type(&content_type) {
+    let dim = if spooled_dimensions.is_some() {
+        spooled_dimensions
+    } else if thumbnail::is_video_type(&content_type) && !all_bytes.is_empty() {
         match probe_video_dimensions(&all_bytes).await {
             Ok(d) => {
                 info!("Probed video dimensions for {}: {}", sha256_hash, d);
@@ -774,7 +936,7 @@ async fn process_upload(
     };
 
     // Trigger HLS transcoding for videos (fire-and-forget)
-    if thumbnail::is_video_type(&content_type) {
+    if state.processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
@@ -794,7 +956,7 @@ async fn process_upload(
     }
 
     // Trigger transcript generation for transcribable media (audio/video)
-    if is_transcribable_type(&content_type) {
+    if state.processing_outbox.is_none() && is_transcribable_type(&content_type) {
         if let Some(ref transcriber_url) = state.config.transcriber_url {
             let transcriber_url = transcriber_url.clone();
             let hash = sha256_hash.clone();
@@ -812,7 +974,9 @@ async fn process_upload(
         }
     }
 
-    spawn_nsfw_scan(&state, &sha256_hash, &content_type, newly_stored);
+    if state.processing_outbox.is_none() {
+        spawn_nsfw_scan(&state, &sha256_hash, &content_type, newly_stored);
+    }
 
     // Build response
     let extension = get_extension(&content_type);
@@ -836,102 +1000,76 @@ async fn process_upload(
 }
 
 async fn stream_to_gcs_with_hash(
-    client: &GcsClient,
-    bucket: &str,
+    client: &storage::MediaStorage,
+    outbox: Option<&outbox::ProcessingOutbox>,
     content_type: &str,
     body: Body,
     owner: &str,
-) -> Result<(String, u64, Vec<u8>, bool)> {
-    let mut original_bytes = Vec::new();
-
-    // Collect body stream first; original bytes remain the source of truth for hashing/storage.
+) -> Result<(String, u64, Vec<u8>, bool, Option<String>)> {
+    use tokio::io::AsyncWriteExt;
+    let spool = NamedTempFile::new()?;
+    let mut file = tokio::fs::File::from_std(spool.reopen()?);
     let mut stream = body.into_data_stream();
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
-        original_bytes.extend_from_slice(&chunk);
-    }
-
-    // Keep original bytes immutable for hash/storage integrity.
-    // Derivative generation (thumbnail/probe/transcode) can use sanitized bytes.
-    let mut derivative_bytes = original_bytes.clone();
-
-    // Sanitize video bytes for derivative processing only.
-    if thumbnail::is_video_type(content_type) {
-        match sanitize_video(&derivative_bytes).await {
-            Ok(sanitized) => {
-                info!(
-                    "Prepared sanitized derivative bytes: {} -> {} bytes",
-                    derivative_bytes.len(),
-                    sanitized.len(),
-                );
-                derivative_bytes = sanitized;
-            }
-            Err(e) => {
-                // Non-fatal: keep original bytes for derivative processing if sanitization fails
-                error!(
-                    "Video sanitization failed for derivatives, using original: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    // Hash and store the original uploaded bytes.
     let mut hasher = Sha256::new();
-    hasher.update(&original_bytes);
-    let total_size = original_bytes.len() as u64;
-    let sha256_hash = hex::encode(hasher.finalize());
-
-    // Check if blob already exists
-    let exists = client
-        .get_object(
-            &google_cloud_storage::http::objects::get::GetObjectRequest {
-                bucket: bucket.to_string(),
-                object: sha256_hash.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        .is_ok();
-
-    if exists {
-        info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size, derivative_bytes, false));
+    let mut total_size = 0u64;
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|_| anyhow!("Failed to receive upload bytes"))?;
+        total_size = total_size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow!("Upload size overflow"))?;
+        resources::check_size(total_size)?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
     }
-
-    // Upload to GCS
-    let upload_type = UploadType::Simple(Media::new(sha256_hash.clone()));
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
+    file.flush().await?;
+    let sha256_hash = hex::encode(hasher.finalize());
+    if let Some(outbox) = outbox {
+        outbox
+            .begin_upload(&sha256_hash, total_size, content_type, owner, client)
+            .await?;
+    }
+    let written = client
+        .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
+        .await?;
+    if let Some(outbox) = outbox {
+        outbox
+            .enqueue_upload(
+                &sha256_hash,
+                total_size,
+                content_type,
+                owner,
+                written.objects,
+            )
+            .await?;
+    }
+    // Keep the legacy synchronous-thumbnail size range without buffering larger
+    // originals. Probing a spool needs no whole-video allocation or consumer.
+    let spooled_dimensions = if thumbnail::is_video_type(content_type)
+        && total_size > thumbnail::MAX_SYNC_VIDEO_BYTES as u64
+        && outbox.is_none()
+    {
+        probe_video_dimensions_path(spool.path()).await.ok()
+    } else {
+        None
     };
-
-    client
-        .upload_object(&req, Bytes::from(original_bytes.clone()), &upload_type)
-        .await
-        .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
-
-    // Set content type and owner metadata for durability
-    let mut metadata_map = std::collections::HashMap::new();
-    metadata_map.insert("owner".to_string(), owner.to_string());
-
-    let update_req = google_cloud_storage::http::objects::patch::PatchObjectRequest {
-        bucket: bucket.to_string(),
-        object: sha256_hash.clone(),
-        metadata: Some(Object {
-            content_type: Some(content_type.to_string()),
-            metadata: Some(metadata_map),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let derivative_bytes = if thumbnail::is_video_type(content_type)
+        && total_size <= thumbnail::MAX_SYNC_VIDEO_BYTES as u64
+    {
+        let original = tokio::fs::read(spool.path()).await?;
+        match sanitize_video(&original).await {
+            Ok(bytes) => bytes,
+            Err(_) => original,
+        }
+    } else {
+        Vec::new()
     };
-    let _ = client.patch_object(&update_req).await;
-
-    info!(
-        "Uploaded {} bytes as {} (owner: {})",
-        total_size, sha256_hash, owner
-    );
-    Ok((sha256_hash, total_size, derivative_bytes, true))
+    Ok((
+        sha256_hash,
+        total_size,
+        derivative_bytes,
+        written.newly_stored,
+        spooled_dimensions,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -1024,12 +1162,20 @@ async fn trigger_nsfw_scan(
 /// Extract thumbnail from video and upload to GCS
 /// Returns the thumbnail URL on success
 async fn extract_and_upload_thumbnail(
-    client: &GcsClient,
-    bucket: &str,
+    client: &storage::MediaStorage,
     cdn_base_url: &str,
     hash: &str,
     video_data: &[u8],
 ) -> Result<String> {
+    let thumb_path = format!("{}.jpg", hash);
+    if client.stat(&thumb_path).await?.is_some() {
+        // Reuse a prior valid thumbnail rather than comparing a regenerated
+        // JPEG (which may differ by input preparation or encoder version).
+        // This explicit upload retry can still repair a missing dual replica.
+        let bytes = client.read(&thumb_path).await?;
+        client.put(&thumb_path, bytes, "image/jpeg", None).await?;
+        return Ok(format!("{}/{}.jpg", cdn_base_url, hash));
+    }
     // Extract thumbnail using ffmpeg
     let thumb_result = thumbnail::extract_thumbnail(video_data)?;
 
@@ -1037,18 +1183,14 @@ async fn extract_and_upload_thumbnail(
     // This allows serving via CDN at media.divine.video/{hash}.jpg
     let thumb_path = format!("{}.jpg", hash);
 
-    let mut media = Media::new(thumb_path.clone());
-    media.content_type = "image/jpeg".into();
-    let upload_type = UploadType::Simple(media);
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
     client
-        .upload_object(&req, Bytes::from(thumb_result.data), &upload_type)
-        .await
-        .map_err(|e| anyhow!("GCS thumbnail upload failed: {}", e))?;
+        .put(
+            &thumb_path,
+            Bytes::from(thumb_result.data),
+            "image/jpeg",
+            None,
+        )
+        .await?;
 
     // Return CDN URL for thumbnail - stored at {hash}.jpg, served via CDN
     Ok(format!("{}/{}.jpg", cdn_base_url, hash))
@@ -1062,35 +1204,99 @@ fn media_source_candidates(hash: &str) -> [String; 3] {
     ]
 }
 
+fn recorded_write_mode(
+    objects: &[storage::ObjectRef],
+    fallback: storage::WriteMode,
+) -> storage::WriteMode {
+    let gcs = objects
+        .iter()
+        .any(|object| object.provider == storage::StorageProvider::Gcs);
+    let b2 = objects
+        .iter()
+        .any(|object| object.provider == storage::StorageProvider::B2);
+    match (gcs, b2) {
+        (true, true) => storage::WriteMode::Dual,
+        (true, false) => storage::WriteMode::Gcs,
+        (false, true) => storage::WriteMode::B2,
+        _ => fallback,
+    }
+}
+
+async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::MediaStorage> {
+    let objects = match &state.processing_outbox {
+        Some(outbox) => outbox.source_objects(hash).await?,
+        None => Vec::new(),
+    };
+    for object in &objects {
+        let valid = match object.provider {
+            storage::StorageProvider::Gcs => object.bucket == state.media_storage.gcs_bucket(),
+            storage::StorageProvider::B2 => {
+                Some(object.bucket.as_str()) == state.media_storage.b2_bucket()
+            }
+        };
+        if !valid {
+            return Err(anyhow!("Recorded derivative storage mapping changed"));
+        }
+    }
+    state
+        .media_storage
+        .with_mode(recorded_write_mode(&objects, state.media_storage.mode))
+}
+
+async fn read_derivative_input(
+    client: &storage::MediaStorage,
+    reference: &storage::ObjectRef,
+) -> Result<Vec<u8>> {
+    let mut stream = client.stream_ref(reference).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > thumbnail::MAX_SYNC_VIDEO_BYTES {
+            return Err(anyhow!("Media requires asynchronous derivative processing"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 async fn download_best_available_media_bytes(
-    client: &GcsClient,
-    bucket: &str,
+    client: &storage::MediaStorage,
+    outbox: Option<&outbox::ProcessingOutbox>,
     hash: &str,
 ) -> Result<(Vec<u8>, String)> {
+    if let Some(outbox) = outbox {
+        let sources = outbox.source_objects(hash).await?;
+        for reference in sources {
+            if let Ok(bytes) = read_derivative_input(client, &reference).await {
+                resources::check_size(bytes.len() as u64)?;
+                if hex::encode(Sha256::digest(&bytes)) == hash {
+                    return Ok((bytes, reference.key));
+                }
+            }
+        }
+    }
     let mut failures = Vec::new();
 
     for object in media_source_candidates(hash) {
-        match client
-            .download_object(
-                &GetObjectRequest {
-                    bucket: bucket.to_string(),
-                    object: object.clone(),
-                    ..Default::default()
-                },
-                &DownloadRange::default(),
-            )
-            .await
-        {
+        let result = async {
+            let stored = client
+                .stat(&object)
+                .await?
+                .ok_or_else(|| anyhow!("Media source missing"))?;
+            read_derivative_input(client, &stored.reference).await
+        }
+        .await;
+        match result {
             Ok(data) => {
                 if object == hash {
-                    return Ok((data, object));
+                    return Ok((data.to_vec(), object));
                 }
 
                 warn!(
                     "Original blob missing for {}, using fallback media source {} for thumbnail generation",
                     hash, object
                 );
-                return Ok((data, object));
+                return Ok((data.to_vec(), object));
             }
             Err(e) => failures.push(format!("{}: {}", object, e)),
         }
@@ -1104,7 +1310,7 @@ async fn download_best_available_media_bytes(
 }
 
 /// On-demand thumbnail generation endpoint
-/// Downloads video from GCS, generates thumbnail, stores it, returns the image
+/// Resolves the recorded original, generates a thumbnail, and preserves its storage policy.
 async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -1123,47 +1329,45 @@ async fn handle_thumbnail_generate(
     }
 
     let hash = hash.to_lowercase();
-
+    let media_storage = match thumbnail_storage(&state, &hash).await {
+        Ok(storage) => storage,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
-    let thumb_exists = state
-        .gcs_client
-        .get_object(&GetObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: thumb_path.clone(),
-            ..Default::default()
-        })
-        .await
-        .is_ok();
-
-    if thumb_exists {
-        // Thumbnail already exists, download and return it
-        match state
-            .gcs_client
-            .download_object(
-                &GetObjectRequest {
-                    bucket: state.config.gcs_bucket.clone(),
-                    object: thumb_path,
-                    ..Default::default()
-                },
-                &DownloadRange::default(),
-            )
-            .await
-        {
+    match media_storage.stat(&thumb_path).await {
+        Ok(Some(_)) => match media_storage.read_verified(&thumb_path).await {
             Ok(data) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
-                    .into_response();
+                    .into_response()
             }
-            Err(e) => {
-                error!("Failed to download existing thumbnail: {}", e);
+            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+                warn!("Thumbnail cache read failed; attempting regeneration");
             }
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        },
+        Ok(None) => {}
+        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+            warn!("Thumbnail cache lookup failed; attempting regeneration");
         }
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     }
 
+    // Cache hits do not occupy expensive thumbnail generation admission.
+    let _permit = match resources::acquire_thumbnail() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response()
+        }
+    };
     // Download the original blob, or fall back to the best available HLS transport stream.
     let (video_data, source_object) = match download_best_available_media_bytes(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
+        &media_storage,
+        state.processing_outbox.as_ref(),
         &hash,
     )
     .await
@@ -1207,23 +1411,22 @@ async fn handle_thumbnail_generate(
         }
     };
 
-    // Upload thumbnail to GCS
+    // Store the thumbnail using the original upload policy.
     let thumb_path = format!("{}.jpg", hash);
-    let mut media = Media::new(thumb_path.clone());
-    media.content_type = "image/jpeg".into();
-    let upload_type = UploadType::Simple(media);
-    let req = UploadObjectRequest {
-        bucket: state.config.gcs_bucket.clone(),
-        ..Default::default()
-    };
-
-    if let Err(e) = state
-        .gcs_client
-        .upload_object(&req, Bytes::from(thumb_result.data.clone()), &upload_type)
+    if media_storage
+        .put(
+            &thumb_path,
+            Bytes::from(thumb_result.data.clone()),
+            "image/jpeg",
+            None,
+        )
         .await
+        .is_err()
     {
-        error!("Failed to upload thumbnail for {}: {}", hash, e);
-        // Still return the thumbnail even if upload failed
+        if media_storage.mode != storage::WriteMode::Gcs {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        warn!("Thumbnail storage failed; returning generated image without a persistence claim");
     }
 
     info!("Generated on-demand thumbnail for {}", hash);
@@ -1299,14 +1502,18 @@ async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
 /// Probe video data with ffprobe to get display dimensions (respecting rotation metadata).
 /// Returns "WIDTHxHEIGHT" string suitable for the Nostr `dim` imeta tag.
 async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
-    use tokio::process::Command;
-
     let probe_path = new_temp_media_path(".mp4")?;
 
     // Write to temp file for ffprobe
     tokio::fs::write(&probe_path, video_bytes)
         .await
         .map_err(|e| anyhow!("Failed to write temp file for probe: {}", e))?;
+
+    probe_video_dimensions_path(&probe_path).await
+}
+
+async fn probe_video_dimensions_path(probe_path: &std::path::Path) -> Result<String> {
+    use tokio::process::Command;
 
     let output = Command::new("ffprobe")
         .args([
@@ -1322,9 +1529,6 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
         .output()
         .await
         .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
-
-    // Clean up temp file
-    let _ = probe_path.close();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1406,11 +1610,368 @@ mod tests {
     use tower::ServiceExt;
     use tracing_subscriber::EnvFilter;
 
+    use crate::storage;
+
+    static ADMISSION_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn unauthenticated_migration_owner_is_not_registration_authority() {
+        let owner = "a".repeat(64);
+        assert_eq!(super::migration_owner(Some(&owner), true), None);
+        assert_eq!(
+            super::migration_owner(Some(&owner), false),
+            Some(owner.as_str())
+        );
+    }
+
+    #[test]
+    fn retryable_session_errors_have_a_backoff_header() {
+        let response =
+            super::resumable_error_response(resumable::ResumableError::Unavailable("busy".into()));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    }
+
+    #[tokio::test]
+    async fn maintenance_requests_cannot_take_upload_admission() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut mirrors = Vec::new();
+        while let Ok(permit) = crate::resources::acquire_mirror() {
+            mirrors.push(permit);
+        }
+        let response = super::handle_migrate(
+            State(test_state(None, 1)),
+            Json(super::MigrateRequest {
+                source_url: "https://not-requested.invalid".into(),
+                expected_hash: None,
+                owner: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let thumbnail =
+            crate::resources::acquire_thumbnail().expect("mirrors cannot take thumbnail admission");
+        drop(thumbnail);
+        drop(mirrors);
+    }
+
+    #[test]
+    fn mirror_host_allowlist_checks_the_domain_boundary() {
+        assert!(super::mirror_host_matches("nostr.build", "nostr.build"));
+        assert!(super::mirror_host_matches(
+            "media.nostr.build",
+            "nostr.build"
+        ));
+        assert!(!super::mirror_host_matches(
+            "evilnostr.build",
+            "nostr.build"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mirror_fetch_total_deadline_includes_the_body() {
+        use axum::body::Bytes;
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(futures::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"late"))
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = super::mirror_http_client(std::time::Duration::from_millis(500)).unwrap();
+        let result = async { client.get(endpoint).send().await?.bytes().await }.await;
+        assert!(result.unwrap_err().is_timeout());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_cache_hit_does_not_need_generation_admission() {
+        use axum::{http::Uri, response::IntoResponse};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut permits = Vec::new();
+        while let Ok(permit) = crate::resources::acquire_thumbnail() {
+            permits.push(permit);
+        }
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.query().unwrap_or_default().contains("alt=media") { return "prior-jpeg".into_response(); }
+            Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+        let response =
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"prior-jpeg");
+        server.abort();
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn chunk_admission_sheds_before_collecting_the_request_body() {
+        let response = super::handle_session_chunk_admitted(
+            test_state(None, 1),
+            "fixture-session".to_string(),
+            axum::http::HeaderMap::new(),
+            Body::empty(),
+            Err(crate::resources::ResourceError::Busy.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    }
+
+    #[tokio::test]
+    async fn unknown_chunk_session_is_rejected_before_reading_body() {
+        use axum::{routing::any, Router};
+        let app = Router::new().route(
+            "/*path",
+            any(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        serde_json::json!({"error":{"code":404,"message":"Not Found","errors":[]}}),
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(gcs.clone()),
+            "fixture".into(),
+            None,
+        )
+        .unwrap();
+        let runtime = resumable::ResumableRuntime::new(storage, Some(gcs), "fixture".into(), None)
+            .await
+            .unwrap();
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("unverified session body must not be read")
+            },
+        ));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let response = super::handle_session_chunk_admitted(
+            state,
+            "missing".into(),
+            headers,
+            body,
+            Ok(permit),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn derivative_input_preserves_legacy_100_mib_thumbnail_range() {
+        use crate::storage::{MediaStorage, ObjectRef, StorageProvider, WriteMode};
+        use axum::{body::Bytes, http::Uri, routing::get, Router};
+        let app = Router::new().route(
+            "/*path",
+            get(|uri: Uri| async move {
+                let mib = if uri.path().ends_with("/65") { 65 } else { 101 };
+                let chunk = Bytes::from(vec![0_u8; 1024 * 1024]);
+                Body::from_stream(futures::stream::iter(
+                    (0..mib).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+                ))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let storage = MediaStorage::new(WriteMode::Gcs, Some(gcs), "fixture".into(), None).unwrap();
+        for size in [65, 101] {
+            let reference = ObjectRef {
+                provider: StorageProvider::Gcs,
+                bucket: "fixture".into(),
+                key: size.to_string(),
+                version: Some("1".into()),
+            };
+            let result = super::read_derivative_input(&storage, &reference).await;
+            if size == 65 {
+                assert_eq!(result.unwrap().len(), 65 * 1024 * 1024);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_upload_reuses_existing_thumbnail_without_regeneration() {
+        use crate::storage::{MediaStorage, WriteMode};
+        use axum::{http::Uri, routing::get, Json, Router};
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.query().unwrap_or_default().contains("alt=media") {
+                return axum::response::IntoResponse::into_response("prior-jpeg");
+            }
+            axum::response::IntoResponse::into_response(Json(serde_json::json!({"name":"hash.jpg","bucket":"fixture","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let storage = MediaStorage::new(WriteMode::Gcs, Some(gcs), "fixture".into(), None).unwrap();
+        let url = super::extract_and_upload_thumbnail(
+            &storage,
+            "https://media.example",
+            "hash",
+            b"not a decodable video",
+        )
+        .await
+        .unwrap();
+        assert_eq!(url, "https://media.example/hash.jpg");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gcs_thumbnail_cache_read_failure_attempts_regeneration() {
+        use axum::{http::Uri, response::IntoResponse, routing::get, Router};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.query().unwrap_or_default().contains("alt=media") {
+                if uri.path().ends_with(".jpg") { return StatusCode::FORBIDDEN.into_response(); }
+                return "not-video".into_response();
+            }
+            Json(serde_json::json!({"name":"fixture","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"9","contentType":"video/mp4"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+        let response =
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
+                .await
+                .into_response();
+        // Invalid source bytes reach generation (500), not the cache-read 502.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        server.abort();
+    }
+
+    #[test]
+    fn derivative_storage_retains_original_policy_after_mode_switch() {
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let reference = |provider| ObjectRef {
+            provider,
+            bucket: "fixture".into(),
+            key: "a".repeat(64),
+            version: Some("v1".into()),
+        };
+        assert_eq!(
+            super::recorded_write_mode(&[reference(StorageProvider::B2)], WriteMode::Gcs),
+            WriteMode::B2
+        );
+        assert_eq!(
+            super::recorded_write_mode(
+                &[
+                    reference(StorageProvider::Gcs),
+                    reference(StorageProvider::B2)
+                ],
+                WriteMode::Gcs
+            ),
+            WriteMode::Dual
+        );
+        assert_eq!(
+            super::recorded_write_mode(&[], WriteMode::Gcs),
+            WriteMode::Gcs
+        );
+    }
+
+    #[test]
+    fn storage_compatibility_is_explicit_and_preserves_b2_independence() {
+        use crate::storage::WriteMode;
+        assert!(!super::gcs_compatibility(WriteMode::B2, None).unwrap());
+        assert!(super::gcs_compatibility(WriteMode::B2, Some("true")).unwrap());
+        assert!(super::gcs_compatibility(WriteMode::Dual, None).unwrap());
+        assert!(super::gcs_compatibility(WriteMode::Dual, Some("false")).is_err());
+        assert!(super::gcs_compatibility(WriteMode::B2, Some("invalid")).is_err());
+    }
+
     fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
         Arc::new(AppState {
-            gcs_client: GcsClient::new(ClientConfig::default().anonymous()),
+            processing_outbox: None,
+            resumable_runtime: resumable::ResumableRuntime::legacy_for_test(),
+            media_storage: storage::MediaStorage::new(
+                storage::WriteMode::Gcs,
+                Some(GcsClient::new(ClientConfig::default().anonymous())),
+                "test-bucket".into(),
+                None,
+            )
+            .unwrap(),
             config: Config {
                 gcs_bucket: "test-bucket".to_string(),
+                media_write_provider: "gcs".into(),
                 cdn_base_url: "https://media.divine.video".to_string(),
                 upload_base_url: "https://upload.divine.video".to_string(),
                 port: 0,
@@ -2573,12 +3134,28 @@ async fn handle_migrate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<MigrateRequest>,
 ) -> Response {
+    let _permit = match resources::acquire_mirror() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response()
+        }
+    };
     match process_migrate(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Migration error: {}", e);
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                if e.is::<outbox::IntentConflict>() {
+                    StatusCode::CONFLICT
+                } else if e.downcast_ref::<resources::ResourceError>().is_some() {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
@@ -2622,12 +3199,16 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("URL must have a host"))?;
-    if !allowed_domains.iter().any(|d| host.ends_with(d)) {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !allowed_domains.iter().any(|d| mirror_host_matches(host, d))
+    {
         return Err(anyhow!("Source URL must be from an allowed domain"));
     }
 
     // Fetch content from source
-    let client = reqwest::Client::new();
+    let client = mirror_http_client(resources::mirror_fetch_timeout())?;
     let mut response = client
         .get(&request.source_url)
         .send()
@@ -2667,17 +3248,23 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
 
     // Stream and hash the content
     let mut hasher = Sha256::new();
-    let mut all_bytes = Vec::new();
+    use tokio::io::AsyncWriteExt;
+    let spool = NamedTempFile::new()?;
+    let mut file = tokio::fs::File::from_std(spool.reopen()?);
     let mut total_size: u64 = 0;
 
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
         hasher.update(&chunk);
-        total_size += chunk.len() as u64;
-        all_bytes.extend_from_slice(&chunk);
+        total_size = total_size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow!("Upload size overflow"))?;
+        resources::check_size(total_size)?;
+        file.write_all(&chunk).await?;
     }
 
+    file.flush().await?;
     let sha256_hash = hex::encode(hasher.finalize());
 
     // Verify hash if expected_hash is provided
@@ -2691,61 +3278,36 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         }
     }
 
-    // Check if blob already exists in GCS
-    let exists = state
-        .gcs_client
-        .get_object(
-            &google_cloud_storage::http::objects::get::GetObjectRequest {
-                bucket: state.config.gcs_bucket.clone(),
-                object: sha256_hash.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        .is_ok();
-
-    if exists {
-        info!("Blob {} already exists, skipping migration", sha256_hash);
-        return Ok(MigrateResponse {
-            sha256: sha256_hash,
-            size: total_size,
-            content_type,
-            migrated: false,
-            source_url: request.source_url,
-        });
+    let trusted_owner =
+        migration_owner(request.owner.as_deref(), state.processing_outbox.is_some());
+    let owner = trusted_owner.unwrap_or("");
+    if let Some(outbox) = &state.processing_outbox {
+        outbox
+            .begin_upload(
+                &sha256_hash,
+                total_size,
+                &content_type,
+                owner,
+                &state.media_storage,
+            )
+            .await?;
     }
+    let written = state
+        .media_storage
+        .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
+        .await?;
 
-    // Upload to GCS
-    let upload_type = UploadType::Simple(Media::new(sha256_hash.clone()));
-    let req = UploadObjectRequest {
-        bucket: state.config.gcs_bucket.clone(),
-        ..Default::default()
-    };
-
-    state
-        .gcs_client
-        .upload_object(&req, Bytes::from(all_bytes), &upload_type)
-        .await
-        .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
-
-    // Set content type and owner metadata for durability
-    let metadata_map = request.owner.as_ref().map(|owner| {
-        let mut m = std::collections::HashMap::new();
-        m.insert("owner".to_string(), owner.clone());
-        m
-    });
-
-    let update_req = google_cloud_storage::http::objects::patch::PatchObjectRequest {
-        bucket: state.config.gcs_bucket.clone(),
-        object: sha256_hash.clone(),
-        metadata: Some(Object {
-            content_type: Some(content_type.clone()),
-            metadata: metadata_map,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let _ = state.gcs_client.patch_object(&update_req).await;
+    if let Some(outbox) = &state.processing_outbox {
+        outbox
+            .enqueue_upload(
+                &sha256_hash,
+                total_size,
+                &content_type,
+                owner,
+                written.objects,
+            )
+            .await?;
+    }
 
     info!(
         "Migrated {} bytes as {} from {} (owner: {:?})",
@@ -2756,9 +3318,32 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         sha256: sha256_hash,
         size: total_size,
         content_type,
-        migrated: true,
+        migrated: written.newly_stored,
         source_url: request.source_url,
     })
+}
+
+fn migration_owner(owner: Option<&str>, outbox_enabled: bool) -> Option<&str> {
+    // /migrate has no caller proof. Legacy metadata is not ownership authority;
+    // do not promote an untrusted declaration into per-owner registration.
+    if outbox_enabled {
+        None
+    } else {
+        owner
+    }
+}
+
+fn mirror_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
+        .build()
+        .map_err(|_| anyhow!("Mirror HTTP client initialization failed"))
+}
+
+fn mirror_host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// Create a Blossom auth header from an nsec

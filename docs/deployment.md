@@ -106,3 +106,109 @@ or serving image. Complete those checks using the private runbook.
   digest, then verify the serving image and health as the private runbook says.
   Do not rerun an old source build, deploy `latest`, patch a live workload, or
   assume a pending newer promotion will not overwrite the rollback.
+
+## B2 support activation prerequisites
+
+The B2 implementation is disabled by the default `MEDIA_WRITE_PROVIDER=gcs`.
+Select `dual` to require verified GCS and B2 copies, or `b2` once the companion
+system can read/process new B2 objects. Set the B2 credentials, scoped
+`COORDINATION_DATABASE_URL`, and compatible authenticated `MEDIA_FINALIZED_URL`
+and `MEDIA_FINALIZED_TOKEN` through the platform configuration. This endpoint is
+a new durable consumer contract, not the current hash-only transcoder endpoint.
+See [the contract](contracts/media-finalized-v1.md).
+
+Use the private authoritative bucket agreed with Blossom; do not upload raw
+media into the approved-only canary/delivery bucket. Activation requires the
+companion policy/erasure exclusion and version-aware derivative pipeline, a
+bounded real-B2 upload/readback/multipart/abort drill, and playback through the
+existing CDN descriptor URLs. Local provider fixtures do not establish those
+production properties. This change does not provision or enable that system.
+
+Direct/mirrored upload spools and resumable declarations default to at most
+1 GiB per object (`MAX_UPLOAD_BYTES`). Upload and finalization operations share
+four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024). Thumbnail generation
+uses its own `MAX_CONCURRENT_THUMBNAILS` slots (default 2); `/migrate` uses separate
+`MAX_CONCURRENT_MIRRORS` slots (default 1). Each setting accepts 1–1024. Cache hits
+bypass thumbnail generation admission. Mirrors cannot occupy thumbnail or upload
+admission; generation cannot occupy upload admission.
+Exhausted admission returns 503; oversized uploads return 413. Provision scratch
+disk for at least the configured maximum times the upload and mirror slot counts,
+plus thumbnail scratch files and operational
+reserve; disk-full errors fail the request and remove local temporary files.
+Resumable requests are capped at 16 MiB per chunk and share admission slots.
+Local thumbnail decoding retains the legacy 100 MiB input limit; larger assets
+require the durable asynchronous processing path for thumbnails. GCS mode without
+a durable consumer still probes dimensions from its disk spool for larger direct
+uploads; it does not promise synchronous thumbnails above that limit.
+Set measured limits before expanding concurrency; these defaults are bounds,
+not a capacity estimate.
+
+Admission and size limits apply in GCS mode too, including resumable chunk PUTs.
+Keeping GCS as the storage default does not preserve the old unbounded admission
+behavior. Before rolling out this binary, size the limits for the existing GCS
+workload and verify saturation/recovery with the current clients. A client that
+exhausts its short chunk-retry budget on repeated 503 responses can start a new
+session rather than retain progress; `Retry-After` alone does not establish that
+the client waits. The four-slot default is not a production-capacity measurement.
+
+With the outbox enabled, `/migrate` does not propagate caller-supplied owners to
+stored-object metadata or ownership-registration events. Its events use a null
+owner. Do not infer ownership from these mirror events before a separately
+verified caller/upload authorization contract is deployed.
+
+Before every provider-mode or destination-bucket change, drain or reconcile all
+unfinished upload intents as well as accepted sessions. An intent remains pinned
+to its original mapping. A retry against another mapping returns HTTP 409 rather
+than retargeting unknown provider outcomes. Keep an endpoint with the original
+configuration to finish an explicit byte retry, or reconcile through the approved
+operator process. Do not delete an intent or silently change its mapping merely
+to unblock a mode switch. Retry repair assumes the pinned mapping is retained.
+This repository does not implement a general abandonment/retargeting tool.
+Defining and exercising the companion operator reconciliation procedure is an
+activation prerequisite before enabling the outbox or changing a mapping with
+unfinished intents, including abandoned uploads with no completed source. It must
+drain writers, distinguish never-started writes from uncertain accepted writes,
+and inspect exact provider versions before any authorized state removal. A HEAD
+404 alone does not establish that a delayed write cannot commit. Until that
+procedure exists, retain the original mapping rather than proceeding with the
+mode switch or deleting rows to clear 409s.
+
+Mirror fetches accept HTTPS allowlisted hosts (including dot-separated subdomains),
+reject URL credentials and redirects, and have a total timeout per fetch attempt:
+`MIRROR_FETCH_TIMEOUT_SECS` (default 120, range 1–3600). The deadline includes the
+body, so slow sources cannot retain mirror admission indefinitely. Size this
+deadline for the intended mirror sizes and source throughput before rollout;
+timeouts discard the temporary spool without beginning a provider write.
+
+B2 control requests have a 120-second total deadline. Object GETs have a
+120-second response-header deadline and a 30-second body stall deadline that
+resets on progress, not a 120-second whole-object download budget. Verification
+of a large object can therefore continue while bytes arrive. Busy resumable
+session locks return 503 with `Retry-After: 5` rather than a server-error verdict.
+GCS on-demand thumbnails preserve best-effort regeneration and return generated
+JPEG bytes when persistence fails; that response does not claim a stored copy.
+B2 and dual thumbnail failures remain explicit rather than claiming verified
+persistence across destinations.
+
+Database transport failures terminate the process so its supervisor restarts
+connections and workers. Run the service under a restart supervisor (as in the
+GKE Deployment); a standalone process requires equivalent restart behavior.
+Pending state stays in PostgreSQL. Keep all credentials and provider-aware
+readers needed by already accepted sessions and queued events during rollback.
+
+An `upload_chunks` reservation with an empty object-reference list has an
+unresolved provider outcome. Abort and expiry retain that session/reservation
+rather than claiming terminal cleanup. HEAD 404 and an HTTP timeout do not prove
+that an accepted PUT cannot commit later. Drain every writer, inspect exact
+provider versions, and reconcile through the approved operator process before
+clearing uncertain state. Do not delete rows merely to unblock a sweeper.
+Multipart IDs are persisted before uploading parts; an uncertain initiation can
+leave an empty provider-side unfinished upload and needs provider-side lifecycle
+or operator reconciliation. No cleanup completion or erasure claim should be
+made without the companion live drills.
+
+Background finalization recovery only verifies existing intended copies and
+queues them; it never creates a missing replica while erasure may be active.
+An explicitly retried upload can repair a partial dual write. Queue processing
+is idempotent by versioned job identity; owner registration is distinct from
+expensive media-processing deduplication.
