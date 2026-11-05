@@ -301,6 +301,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_schema_bootstrap_is_safe_on_fresh_schemas() {
+        // Separate fresh schemas expose catalog races that disappear on reruns.
+        for _ in 0..3 {
+            let Some(url) = isolated_database_url().await else {
+                return;
+            };
+            let barrier = Arc::new(tokio::sync::Barrier::new(4));
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let url = url.clone();
+                let barrier = barrier.clone();
+                workers.push(tokio::spawn(async move {
+                    let client = crate::coordination::connect(&url).await.unwrap();
+                    barrier.wait().await;
+                    client
+                        .batch_execute(include_str!("storage/multipart.sql"))
+                        .await
+                        .unwrap();
+                    client.batch_execute(SCHEMA).await.unwrap();
+                    client
+                        .batch_execute(include_str!(
+                            "../database/migrations/001_upload_coordination.sql"
+                        ))
+                        .await
+                        .unwrap();
+                }));
+            }
+            for worker in workers {
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn source_policy_uses_finalization_order_not_retry_schedule() {
         let Some(url) = isolated_database_url().await else {
             return;

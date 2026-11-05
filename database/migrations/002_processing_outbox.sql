@@ -1,3 +1,5 @@
+BEGIN;
+SELECT pg_advisory_xact_lock(7301001);
 CREATE TABLE IF NOT EXISTS upload_processing_intents (
     sha256 TEXT NOT NULL,
     owner TEXT NOT NULL,
@@ -27,3 +29,4 @@ CREATE INDEX IF NOT EXISTS upload_processing_outbox_pending
 ALTER TABLE upload_processing_outbox ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp();
 CREATE INDEX IF NOT EXISTS upload_processing_outbox_original_finalized
     ON upload_processing_outbox ((payload->>'sha256'), finalized_at DESC, job_id DESC);
+COMMIT;
