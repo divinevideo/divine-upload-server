@@ -594,12 +594,14 @@ where
             &session.content_type,
             newly_stored,
         );
-        response.objects = self
-            .backend
-            .final_objects(session)
-            .await
-            .map_err(internal_error)?;
+        // Only the processing outbox consumes the object references. Without one,
+        // looking them up adds a failure after the bytes are already stored.
         if let Some(outbox) = &self.outbox {
+            response.objects = self
+                .backend
+                .final_objects(session)
+                .await
+                .map_err(internal_error)?;
             outbox
                 .enqueue_upload(
                     &session.final_sha256,
@@ -1191,10 +1193,21 @@ mod tests {
     struct FakeBackend {
         temp_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        fail_final_object_lookup: bool,
     }
 
     #[async_trait]
     impl ResumableBackend for FakeBackend {
+        async fn final_objects(
+            &self,
+            _session: &UploadSession,
+        ) -> Result<Vec<crate::storage::ObjectRef>> {
+            if self.fail_final_object_lookup {
+                return Err(anyhow!("final object lookup failed"));
+            }
+            Ok(Vec::new())
+        }
+
         async fn create_session(
             &self,
             upload_id: &str,
@@ -1655,6 +1668,57 @@ mod tests {
             .await
             .expect("repeated completion is idempotent");
         assert!(!repeated.newly_stored);
+    }
+
+    #[tokio::test]
+    async fn completion_without_processing_outbox_skips_final_object_lookup() {
+        // Without an outbox nothing consumes the object references, so a failed
+        // lookup must not turn a stored upload into an error. A retried
+        // completion would report newly_stored=false and skip the hooks gated on it.
+        let manager = ResumableManager::new(
+            FakeBackend {
+                fail_final_object_lookup: true,
+                ..FakeBackend::default()
+            },
+            InMemoryStore::default(),
+            "https://upload.divine.video",
+            "https://media.divine.video",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let response = manager
+            .init_session(
+                "owner_pubkey",
+                ResumableUploadInitRequest {
+                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                        .to_string(),
+                    size: 5,
+                    content_type: "video/mp4".to_string(),
+                    file_name: None,
+                },
+            )
+            .await
+            .expect("init response");
+        let auth = response
+            .required_headers
+            .get("Authorization")
+            .expect("session auth")
+            .to_string();
+        manager
+            .upload_chunk(
+                &response.upload_id,
+                Some(&auth),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .expect("final chunk");
+
+        let complete = manager
+            .complete_session(&response.upload_id, "owner_pubkey")
+            .await
+            .expect("completion must not depend on an unused object lookup");
+        assert!(complete.newly_stored);
     }
 
     #[test]

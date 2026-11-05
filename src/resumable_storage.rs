@@ -972,7 +972,11 @@ mod integration_tests {
             .await
             .unwrap();
         assert!(complete.newly_stored);
-        assert_eq!(complete.objects.len(), 1);
+        let session = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
+        assert_eq!(
+            runtime.backend.final_objects(&session).await.unwrap().len(),
+            1
+        );
         assert_eq!(
             objects
                 .lock()
