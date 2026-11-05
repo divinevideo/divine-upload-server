@@ -17,6 +17,7 @@ pub struct B2Store {
     secret_key: String,
     endpoint: String,
     client: reqwest::Client,
+    read_client: reqwest::Client,
     tracker: std::sync::Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
 }
 impl B2Store {
@@ -52,6 +53,10 @@ impl B2Store {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()?;
+        let read_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
         Ok(Self {
             bucket,
             region,
@@ -59,6 +64,7 @@ impl B2Store {
             secret_key,
             endpoint,
             client,
+            read_client,
             tracker: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -209,16 +215,22 @@ impl B2Store {
             &canonical,
         );
         let authorization=format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",self.access_key);
-        let mut req = self
-            .client
+        let client = if method == Method::GET {
+            &self.read_client
+        } else {
+            &self.client
+        };
+        let mut req = client
             .request(method, url)
             .header("authorization", authorization);
         for (name, value) in headers {
             req = req.header(name, value);
         }
-        req.body(body)
-            .send()
+        // GET bodies use a per-chunk stall deadline, not a whole-object deadline.
+        // Headers and control requests still have a bounded response wait.
+        tokio::time::timeout(Duration::from_secs(120), req.body(body).send())
             .await
+            .map_err(|_| anyhow!("B2 response headers timed out"))?
             .map_err(|_| anyhow!("B2 transport failure; write outcome may require reconciliation"))
     }
     pub async fn stat(&self, key: &str) -> Result<Option<StoredObject>> {
@@ -272,10 +284,14 @@ impl B2Store {
         {
             bail!("B2 response version mismatch");
         }
-        response
-            .bytes()
+        use futures::TryStreamExt;
+        body_stream(response, Duration::from_secs(30))
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
             .await
-            .map_err(|_| anyhow!("B2 body read failed"))
+            .map(Bytes::from)
     }
     pub async fn put(
         &self,
@@ -349,7 +365,7 @@ impl B2Store {
         if response.content_length() != Some(bytes.len() as u64) {
             bail!("B2 stored media length mismatch");
         }
-        let mut stream = response.bytes_stream();
+        let mut stream = body_stream(response, Duration::from_secs(30));
         let mut total = 0usize;
         let mut hash = Sha256::new();
         while let Some(chunk) = stream.next().await {
@@ -397,7 +413,6 @@ impl B2Store {
         &self,
         reference: &ObjectRef,
     ) -> Result<futures::stream::BoxStream<'static, Result<Bytes>>> {
-        use futures::StreamExt;
         self.validate_ref(reference)?;
         let response = self
             .request(
@@ -418,10 +433,7 @@ impl B2Store {
         {
             bail!("B2 response version mismatch");
         }
-        Ok(response
-            .bytes_stream()
-            .map(|r| r.map_err(|_| anyhow!("B2 body read failed")))
-            .boxed())
+        Ok(body_stream(response, Duration::from_secs(30)))
     }
     pub async fn put_file(
         &self,
@@ -572,6 +584,24 @@ fn require_success(response: &Response) -> Result<()> {
     }
     Ok(())
 }
+
+fn body_stream(
+    response: Response,
+    stall: Duration,
+) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+    use futures::StreamExt;
+    futures::stream::try_unfold(response.bytes_stream(), move |mut stream| async move {
+        match tokio::time::timeout(stall, stream.next()).await {
+            Ok(Some(chunk)) => Ok(Some((
+                chunk.map_err(|_| anyhow!("B2 body read failed"))?,
+                stream,
+            ))),
+            Ok(None) => Ok(None),
+            Err(_) => Err(anyhow!("B2 body stalled")),
+        }
+    })
+    .boxed()
+}
 fn canonical_request(
     method: &str,
     path: &str,
@@ -670,6 +700,61 @@ fn escape_xml(value: &str) -> String {
 #[cfg(test)]
 mod signing_tests {
     use super::*;
+    #[tokio::test]
+    async fn read_stall_deadline_resets_on_progress() {
+        use axum::{body::Body, routing::get, Router};
+        use futures::TryStreamExt;
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(futures::stream::unfold(0, |index| async move {
+                    if index == 6 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"x")),
+                        index + 1,
+                    ))
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        let bytes: Vec<Bytes> = body_stream(response, Duration::from_millis(500))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bytes.iter().map(Bytes::len).sum::<usize>(), 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn read_stall_deadline_rejects_a_stopped_body() {
+        use axum::{body::Body, routing::get, Router};
+        use futures::TryStreamExt;
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(futures::stream::once(async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"late"))
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        let error = body_stream(response, Duration::from_millis(500))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "B2 body stalled");
+        server.abort();
+    }
     #[test]
     fn aws_published_s3_get_signature_matches() {
         // AWS's published GET Object known-answer vector, using its public example key:
