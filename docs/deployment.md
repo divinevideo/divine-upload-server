@@ -138,6 +138,14 @@ uploads; it does not promise synchronous thumbnails above that limit.
 Set measured limits before expanding concurrency; these defaults are bounds,
 not a capacity estimate.
 
+Admission and size limits apply in GCS mode too, including resumable chunk PUTs.
+Keeping GCS as the storage default does not preserve the old unbounded admission
+behavior. Before rolling out this binary, size the limits for the existing GCS
+workload and verify saturation/recovery with the current clients. A client that
+exhausts its short chunk-retry budget on repeated 503 responses can start a new
+session rather than retain progress; `Retry-After` alone does not establish that
+the client waits. The four-slot default is not a production-capacity measurement.
+
 Database transport failures terminate the process so its supervisor restarts
 connections and workers. Run the service under a restart supervisor (as in the
 GKE Deployment); a standalone process requires equivalent restart behavior.
