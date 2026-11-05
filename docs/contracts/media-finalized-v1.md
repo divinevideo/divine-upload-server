@@ -12,8 +12,11 @@ Deploy a compatible consumer before enabling a B2 upload mode.
 ## Request
 
 The JSON body has `schema_version: 1`, `job_id`, `source`, `replicas`, `sha256`,
-`size`, `content_type`, `owner`, and `pipeline_version: 1`. `owner` is null for
-legacy mirror operations with no supplied owner; this must not grant ownership.
+`size`, `content_type`, `owner`, and `pipeline_version: 1`. `owner` is always null
+for the unauthenticated `/migrate` route when the outbox is enabled, regardless of
+the request's owner declaration. It must not grant ownership. A verified
+caller/upload authorization contract is required before mirror events can claim
+an owner; legacy metadata is not registration authority.
 `replicas` is omitted when there are no additional verified copies.
 
 `source` and every replica use Blossom's internal object-reference shape:

@@ -125,10 +125,13 @@ existing CDN descriptor URLs. Local provider fixtures do not establish those
 production properties. This change does not provision or enable that system.
 
 Direct/mirrored upload spools and resumable declarations default to at most
-1 GiB per object (`MAX_UPLOAD_BYTES`). Expensive upload/finalization/thumbnail
-operations share four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024).
+1 GiB per object (`MAX_UPLOAD_BYTES`). Upload and finalization operations share
+four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024). Unauthenticated
+thumbnail and `/migrate` work instead share a separate one-slot maintenance pool;
+they cannot take authenticated upload admission slots.
 Exhausted admission returns 503; oversized uploads return 413. Provision scratch
-disk for at least the configured maximum times the slot count plus operational
+disk for at least the configured maximum times the upload slot count plus one
+maintenance spool and operational
 reserve; disk-full errors fail the request and remove local temporary files.
 Resumable requests are capped at 16 MiB per chunk and share admission slots.
 Local thumbnail decoding retains the legacy 100 MiB input limit; larger assets
@@ -145,6 +148,29 @@ workload and verify saturation/recovery with the current clients. A client that
 exhausts its short chunk-retry budget on repeated 503 responses can start a new
 session rather than retain progress; `Retry-After` alone does not establish that
 the client waits. The four-slot default is not a production-capacity measurement.
+
+With the outbox enabled, `/migrate` does not propagate caller-supplied owners to
+stored-object metadata or ownership-registration events. Its events use a null
+owner. Do not infer ownership from these mirror events before a separately
+verified caller/upload authorization contract is deployed.
+
+Before every provider-mode or destination-bucket change, drain or reconcile all
+unfinished upload intents as well as accepted sessions. An intent remains pinned
+to its original mapping. A retry against another mapping returns HTTP 409 rather
+than retargeting unknown provider outcomes. Keep an endpoint with the original
+configuration to finish an explicit byte retry, or reconcile through the approved
+operator process. Do not delete an intent or silently change its mapping merely
+to unblock a mode switch. Retry repair assumes the pinned mapping is retained.
+
+B2 control requests have a 120-second total deadline. Object GETs have a
+120-second response-header deadline and a 30-second body stall deadline that
+resets on progress, not a 120-second whole-object download budget. Verification
+of a large object can therefore continue while bytes arrive. Busy resumable
+session locks return 503 with `Retry-After: 5` rather than a server-error verdict.
+GCS on-demand thumbnails preserve best-effort regeneration and return generated
+JPEG bytes when persistence fails; that response does not claim a stored copy.
+B2 and dual thumbnail failures remain explicit rather than claiming verified
+persistence across destinations.
 
 Database transport failures terminate the process so its supervisor restarts
 connections and workers. Run the service under a restart supervisor (as in the
