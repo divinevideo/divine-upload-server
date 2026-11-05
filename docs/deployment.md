@@ -126,12 +126,14 @@ production properties. This change does not provision or enable that system.
 
 Direct/mirrored upload spools and resumable declarations default to at most
 1 GiB per object (`MAX_UPLOAD_BYTES`). Upload and finalization operations share
-four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024). Unauthenticated
-thumbnail and `/migrate` work instead share a separate one-slot maintenance pool;
-they cannot take authenticated upload admission slots.
+four slots per pod (`MAX_CONCURRENT_UPLOADS`, maximum 1024). Thumbnail generation
+uses its own `MAX_CONCURRENT_THUMBNAILS` slots (default 2); `/migrate` uses separate
+`MAX_CONCURRENT_MIRRORS` slots (default 1). Each setting accepts 1–1024. Cache hits
+bypass thumbnail generation admission. Mirrors cannot occupy thumbnail or upload
+admission; generation cannot occupy upload admission.
 Exhausted admission returns 503; oversized uploads return 413. Provision scratch
-disk for at least the configured maximum times the upload slot count plus one
-maintenance spool and operational
+disk for at least the configured maximum times the upload and mirror slot counts,
+plus thumbnail scratch files and operational
 reserve; disk-full errors fail the request and remove local temporary files.
 Resumable requests are capped at 16 MiB per chunk and share admission slots.
 Local thumbnail decoding retains the legacy 100 MiB input limit; larger assets
@@ -161,6 +163,22 @@ than retargeting unknown provider outcomes. Keep an endpoint with the original
 configuration to finish an explicit byte retry, or reconcile through the approved
 operator process. Do not delete an intent or silently change its mapping merely
 to unblock a mode switch. Retry repair assumes the pinned mapping is retained.
+This repository does not implement a general abandonment/retargeting tool.
+Defining and exercising the companion operator reconciliation procedure is an
+activation prerequisite before enabling the outbox or changing a mapping with
+unfinished intents, including abandoned uploads with no completed source. It must
+drain writers, distinguish never-started writes from uncertain accepted writes,
+and inspect exact provider versions before any authorized state removal. A HEAD
+404 alone does not establish that a delayed write cannot commit. Until that
+procedure exists, retain the original mapping rather than proceeding with the
+mode switch or deleting rows to clear 409s.
+
+Mirror fetches accept HTTPS allowlisted hosts (including dot-separated subdomains),
+reject URL credentials and redirects, and have a total timeout per fetch attempt:
+`MIRROR_FETCH_TIMEOUT_SECS` (default 120, range 1–3600). The deadline includes the
+body, so slow sources cannot retain mirror admission indefinitely. Size this
+deadline for the intended mirror sizes and source throughput before rollout;
+timeouts discard the temporary spool without beginning a provider write.
 
 B2 control requests have a 120-second total deadline. Object GETs have a
 120-second response-header deadline and a 30-second body stall deadline that

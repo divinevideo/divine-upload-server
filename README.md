@@ -145,8 +145,12 @@ their provider/bucket mapping. A mismatched retry returns 409 and keeps the old
 mapping; retry repair requires the original configuration. See the deployment
 runbook for reconciliation. With the outbox enabled, unauthenticated `/migrate`
 events always have a null owner instead of trusting the request's declaration.
-Thumbnail/mirror work has a separate one-slot admission pool, not the authenticated
-upload pool. Busy session locks return 503 with `Retry-After`.
+Thumbnail generation and mirroring have independent configurable admission pools
+(`MAX_CONCURRENT_THUMBNAILS`, default 2; `MAX_CONCURRENT_MIRRORS`, default 1), separate
+from uploads. Thumbnail cache hits bypass generation admission. Mirror fetches use
+HTTPS allowlisted hosts without redirects and are bounded by
+`MIRROR_FETCH_TIMEOUT_SECS` (default 120). Busy session locks return 503 with
+`Retry-After`.
 
 ## Deployment
 

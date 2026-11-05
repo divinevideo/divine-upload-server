@@ -4,7 +4,12 @@ mod tests {
     fn maintenance_and_upload_admission_use_distinct_pools() {
         assert!(!std::sync::Arc::ptr_eq(
             &super::SLOTS,
-            &super::MAINTENANCE_SLOTS
+            &super::THUMBNAIL_SLOTS
+        ));
+        assert!(!std::sync::Arc::ptr_eq(&super::SLOTS, &super::MIRROR_SLOTS));
+        assert!(!std::sync::Arc::ptr_eq(
+            &super::THUMBNAIL_SLOTS,
+            &super::MIRROR_SLOTS
         ));
     }
     #[test]
@@ -47,9 +52,17 @@ fn positive_setting(name: &str, default: u64) -> Result<u64> {
 }
 pub fn validate() -> Result<()> {
     positive_setting("MAX_UPLOAD_BYTES", 1024 * 1024 * 1024)?;
-    let slots = positive_setting("MAX_CONCURRENT_UPLOADS", 4)?;
-    if slots > 1024 {
-        return Err(anyhow!("MAX_CONCURRENT_UPLOADS must not exceed 1024"));
+    for (name, default) in [
+        ("MAX_CONCURRENT_UPLOADS", 4),
+        ("MAX_CONCURRENT_THUMBNAILS", 2),
+        ("MAX_CONCURRENT_MIRRORS", 1),
+    ] {
+        if positive_setting(name, default)? > 1024 {
+            return Err(anyhow!("{name} must not exceed 1024"));
+        }
+    }
+    if positive_setting("MIRROR_FETCH_TIMEOUT_SECS", 120)? > 3600 {
+        return Err(anyhow!("MIRROR_FETCH_TIMEOUT_SECS must not exceed 3600"));
     }
     Ok(())
 }
@@ -72,8 +85,21 @@ static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
             .min(1024) as usize,
     ))
 });
-// Public maintenance requests must not consume authenticated upload admission.
-static MAINTENANCE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+// Public mirrors and thumbnail generation cannot starve each other or uploads.
+static THUMBNAIL_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        positive_setting("MAX_CONCURRENT_THUMBNAILS", 2)
+            .unwrap_or(2)
+            .min(1024) as usize,
+    ))
+});
+static MIRROR_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        positive_setting("MAX_CONCURRENT_MIRRORS", 1)
+            .unwrap_or(1)
+            .min(1024) as usize,
+    ))
+});
 fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
     slots
         .try_acquire_owned()
@@ -82,6 +108,16 @@ fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
 pub fn acquire() -> Result<OwnedSemaphorePermit> {
     acquire_from(SLOTS.clone())
 }
-pub fn acquire_maintenance() -> Result<OwnedSemaphorePermit> {
-    acquire_from(MAINTENANCE_SLOTS.clone())
+pub fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
+    acquire_from(THUMBNAIL_SLOTS.clone())
+}
+pub fn acquire_mirror() -> Result<OwnedSemaphorePermit> {
+    acquire_from(MIRROR_SLOTS.clone())
+}
+pub fn mirror_fetch_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        positive_setting("MIRROR_FETCH_TIMEOUT_SECS", 120)
+            .unwrap_or(120)
+            .min(3600),
+    )
 }

@@ -1329,17 +1329,6 @@ async fn handle_thumbnail_generate(
     }
 
     let hash = hash.to_lowercase();
-    let _permit = match resources::acquire_maintenance() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-            )
-                .into_response()
-        }
-    };
-
     let media_storage = match thumbnail_storage(&state, &hash).await {
         Ok(storage) => storage,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
@@ -1364,6 +1353,17 @@ async fn handle_thumbnail_generate(
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     }
 
+    // Cache hits do not occupy expensive thumbnail generation admission.
+    let _permit = match resources::acquire_thumbnail() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response()
+        }
+    };
     // Download the original blob, or fall back to the best available HLS transport stream.
     let (video_data, source_object) = match download_best_available_media_bytes(
         &media_storage,
@@ -1635,8 +1635,10 @@ mod tests {
     #[tokio::test]
     async fn maintenance_requests_cannot_take_upload_admission() {
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
-        let maintenance =
-            crate::resources::acquire_maintenance().expect("separate maintenance pool");
+        let mut mirrors = Vec::new();
+        while let Ok(permit) = crate::resources::acquire_mirror() {
+            mirrors.push(permit);
+        }
         let response = super::handle_migrate(
             State(test_state(None, 1)),
             Json(super::MigrateRequest {
@@ -1647,16 +1649,86 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let response = super::handle_thumbnail_generate(
-            State(test_state(None, 1)),
-            axum::extract::Path("a".repeat(64)),
-        )
-        .await;
-        assert_eq!(
-            axum::response::IntoResponse::into_response(response).status(),
-            StatusCode::SERVICE_UNAVAILABLE
+        let thumbnail =
+            crate::resources::acquire_thumbnail().expect("mirrors cannot take thumbnail admission");
+        drop(thumbnail);
+        drop(mirrors);
+    }
+
+    #[test]
+    fn mirror_host_allowlist_checks_the_domain_boundary() {
+        assert!(super::mirror_host_matches("nostr.build", "nostr.build"));
+        assert!(super::mirror_host_matches(
+            "media.nostr.build",
+            "nostr.build"
+        ));
+        assert!(!super::mirror_host_matches(
+            "evilnostr.build",
+            "nostr.build"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mirror_fetch_total_deadline_includes_the_body() {
+        use axum::body::Bytes;
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(futures::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"late"))
+                }))
+            }),
         );
-        drop(maintenance);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = super::mirror_http_client(std::time::Duration::from_millis(500)).unwrap();
+        let result = async { client.get(endpoint).send().await?.bytes().await }.await;
+        assert!(result.unwrap_err().is_timeout());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_cache_hit_does_not_need_generation_admission() {
+        use axum::{http::Uri, response::IntoResponse};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut permits = Vec::new();
+        while let Ok(permit) = crate::resources::acquire_thumbnail() {
+            permits.push(permit);
+        }
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.query().unwrap_or_default().contains("alt=media") { return "prior-jpeg".into_response(); }
+            Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+        let response =
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"prior-jpeg");
+        server.abort();
+        drop(permits);
     }
 
     #[tokio::test]
@@ -3062,7 +3134,7 @@ async fn handle_migrate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<MigrateRequest>,
 ) -> Response {
-    let _permit = match resources::acquire_maintenance() {
+    let _permit = match resources::acquire_mirror() {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -3127,12 +3199,16 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("URL must have a host"))?;
-    if !allowed_domains.iter().any(|d| host.ends_with(d)) {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !allowed_domains.iter().any(|d| mirror_host_matches(host, d))
+    {
         return Err(anyhow!("Source URL must be from an allowed domain"));
     }
 
     // Fetch content from source
-    let client = reqwest::Client::new();
+    let client = mirror_http_client(resources::mirror_fetch_timeout())?;
     let mut response = client
         .get(&request.source_url)
         .send()
@@ -3255,6 +3331,19 @@ fn migration_owner(owner: Option<&str>, outbox_enabled: bool) -> Option<&str> {
     } else {
         owner
     }
+}
+
+fn mirror_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
+        .build()
+        .map_err(|_| anyhow!("Mirror HTTP client initialization failed"))
+}
+
+fn mirror_host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// Create a Blossom auth header from an nsec
