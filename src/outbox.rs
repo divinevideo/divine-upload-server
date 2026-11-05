@@ -11,6 +11,10 @@ use tokio_postgres::Client;
 
 const SCHEMA: &str = include_str!("../database/migrations/002_processing_outbox.sql");
 
+#[derive(Debug, thiserror::Error)]
+#[error("Upload intent is pinned to another storage policy; retry against its original provider configuration or reconcile before switching modes")]
+pub struct IntentConflict;
+
 #[derive(Clone)]
 pub struct ProcessingOutbox {
     database: Arc<Mutex<Client>>,
@@ -65,7 +69,7 @@ impl ProcessingOutbox {
             || row.get::<_, String>(3) != gcs_bucket
             || row.get::<_, Option<String>>(4).as_deref() != b2_bucket
         {
-            bail!("upload intent conflicts with existing metadata");
+            return Err(IntentConflict.into());
         }
         Ok(())
     }
@@ -443,6 +447,52 @@ mod tests {
         assert_eq!(retry_delay(1), 10);
         assert!(retry_delay(2) > retry_delay(1));
         assert!(retry_delay(i32::MAX) <= 86400);
+    }
+
+    #[tokio::test]
+    async fn unfinished_policy_conflict_is_explicit_and_keeps_original_mapping() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let gcs = google_cloud_storage::client::Client::new(
+            google_cloud_storage::client::ClientConfig::default().anonymous(),
+        );
+        let gcs_storage =
+            MediaStorage::new(WriteMode::Gcs, Some(gcs), "first-bucket".into(), None).unwrap();
+        let b2_storage = MediaStorage::new(
+            WriteMode::B2,
+            None,
+            "first-bucket".into(),
+            Some(
+                crate::storage::B2Store::new(
+                    "second-bucket".into(),
+                    "us-west-001".into(),
+                    "fixture".into(),
+                    "fixture".into(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &gcs_storage)
+            .await
+            .unwrap();
+        let error = outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &b2_storage)
+            .await
+            .unwrap_err();
+        assert!(error.is::<IntentConflict>());
+        let pending = outbox.pending_intents(1).await.unwrap();
+        assert_eq!(pending[0].mode, "gcs");
+        assert_eq!(pending[0].gcs_bucket, "first-bucket");
+        assert_eq!(pending[0].b2_bucket, None);
     }
     /// Run against an explicitly provided disposable database; never production.
     #[tokio::test]

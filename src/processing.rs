@@ -74,6 +74,17 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn mirror_without_verified_owner_serializes_no_ownership_claim() {
+        let event =
+            MediaFinalizedV1::new(&"a".repeat(64), 3, "video/mp4", "", object("v1")).unwrap();
+        assert!(event.owner.is_none());
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["owner"],
+            serde_json::Value::Null
+        );
+    }
+
     #[tokio::test]
     async fn delivery_requires_matching_durable_acknowledgement() {
         use axum::{routing::post, Json, Router};

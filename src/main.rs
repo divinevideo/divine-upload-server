@@ -559,13 +559,20 @@ fn auth_error_response(error: anyhow::Error) -> Response {
 }
 
 fn resumable_error_response(error: resumable::ResumableError) -> Response {
-    (
+    let retryable = matches!(error, resumable::ResumableError::Unavailable(_));
+    let mut response = (
         error.status_code(),
         Json(ErrorResponse {
             error: error.to_string(),
         }),
     )
-        .into_response()
+        .into_response();
+    if retryable {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    response
 }
 
 async fn collect_body_bytes(body: Body) -> Result<Bytes> {
@@ -654,7 +661,9 @@ async fn handle_upload(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Upload error: {}", e);
-            let status = if e.downcast_ref::<resources::ResourceError>().is_some() {
+            let status = if e.is::<outbox::IntentConflict>() {
+                StatusCode::CONFLICT
+            } else if e.downcast_ref::<resources::ResourceError>().is_some() {
                 StatusCode::PAYLOAD_TOO_LARGE
             } else if e.to_string().contains("auth") || e.to_string().contains("Auth") {
                 StatusCode::UNAUTHORIZED
@@ -1297,7 +1306,7 @@ async fn handle_thumbnail_generate(
     }
 
     let hash = hash.to_lowercase();
-    let _permit = match resources::acquire() {
+    let _permit = match resources::acquire_maintenance() {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1320,9 +1329,15 @@ async fn handle_thumbnail_generate(
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
                     .into_response()
             }
+            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+                warn!("Thumbnail cache read failed; attempting regeneration");
+            }
             Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
         },
         Ok(None) => {}
+        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+            warn!("Thumbnail cache lookup failed; attempting regeneration");
+        }
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     }
 
@@ -1385,7 +1400,10 @@ async fn handle_thumbnail_generate(
         .await
         .is_err()
     {
-        return StatusCode::BAD_GATEWAY.into_response();
+        if media_storage.mode != storage::WriteMode::Gcs {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        warn!("Thumbnail storage failed; returning generated image without a persistence claim");
     }
 
     info!("Generated on-demand thumbnail for {}", hash);
@@ -1571,8 +1589,61 @@ mod tests {
 
     use crate::storage;
 
+    static ADMISSION_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn unauthenticated_migration_owner_is_not_registration_authority() {
+        let owner = "a".repeat(64);
+        assert_eq!(super::migration_owner(Some(&owner), true), None);
+        assert_eq!(
+            super::migration_owner(Some(&owner), false),
+            Some(owner.as_str())
+        );
+    }
+
+    #[test]
+    fn retryable_session_errors_have_a_backoff_header() {
+        let response =
+            super::resumable_error_response(resumable::ResumableError::Unavailable("busy".into()));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    }
+
+    #[tokio::test]
+    async fn maintenance_requests_cannot_take_upload_admission() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut uploads = Vec::new();
+        while let Ok(permit) = crate::resources::acquire() {
+            uploads.push(permit);
+        }
+        let maintenance =
+            crate::resources::acquire_maintenance().expect("separate maintenance pool");
+        let response = super::handle_migrate(
+            State(test_state(None, 1)),
+            Json(super::MigrateRequest {
+                source_url: "https://not-requested.invalid".into(),
+                expected_hash: None,
+                owner: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = super::handle_thumbnail_generate(
+            State(test_state(None, 1)),
+            axum::extract::Path("a".repeat(64)),
+        )
+        .await;
+        assert_eq!(
+            axum::response::IntoResponse::into_response(response).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(maintenance);
+        drop(uploads);
+    }
+
     #[tokio::test]
     async fn chunk_admission_sheds_before_collecting_the_request_body() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let mut permits = Vec::new();
         while let Ok(permit) = crate::resources::acquire() {
             permits.push(permit);
@@ -1661,6 +1732,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(url, "https://media.example/hash.jpg");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gcs_thumbnail_cache_read_failure_attempts_regeneration() {
+        use axum::{http::Uri, response::IntoResponse, routing::get, Router};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.query().unwrap_or_default().contains("alt=media") {
+                if uri.path().ends_with(".jpg") { return StatusCode::FORBIDDEN.into_response(); }
+                return "not-video".into_response();
+            }
+            Json(serde_json::json!({"name":"fixture","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"9","contentType":"video/mp4"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+        let response =
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
+                .await
+                .into_response();
+        // Invalid source bytes reach generation (500), not the cache-read 502.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         server.abort();
     }
 
@@ -2879,7 +2988,7 @@ async fn handle_migrate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<MigrateRequest>,
 ) -> Response {
-    let _permit = match resources::acquire() {
+    let _permit = match resources::acquire_maintenance() {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -2894,7 +3003,9 @@ async fn handle_migrate(
         Err(e) => {
             error!("Migration error: {}", e);
             (
-                if e.downcast_ref::<resources::ResourceError>().is_some() {
+                if e.is::<outbox::IntentConflict>() {
+                    StatusCode::CONFLICT
+                } else if e.downcast_ref::<resources::ResourceError>().is_some() {
                     StatusCode::PAYLOAD_TOO_LARGE
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -3017,7 +3128,9 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         }
     }
 
-    let owner = request.owner.as_deref().unwrap_or("");
+    let trusted_owner =
+        migration_owner(request.owner.as_deref(), state.processing_outbox.is_some());
+    let owner = trusted_owner.unwrap_or("");
     if let Some(outbox) = &state.processing_outbox {
         outbox
             .begin_upload(
@@ -3031,12 +3144,7 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
     }
     let written = state
         .media_storage
-        .put_file(
-            &sha256_hash,
-            spool.path(),
-            &content_type,
-            request.owner.as_deref(),
-        )
+        .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
         .await?;
 
     if let Some(outbox) = &state.processing_outbox {
@@ -3063,6 +3171,16 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         migrated: written.newly_stored,
         source_url: request.source_url,
     })
+}
+
+fn migration_owner(owner: Option<&str>, outbox_enabled: bool) -> Option<&str> {
+    // /migrate has no caller proof. Legacy metadata is not ownership authority;
+    // do not promote an untrusted declaration into per-owner registration.
+    if outbox_enabled {
+        None
+    } else {
+        owner
+    }
 }
 
 /// Create a Blossom auth header from an nsec

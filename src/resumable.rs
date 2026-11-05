@@ -1066,8 +1066,18 @@ fn is_video_content_type(content_type: &str) -> bool {
     crate::media_type::normalize(content_type).starts_with("video/")
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Upload session is busy; retry the request")]
+pub struct SessionBusy;
+
 fn internal_error(error: anyhow::Error) -> ResumableError {
-    ResumableError::Internal(error.to_string())
+    if error.is::<SessionBusy>() {
+        ResumableError::Unavailable(error.to_string())
+    } else if error.is::<crate::outbox::IntentConflict>() {
+        ResumableError::Conflict(error.to_string())
+    } else {
+        ResumableError::Internal(error.to_string())
+    }
 }
 
 fn is_not_found_error(error: &impl std::fmt::Display) -> bool {

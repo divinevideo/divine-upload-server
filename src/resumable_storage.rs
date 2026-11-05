@@ -147,7 +147,7 @@ impl SessionStore for ProviderSessionStore {
                 .map_err(|_| anyhow!("Upload lock unavailable"))?
                 .get(0);
             if !locked {
-                bail!("Upload session is busy; retry the request");
+                return Err(SessionBusy.into());
             }
             Ok(Some(Box::new(client)))
         } else {
@@ -597,7 +597,16 @@ mod tests {
         let store = database_store().await;
         let id = format!("test_lock_{}", random_hex(12));
         let guard = store.lock(&id).await.unwrap();
-        assert!(store.lock(&id).await.is_err());
+        let busy = store
+            .lock(&id)
+            .await
+            .err()
+            .expect("lock must remain exclusive");
+        assert!(busy.is::<SessionBusy>());
+        assert_eq!(
+            super::internal_error(busy).status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         drop(guard);
     }
     #[tokio::test]

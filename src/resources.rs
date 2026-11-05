@@ -65,6 +65,8 @@ static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
             .min(1024) as usize,
     ))
 });
+// Public maintenance requests must not consume authenticated upload admission.
+static MAINTENANCE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
     slots
         .try_acquire_owned()
@@ -72,4 +74,7 @@ fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
 }
 pub fn acquire() -> Result<OwnedSemaphorePermit> {
     acquire_from(SLOTS.clone())
+}
+pub fn acquire_maintenance() -> Result<OwnedSemaphorePermit> {
+    acquire_from(MAINTENANCE_SLOTS.clone())
 }
