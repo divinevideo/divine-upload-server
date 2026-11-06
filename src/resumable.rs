@@ -104,8 +104,6 @@ pub struct CompleteUploadResponse {
     /// downstream hooks more than once.
     #[serde(skip)]
     pub newly_stored: bool,
-    #[serde(skip)]
-    pub objects: Vec<crate::storage::ObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +512,27 @@ where
         }
 
         if session.finalized_object.is_some() {
+            // A committed receipt answers the replay without asking storage for
+            // the final objects again.
+            if let Some(outbox) = &self.outbox {
+                if outbox
+                    .has_session_receipt(
+                        &session.upload_id,
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.owner,
+                    )
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return Ok(self.build_complete_upload_response(
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.content_type,
+                        false,
+                    ));
+                }
+            }
             return self.completed_response(&session, false).await;
         }
 
@@ -588,7 +607,7 @@ where
         session: &UploadSession,
         newly_stored: bool,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
-        let mut response = self.build_complete_upload_response(
+        let response = self.build_complete_upload_response(
             &session.final_sha256,
             session.declared_size,
             &session.content_type,
@@ -597,18 +616,18 @@ where
         // Only the processing outbox consumes the object references. Without one,
         // looking them up adds a failure after the bytes are already stored.
         if let Some(outbox) = &self.outbox {
-            response.objects = self
+            let objects = self
                 .backend
                 .final_objects(session)
                 .await
                 .map_err(internal_error)?;
             outbox
-                .enqueue_upload(
+                .enqueue_completed_session(
+                    &session.upload_id,
                     &session.final_sha256,
                     session.declared_size,
-                    &session.content_type,
                     &session.owner,
-                    response.objects.clone(),
+                    objects,
                 )
                 .await
                 .map_err(internal_error)?;
@@ -689,7 +708,6 @@ where
             thumbnail: None,
             streaming,
             newly_stored,
-            objects: Vec::new(),
         }
     }
 
@@ -1204,6 +1222,7 @@ mod tests {
         temp_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_final_object_lookup: bool,
+        final_refs: Vec<crate::storage::ObjectRef>,
     }
 
     #[async_trait]
@@ -1215,7 +1234,7 @@ mod tests {
             if self.fail_final_object_lookup {
                 return Err(anyhow!("final object lookup failed"));
             }
-            Ok(Vec::new())
+            Ok(self.final_refs.clone())
         }
 
         async fn create_session(
@@ -1598,6 +1617,271 @@ mod tests {
             .expect_err("non-contiguous chunk should fail");
 
         assert!(matches!(error, ResumableError::RangeNotSatisfiable(_)));
+    }
+
+    #[tokio::test]
+    async fn receipt_backed_replay_needs_no_final_object_lookup() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let store = InMemoryStore::default();
+        let manager_with = |backend: FakeBackend| {
+            ResumableManager::new(
+                backend,
+                store.clone(),
+                "https://upload.example",
+                "https://media.example",
+                DEFAULT_RESUMABLE_CHUNK_SIZE,
+                DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+            )
+            .with_outbox(Some(outbox.clone()))
+        };
+        let manager = manager_with(FakeBackend {
+            final_refs: vec![ObjectRef {
+                provider: StorageProvider::Gcs,
+                bucket: "fixture-gcs".into(),
+                key: hash.clone(),
+                version: Some("1".into()),
+            }],
+            ..Default::default()
+        });
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+        session.next_offset = 5;
+        session.storage_complete = true;
+        session.finalized_object = Some(hash.clone());
+        store.save(&session).await.unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        manager
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(outbox
+            .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert!(!outbox
+            .has_session_receipt("unknown-upload", &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert_eq!(
+            outbox
+                .has_session_receipt(&init.upload_id, &hash, 6, &owner)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session receipt does not match the completed upload"
+        );
+
+        // Storage can no longer answer (provider disabled or object moved), but
+        // the durable receipt already records the committed completion.
+        let unavailable = manager_with(FakeBackend {
+            fail_final_object_lookup: true,
+            ..Default::default()
+        });
+        let replay = unavailable.complete_session(&init.upload_id, &owner).await;
+        assert!(
+            replay.is_ok(),
+            "receipt-backed replay failed: {:?}",
+            replay.err()
+        );
+        assert!(!replay.unwrap().newly_stored);
+    }
+
+    #[tokio::test]
+    async fn completed_session_replay_preserves_a_newer_upload_policy() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let gcs = ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        };
+        let b2 = ObjectRef {
+            provider: StorageProvider::B2,
+            bucket: "fixture-b2".into(),
+            key: hash.clone(),
+            version: Some("v1".into()),
+        };
+        for (index, (old_mode, new_mode)) in [
+            (WriteMode::Gcs, WriteMode::Dual),
+            (WriteMode::Dual, WriteMode::Gcs),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let owner = format!("{:064x}", index + 1);
+            let old_refs = if old_mode == WriteMode::Gcs {
+                vec![gcs.clone()]
+            } else {
+                vec![gcs.clone(), b2.clone()]
+            };
+            let new_refs = if new_mode == WriteMode::Gcs {
+                vec![gcs.clone()]
+            } else {
+                vec![gcs.clone(), b2.clone()]
+            };
+            let store = InMemoryStore::default();
+            let manager = ResumableManager::new(
+                FakeBackend {
+                    final_refs: old_refs.clone(),
+                    ..Default::default()
+                },
+                store.clone(),
+                "https://upload.example",
+                "https://media.example",
+                DEFAULT_RESUMABLE_CHUNK_SIZE,
+                DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+            )
+            .with_outbox(Some(outbox.clone()));
+            let init = manager
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hash.clone(),
+                        size: 5,
+                        content_type: "video/mp4".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+            session.next_offset = 5;
+            session.storage_complete = true;
+            session.finalized_object = Some(hash.clone());
+            store.save(&session).await.unwrap();
+            outbox
+                .begin_upload(
+                    &hash,
+                    5,
+                    "video/mp4",
+                    &owner,
+                    &storage.with_mode(old_mode).unwrap(),
+                )
+                .await
+                .unwrap();
+            manager
+                .complete_session(&init.upload_id, &owner)
+                .await
+                .unwrap();
+            outbox
+                .begin_upload(
+                    &hash,
+                    5,
+                    "video/mp4",
+                    &owner,
+                    &storage.with_mode(new_mode).unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let replay = manager.complete_session(&init.upload_id, &owner).await;
+            assert!(
+                replay.is_ok(),
+                "already committed completion must survive {old_mode:?}→{new_mode:?}: {:?}",
+                replay.err()
+            );
+            let pending = outbox.pending_intents(10).await.unwrap();
+            assert!(
+                pending.iter().any(|intent| intent.owner == owner),
+                "old completion must not complete newer pending work"
+            );
+
+            outbox
+                .enqueue_upload(&hash, 5, "video/mp4", &owner, new_refs.clone())
+                .await
+                .unwrap();
+            manager
+                .complete_session(&init.upload_id, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                outbox.source_objects(&hash).await.unwrap(),
+                new_refs,
+                "old completion must not become the newest artifact source policy"
+            );
+            // A genuinely new session can reuse the old content/event identity.
+            // It must establish its newly admitted policy, even after a restart
+            // between storing finalized_object and committing processing work.
+            let next = manager
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hash.clone(),
+                        size: 5,
+                        content_type: "video/mp4".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut next_session = store.load(&next.upload_id).await.unwrap().unwrap();
+            next_session.next_offset = 5;
+            next_session.storage_complete = true;
+            next_session.finalized_object = Some(hash.clone());
+            store.save(&next_session).await.unwrap();
+            outbox
+                .begin_upload(
+                    &hash,
+                    5,
+                    "video/mp4",
+                    &owner,
+                    &storage.with_mode(old_mode).unwrap(),
+                )
+                .await
+                .unwrap();
+            manager
+                .complete_session(&next.upload_id, &owner)
+                .await
+                .unwrap();
+            assert!(!outbox.pending_intents(10).await.unwrap().iter().any(|intent| intent.owner == owner), "new session must complete its own admission, not merely replay another session's event");
+            assert_eq!(outbox.source_objects(&hash).await.unwrap(), old_refs);
+        }
     }
 
     #[tokio::test]
