@@ -165,8 +165,12 @@ finalization must match the session's recorded policy; it cannot adopt a differe
 pending intent's destinations. Finalization refuses missing, extra, reordered or
 wrong-bucket references rather than marking such an intent complete.
 An already committed resumable completion remains replayable after a later
-upload changes policy: an exact existing event is acknowledged without changing
-the newer intent or artifact source ordering.
+upload changes policy: its durable session receipt is acknowledged without
+changing the newer intent or artifact source ordering. Startup adds the
+`upload_processing_session_receipts` table under the existing schema lock. Its
+receipt/event/intent transaction distinguishes a new session reusing an event
+identity from replay of a previously completed session. Keep receipts and their
+referenced outbox events for the supported session lifetime.
 
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping

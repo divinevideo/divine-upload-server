@@ -597,17 +597,18 @@ where
         // Only the processing outbox consumes the object references. Without one,
         // looking them up adds a failure after the bytes are already stored.
         if let Some(outbox) = &self.outbox {
-            response.objects = self
+            let objects = self
                 .backend
                 .final_objects(session)
                 .await
                 .map_err(internal_error)?;
-            outbox
+            response.objects = outbox
                 .enqueue_completed_session(
+                    &session.upload_id,
                     &session.final_sha256,
                     session.declared_size,
                     &session.owner,
-                    response.objects.clone(),
+                    objects,
                 )
                 .await
                 .map_err(internal_error)?;
@@ -1749,6 +1750,42 @@ mod tests {
                 new_refs,
                 "old completion must not become the newest artifact source policy"
             );
+            // A genuinely new session can reuse the old content/event identity.
+            // It must establish its newly admitted policy, even after a restart
+            // between storing finalized_object and committing processing work.
+            let next = manager
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hash.clone(),
+                        size: 5,
+                        content_type: "video/mp4".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut next_session = store.load(&next.upload_id).await.unwrap().unwrap();
+            next_session.next_offset = 5;
+            next_session.storage_complete = true;
+            next_session.finalized_object = Some(hash.clone());
+            store.save(&next_session).await.unwrap();
+            outbox
+                .begin_upload(
+                    &hash,
+                    5,
+                    "video/mp4",
+                    &owner,
+                    &storage.with_mode(old_mode).unwrap(),
+                )
+                .await
+                .unwrap();
+            manager
+                .complete_session(&next.upload_id, &owner)
+                .await
+                .unwrap();
+            assert!(!outbox.pending_intents(10).await.unwrap().iter().any(|intent| intent.owner == owner), "new session must complete its own admission, not merely replay another session's event");
+            assert_eq!(outbox.source_objects(&hash).await.unwrap(), old_refs);
         }
     }
 

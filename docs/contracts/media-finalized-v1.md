@@ -74,10 +74,14 @@ sessions instead require the intent to match their already recorded policy.
 The finalization transaction checks the exact destination set and ordering
 against the locked intent: GCS only, B2 only, or GCS then B2 for dual. Missing,
 extra, duplicate, reordered or wrong-bucket references cannot complete the intent.
-Replaying a completed resumable session may acknowledge an exact event already
-persisted in the outbox without changing the current intent or refreshing that
-event's finalization order. This preserves successful session replay after a
-newer upload changes policy, without completing newer pending work.
+Resumable completion records a per-session receipt atomically with the outbox
+event and intent completion. A repeated session uses that receipt without
+changing the current intent or refreshing finalization order. A new session
+still completes its own admission even when it reuses a historical event ID.
+For completed sessions predating receipts, an exact historical event may be
+adopted when the current intent has a different policy; this does not mutate the
+newer intent. Receipt rows reference retained outbox events: future cleanup must
+retain them for the supported session replay lifetime.
 
 Outbox workers claim jobs through PostgreSQL `FOR UPDATE SKIP LOCKED`, with a
 60-second lease. Delivery is at least once: a crash after consumer acceptance but

@@ -117,20 +117,22 @@ impl ProcessingOutbox {
         owner: &str,
         objects: Vec<ObjectRef>,
     ) -> Result<()> {
-        self.enqueue_upload_inner(hash, size, owner, objects, false)
+        self.enqueue_upload_inner(hash, size, owner, objects, None)
             .await
+            .map(|_| ())
     }
 
     /// A completed session may be replayed after a newer upload changes the
     /// mutable intent. An exact event already committed needs no new admission.
     pub async fn enqueue_completed_session(
         &self,
+        upload_id: &str,
         hash: &str,
         size: u64,
         owner: &str,
         objects: Vec<ObjectRef>,
-    ) -> Result<()> {
-        self.enqueue_upload_inner(hash, size, owner, objects, true)
+    ) -> Result<Vec<ObjectRef>> {
+        self.enqueue_upload_inner(hash, size, owner, objects, Some(upload_id))
             .await
     }
 
@@ -140,8 +142,8 @@ impl ProcessingOutbox {
         size: u64,
         owner: &str,
         mut objects: Vec<ObjectRef>,
-        replay_committed: bool,
-    ) -> Result<()> {
+        upload_id: Option<&str>,
+    ) -> Result<Vec<ObjectRef>> {
         let stored_size =
             i64::try_from(size).map_err(|_| anyhow!("upload size exceeds database range"))?;
         if objects.is_empty() {
@@ -152,6 +154,27 @@ impl ProcessingOutbox {
             .transaction()
             .await
             .map_err(|_| anyhow!("processing transaction failed"))?;
+        if let Some(upload_id) = upload_id {
+            // Serialize receipt creation across replicas independently of the
+            // resumable store's session lock. No provider I/O occurs here.
+            transaction
+                .query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 7304))",
+                    &[&upload_id],
+                )
+                .await
+                .map_err(|_| anyhow!("processing receipt lock failed"))?;
+            if let Some(receipt) = transaction.query_opt(
+                "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1",
+                &[&upload_id],
+            ).await.map_err(|_| anyhow!("processing receipt lookup failed"))? {
+                let event: MediaFinalizedV1 = serde_json::from_value(receipt.get(0))?;
+                if event.sha256 != hash || event.size != size || event.owner.as_deref() != Some(owner) {
+                    return Err(IntentConflict.into());
+                }
+                return Ok(std::iter::once(event.source).chain(event.replicas).collect());
+            }
+        }
         // MIME declarations may change on a retry of identical content. Retain
         // the first intent's metadata instead of rejecting a valid hash forever.
         let intent = transaction.query_opt(
@@ -189,7 +212,8 @@ impl ProcessingOutbox {
         event.replicas = objects;
         event.refresh_job_id()?;
         let payload = serde_json::to_value(&event)?;
-        if replay_committed
+        let historical_replay = upload_id.is_some()
+            && !matches_intent
             && transaction
                 .query_opt(
                     "SELECT 1 FROM upload_processing_outbox WHERE job_id=$1 AND payload=$2",
@@ -197,25 +221,30 @@ impl ProcessingOutbox {
                 )
                 .await
                 .map_err(|_| anyhow!("completed processing event lookup failed"))?
-                .is_some()
-        {
-            // Do not complete a newer intent or refresh finalized_at: either
-            // would let an old session overwrite a newer upload's policy.
-            return Ok(());
-        }
-        if !matches_intent {
+                .is_some();
+        if !matches_intent && !historical_replay {
             return Err(IntentConflict.into());
         }
-        transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
-        let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
-        if updated != 1 {
-            bail!("processing event has no matching upload intent");
+        if !historical_replay {
+            transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
+            let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
+            if updated != 1 {
+                bail!("processing event has no matching upload intent");
+            }
+        }
+        if let Some(upload_id) = upload_id {
+            transaction.execute(
+                "INSERT INTO upload_processing_session_receipts(upload_id,job_id) VALUES($1,$2)",
+                &[&upload_id, &event.job_id],
+            ).await.map_err(|_| anyhow!("processing receipt persistence failed"))?;
         }
         transaction
             .commit()
             .await
             .map_err(|_| anyhow!("processing event commit failed"))?;
-        Ok(())
+        Ok(std::iter::once(event.source)
+            .chain(event.replicas)
+            .collect())
     }
 
     /// Reads a bounded page of unfinished intents so upload recovery can reconcile

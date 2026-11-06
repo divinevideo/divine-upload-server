@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS upload_processing_outbox (
 );
 CREATE INDEX IF NOT EXISTS upload_processing_outbox_pending
     ON upload_processing_outbox(next_attempt_at) WHERE delivered_at IS NULL;
+CREATE TABLE IF NOT EXISTS upload_processing_session_receipts (
+    upload_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES upload_processing_outbox(job_id)
+);
 
 ALTER TABLE upload_processing_outbox ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp();
 CREATE INDEX IF NOT EXISTS upload_processing_outbox_original_finalized
