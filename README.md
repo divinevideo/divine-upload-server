@@ -145,7 +145,9 @@ recorded provider policy, even after the new-upload mode changes. Keep every
 required provider and bucket available: an unavailable or changed destination
 returns 409 rather than retargeting the intent. A dual retry still requires both
 copies after GCS admission is restored. Resumable sessions retain their own
-policy. See the deployment runbook for reconciliation before changing bucket
+policy, so completing one for bytes whose unfinished intent was recorded under
+another mode still returns 409; drain or reconcile those intents before a mode
+switch. See the deployment runbook for reconciliation before changing bucket
 mappings. With the outbox enabled, unauthenticated `/migrate`
 events always have a null owner instead of trusting the request's declaration.
 Thumbnail generation and mirroring have independent configurable admission pools

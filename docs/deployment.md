@@ -162,8 +162,13 @@ provider I/O at the normal endpoint. Retain both provider adapters, credentials
 and required bucket mappings when returning new admission to GCS: existing dual
 work still requires B2 and may remain pending during its outage. Resumable
 finalization must match the session's recorded policy; it cannot adopt a different
-pending intent's destinations. Finalization refuses missing, extra, reordered or
-wrong-bucket references rather than marking such an intent complete.
+pending intent's destinations. A mode-only change therefore still strands a
+resumable session for an owner and hash that already has an unfinished intent
+recorded under the other mode: completion returns 409 after the full transfer
+until that intent finishes through a direct or mirror retry or is reconciled.
+Drain or reconcile such intents before switching modes when clients may retry the
+same bytes through resumable upload. Finalization refuses missing, extra,
+reordered or wrong-bucket references rather than marking such an intent complete.
 An already committed resumable completion remains replayable after a later
 upload changes policy: its durable session receipt is acknowledged without
 changing the newer intent or artifact source ordering. Startup adds the
@@ -185,7 +190,8 @@ and inspect exact provider versions before any authorized state removal. A HEAD
 404 alone does not establish that a delayed write cannot commit. Until that
 procedure exists, retain the original required destinations rather than changing
 their mapping or deleting rows to clear 409s. A mode-only change with all recorded
-destinations retained does not require retargeting an intent. This retry behavior
+destinations retained does not require retargeting an intent for direct and mirror
+retries; resumable completions follow the drain rule above. This retry behavior
 does not provide the shared admission-policy store or atomic fleet handover in
 the production rollout plan.
 
