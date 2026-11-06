@@ -37,6 +37,10 @@ pub fn router(runtime: Option<InboxRuntime>) -> Router {
         .route("/internal/media-processing/lookup", post(handle))
         .route("/internal/media-processing/renew", post(handle))
         .route("/internal/media-processing/complete", post(handle))
+        .route("/internal/media-processing/attempts/begin", post(handle))
+        .route("/internal/media-processing/attempts/prepare", post(handle))
+        .route("/internal/media-processing/attempts/inspect", post(handle))
+        .route("/internal/media-processing/attempts/dispatch", post(handle))
         .with_state(runtime)
 }
 
@@ -113,6 +117,14 @@ async fn handle(State(runtime): State<Option<InboxRuntime>>, request: Request) -
     if !token_matches(&request, expected) {
         return error(StatusCode::UNAUTHORIZED, "invalid processing credential");
     }
+    if request
+        .uri()
+        .path()
+        .starts_with("/internal/media-processing/attempts/")
+        && !runtime.settings.producer_journal_enabled
+    {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "producer journal disabled");
+    }
     let key = request
         .headers()
         .get("idempotency-key")
@@ -139,6 +151,45 @@ async fn handle(State(runtime): State<Option<InboxRuntime>>, request: Request) -
         };
     let operation = async {
         match path.as_str() {
+            "/internal/media-processing/attempts/begin" => {
+                let input: journal::Begin = parse(&body)?;
+                let attempt = runtime
+                    .store
+                    .journal_begin(&input.lease)
+                    .await
+                    .map_err(database_error)?;
+                Ok(serde_json::json!({"attempt":attempt}))
+            }
+            "/internal/media-processing/attempts/prepare" => {
+                let input: journal::Prepare = parse(&body)?;
+                let attempt = runtime
+                    .store
+                    .journal_prepare(input)
+                    .await
+                    .map_err(database_error)?;
+                Ok(serde_json::json!({"attempt":attempt}))
+            }
+            "/internal/media-processing/attempts/inspect" => {
+                let input: journal::Inspect = parse(&body)?;
+                let attempt = runtime
+                    .store
+                    .journal_inspect(&input.attempt_id)
+                    .await
+                    .map_err(database_error)?;
+                Ok(serde_json::json!({"attempt":attempt}))
+            }
+            "/internal/media-processing/attempts/dispatch" => {
+                let input: journal::Dispatch = parse(&body)?;
+                runtime
+                    .store
+                    .journal_dispatch(input)
+                    .await
+                    .map_err(database_error)?;
+                Err(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "producer parent gate unavailable",
+                ))
+            }
             "/internal/media-finalized" => {
                 let event: MediaFinalizedV1 = parse(&body)?;
                 if validate_event(&event, &key).is_err() {
@@ -191,12 +242,19 @@ async fn handle(State(runtime): State<Option<InboxRuntime>>, request: Request) -
             }
             "/internal/media-processing/complete" => {
                 let completion: Completion = parse(&body)?;
-                if !runtime
-                    .store
-                    .complete(&completion.lease, &completion.manifest)
-                    .await
-                    .map_err(database_error)?
-                {
+                let completed = if runtime.settings.producer_journal_enabled {
+                    runtime
+                        .store
+                        .journal_completion_replay(&completion.lease, &completion.manifest)
+                        .await
+                } else {
+                    runtime
+                        .store
+                        .complete(&completion.lease, &completion.manifest)
+                        .await
+                }
+                .map_err(database_error)?;
+                if !completed {
                     return Err(error(
                         StatusCode::CONFLICT,
                         "processing assignment is stale",
@@ -218,6 +276,22 @@ async fn handle(State(runtime): State<Option<InboxRuntime>>, request: Request) -
 }
 
 fn database_error(error: anyhow::Error) -> Response {
+    if let Some(error) = error.downcast_ref::<journal::JournalError>() {
+        let (status, message) = match error {
+            journal::JournalError::Invalid => {
+                (StatusCode::BAD_REQUEST, "invalid producer journal request")
+            }
+            journal::JournalError::Stale => (StatusCode::CONFLICT, "producer assignment is stale"),
+            journal::JournalError::Conflict => {
+                (StatusCode::CONFLICT, "conflicting producer artifact plan")
+            }
+            journal::JournalError::GateUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "producer parent gate unavailable",
+            ),
+        };
+        return self::error(status, message);
+    }
     if error.is::<InboxConflict>() {
         return self::error(StatusCode::CONFLICT, "conflicting finalization input");
     }
