@@ -177,6 +177,20 @@ receipt/event/intent transaction distinguishes a new session reusing an event
 identity from replay of a previously completed session. Keep receipts and their
 referenced outbox events for the supported session lifetime.
 
+Thumbnail and derivative writes use every copy recorded for the same bytes,
+across owners, not only the newest finalization. The newest event still leads
+and supplies its versions; a provider it lacks comes from the newest event that
+recorded one. A later GCS-only completion therefore cannot narrow derivatives of
+media that already has a B2 copy. That completion might be a GCS intent left
+unfinished from before dual admission, a background recovery of one, or an
+upload accepted after admission returns to GCS. Keep the B2 binding while such
+media can still need derivatives: without it, their derivative writes fail with
+a mapping error instead of silently skipping B2. The same holds for GCS. Once
+any event for the bytes records a GCS copy, their derivatives require GCS, so a
+B2-only deployment without GCS compatibility cannot generate them. Retiring GCS
+therefore needs an explicit change to how derivatives treat recorded GCS copies;
+removing the GCS binding alone does not do it.
+
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping
 returns HTTP 409 rather than retargeting unknown provider outcomes. Do not delete

@@ -248,6 +248,7 @@ Prepare the cutover evidence alongside dual work, not after it:
 - [ ] Reuse S1 processing and bounded B2-primary delivery evidence, including private-origin signing, browser/range behavior, descriptor references and policy/erasure handling.
 - [ ] Reuse the S2 lifecycle evidence and resolve its cutover blockers. Verify both existing-provider session types drain under recorded policies and restoring dual/GCS admission preserves accepted B2 work.
 - [ ] Record the exact remaining cutover changes: routing/origin preference, new admission to `b2`, provider/session/job drain and retention of necessary GCS reads. Establish cutover thresholds and rollback from measured results.
+- [ ] Decide how derivative storage stops requiring GCS once GCS is retired. Derivative storage keeps every provider ever recorded for a hash, so any hash with a recorded GCS copy needs GCS for its derivatives until that is changed explicitly (#33).
 
 After full dual observation passes, hold a separate, explicit go/no-go for B2-primary reads and B2-only new admission. Existing media must have verified B2 coverage or an explicit GCS fallback; GCS dependency is not retired while that fallback is needed. Keep Google URLs and unrelated state/backups intact. Remove compatibility/access only after proven drain and the relevant retention decision. Default read routing, B2-only production admission and deletion of historical GCS media are not authorized by this planning request.
 

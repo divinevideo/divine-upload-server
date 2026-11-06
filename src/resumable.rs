@@ -1721,7 +1721,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_session_replay_preserves_a_newer_upload_policy() {
-        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::outbox::tests::{fixture_storage, isolated_database_url, newest_event_objects};
         use crate::storage::{ObjectRef, StorageProvider, WriteMode};
         let Some(url) = isolated_database_url().await else {
             return;
@@ -1841,9 +1841,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                outbox.source_objects(&hash).await.unwrap(),
+                newest_event_objects(&outbox, &hash).await,
                 new_refs,
-                "old completion must not become the newest artifact source policy"
+                "old completion must not become the newest finalization"
             );
             // A genuinely new session can reuse the old content/event identity.
             // It must establish its newly admitted policy, even after a restart
@@ -1880,7 +1880,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!outbox.pending_intents(10).await.unwrap().iter().any(|intent| intent.owner == owner), "new session must complete its own admission, not merely replay another session's event");
-            assert_eq!(outbox.source_objects(&hash).await.unwrap(), old_refs);
+            assert_eq!(newest_event_objects(&outbox, &hash).await, old_refs);
         }
     }
 
