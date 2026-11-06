@@ -1,7 +1,7 @@
 //! Durable upload intents and authenticated, at-least-once processing dispatch.
 use crate::{
     processing::{MediaFinalizedV1, ProcessingClient},
-    storage::{MediaStorage, ObjectRef, WriteMode},
+    storage::{MediaStorage, ObjectRef, StorageProvider, WriteMode},
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -93,14 +93,11 @@ impl ProcessingOutbox {
         let client = self.database.lock().await;
         let row=client.query_one("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO UPDATE SET updated_at=now(), write_mode=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.write_mode ELSE upload_processing_intents.write_mode END, gcs_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.gcs_bucket ELSE upload_processing_intents.gcs_bucket END, b2_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.b2_bucket ELSE upload_processing_intents.b2_bucket END, completed=upload_processing_intents.completed AND upload_processing_intents.write_mode=EXCLUDED.write_mode AND upload_processing_intents.gcs_bucket=EXCLUDED.gcs_bucket AND upload_processing_intents.b2_bucket IS NOT DISTINCT FROM EXCLUDED.b2_bucket WHERE upload_processing_intents.size=EXCLUDED.size RETURNING size,content_type,write_mode,gcs_bucket,b2_bucket",&[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
         let recorded_mode: WriteMode = row.get::<_, String>(2).parse()?;
-        let same_gcs = row.get::<_, String>(3) == gcs_bucket;
-        let same_b2 = row.get::<_, Option<String>>(4).as_deref() == b2_bucket;
-        let compatible = if resume_recorded {
-            (recorded_mode == WriteMode::B2 || same_gcs)
-                && (recorded_mode == WriteMode::Gcs || same_b2)
-        } else {
-            recorded_mode == storage.mode && same_gcs && same_b2
-        };
+        let recorded_gcs: String = row.get(3);
+        let recorded_b2: Option<String> = row.get(4);
+        let available = required_destinations(recorded_mode, &recorded_gcs, recorded_b2.as_deref())
+            .is_ok_and(|destinations| destinations_configured(storage, &destinations));
+        let compatible = available && (resume_recorded || recorded_mode == storage.mode);
         if row.get::<_, i64>(0) != size || !compatible {
             return Err(IntentConflict.into());
         }
@@ -186,15 +183,7 @@ impl ProcessingOutbox {
         let mode: WriteMode = intent.get::<_, String>(1).parse()?;
         let gcs_bucket: String = intent.get(2);
         let b2_bucket: Option<String> = intent.get(3);
-        use crate::storage::StorageProvider::{Gcs, B2};
-        let expected = match mode {
-            WriteMode::Gcs => vec![(Gcs, gcs_bucket.as_str())],
-            WriteMode::B2 => vec![(B2, b2_bucket.as_deref().ok_or(IntentConflict)?)],
-            WriteMode::Dual => vec![
-                (Gcs, gcs_bucket.as_str()),
-                (B2, b2_bucket.as_deref().ok_or(IntentConflict)?),
-            ],
-        };
+        let expected = required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?;
         let matches_intent = objects.len() == expected.len()
             && objects
                 .iter()
@@ -405,6 +394,37 @@ impl ProcessingOutbox {
         }
         Ok(delivered)
     }
+}
+
+/// Destinations a recorded intent requires, in finalization order. Only these
+/// buckets bind the intent: a configured adapter its mode never writes does not.
+fn required_destinations<'a>(
+    mode: WriteMode,
+    gcs_bucket: &'a str,
+    b2_bucket: Option<&'a str>,
+) -> std::result::Result<Vec<(StorageProvider, &'a str)>, IntentConflict> {
+    let b2 = || b2_bucket.ok_or(IntentConflict);
+    Ok(match mode {
+        WriteMode::Gcs => vec![(StorageProvider::Gcs, gcs_bucket)],
+        WriteMode::B2 => vec![(StorageProvider::B2, b2()?)],
+        WriteMode::Dual => vec![
+            (StorageProvider::Gcs, gcs_bucket),
+            (StorageProvider::B2, b2()?),
+        ],
+    })
+}
+
+fn destinations_configured(
+    storage: &MediaStorage,
+    destinations: &[(StorageProvider, &str)],
+) -> bool {
+    destinations.iter().all(|(provider, bucket)| {
+        let configured = match provider {
+            StorageProvider::Gcs => Some(storage.gcs_bucket()),
+            StorageProvider::B2 => storage.b2_bucket(),
+        };
+        configured == Some(*bucket)
+    })
 }
 
 fn retry_delay(attempt: i32) -> i64 {
@@ -649,6 +669,70 @@ pub(crate) mod tests {
                 .mode,
             WriteMode::Gcs
         );
+    }
+
+    #[tokio::test]
+    async fn session_admission_ignores_an_unused_adapter_bucket() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        outbox
+            .begin_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        // A legacy GCS session completes through the GCS view of a deployment
+        // that has since gained a B2 adapter. GCS mode never writes that bucket.
+        let with_b2 = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        outbox
+            .begin_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                &with_b2.with_mode(WriteMode::Gcs).unwrap(),
+            )
+            .await
+            .expect("an unused B2 adapter must not conflict with a pending GCS intent");
+        // The session's own policy still binds: another mode conflicts.
+        let result = outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &with_b2)
+            .await;
+        assert!(result.err().unwrap().is::<IntentConflict>());
+        // A changed required bucket conflicts whether the request carries its
+        // own policy or resumes the recorded one.
+        let moved_gcs = MediaStorage::new(
+            WriteMode::Gcs,
+            Some(google_cloud_storage::client::Client::new(
+                google_cloud_storage::client::ClientConfig::default().anonymous(),
+            )),
+            "moved-gcs".into(),
+            None,
+        )
+        .unwrap();
+        let strict = outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &moved_gcs)
+            .await;
+        assert!(strict.err().unwrap().is::<IntentConflict>());
+        let resumed = outbox
+            .begin_or_resume_upload(&hash, 3, "video/mp4", &owner, &moved_gcs)
+            .await;
+        assert!(resumed.err().unwrap().is::<IntentConflict>());
+        let pending = outbox.pending_intents(10).await.unwrap();
+        assert_eq!(pending[0].mode, "gcs");
+        assert_eq!(pending[0].gcs_bucket, "fixture-gcs");
+        assert_eq!(pending[0].b2_bucket, None);
     }
 
     #[tokio::test]
