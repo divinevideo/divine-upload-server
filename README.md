@@ -167,6 +167,13 @@ The optional GitOps promotion job requests a digest-pinned production image-upda
 
 Video follow-up currently points at the existing transcoder endpoint through `TRANSCODER_URL`. `export-video-upload-hashes.py` reads both the legacy Cloud Run audit logs and the GKE `k8s_container` audit logs, so historic exports keep working across the platform migration.
 
+The optional [durable finalization inbox and processing authority](docs/contracts/media-processing-assignment-v1.md)
+reuses PostgreSQL coordination and the existing finalization event contract. It
+is default-off, requires separate intake/worker credentials, and starts no
+automatic processing workers. Persisted intake is distinct from complete
+registration, moderation and artifact production; these remain outbox activation
+requirements.
+
 ---
 
 Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)

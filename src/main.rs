@@ -2,6 +2,7 @@
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
 mod coordination;
+mod inbox;
 mod media_type;
 mod outbox;
 mod processing;
@@ -510,7 +511,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let app = build_router(state);
+    let processing_inbox = inbox::configured(database_url.as_deref()).await?;
+    let app = build_router(state).merge(inbox::router(processing_inbox));
 
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting HTTP/2 server on {}", addr);
