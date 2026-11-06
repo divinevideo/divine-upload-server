@@ -448,11 +448,16 @@ async fn main() -> Result<()> {
     )
     .await?;
     let cleanup_runtime = resumable_runtime.clone();
+    let cleanup_outbox = processing_outbox.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if cleanup_runtime.sweep_expired(100).await.is_err() {
+            if cleanup_runtime
+                .sweep_expired(100, cleanup_outbox.as_ref())
+                .await
+                .is_err()
+            {
                 warn!("Expired upload cleanup deferred");
             }
         }

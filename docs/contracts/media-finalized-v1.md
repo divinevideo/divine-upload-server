@@ -78,10 +78,13 @@ Resumable completion records a per-session receipt atomically with the outbox
 event and intent completion. A repeated session uses that receipt without
 changing the current intent or refreshing finalization order. A new session
 still completes its own admission even when it reuses a historical event ID.
+<!-- TODO(#33): remove the next sentence with the pre-receipt replay path once sessions completed before receipts have expired everywhere. -->
 For completed sessions predating receipts, an exact historical event may be
 adopted when the current intent has a different policy; this does not mutate the
-newer intent. Receipt rows reference retained outbox events: future cleanup must
-retain them for the supported session replay lifetime.
+newer intent. A receipt is deleted with its session when the expired session is
+cleaned up, because an expired session's completion is refused before its
+receipt is read. Receipt rows reference outbox events by foreign key, so any
+future outbox retention must delete referencing receipts first.
 
 Outbox workers claim jobs through PostgreSQL `FOR UPDATE SKIP LOCKED`, with a
 60-second lease. Delivery is at least once: a crash after consumer acceptance but

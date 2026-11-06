@@ -155,6 +155,21 @@ impl ProcessingOutbox {
         Ok(true)
     }
 
+    /// Drop the receipt of a session being deleted after expiry. An expired
+    /// session's `complete` is refused before any receipt is read, so the receipt
+    /// can never answer a replay again. Its outbox event is retained.
+    pub async fn forget_session_receipt(&self, upload_id: &str) -> Result<()> {
+        let client = self.database.lock().await;
+        client
+            .execute(
+                "DELETE FROM upload_processing_session_receipts WHERE upload_id=$1",
+                &[&upload_id],
+            )
+            .await
+            .map_err(|_| anyhow!("processing receipt cleanup failed"))?;
+        Ok(())
+    }
+
     async fn enqueue_upload_inner(
         &self,
         hash: &str,
@@ -220,6 +235,10 @@ impl ProcessingOutbox {
         event.replicas = objects;
         event.refresh_job_id()?;
         let payload = serde_json::to_value(&event)?;
+        // TODO(#33): remove this pre-receipt replay path, its lookup query and
+        // the matching contract and deployment text once every session completed
+        // before receipts has expired: one session lifetime after the receipts
+        // schema is live in every environment.
         let historical_replay = upload_id.is_some()
             && !matches_intent
             && transaction
@@ -368,17 +387,31 @@ impl ProcessingOutbox {
         Ok(recovered)
     }
 
-    /// Resolve new uploads from their recorded provider identities after a mode switch.
+    /// Resolve every storage copy recorded for these bytes, across owners. The
+    /// newest finalization leads, so its order and versions win. A provider it
+    /// lacks comes from the newest event that recorded one: a later GCS-only
+    /// completion (a stale intent, background recovery, or admission rolled back
+    /// to GCS) must not drop a destination this media already requires.
     pub async fn source_objects(&self, hash: &str) -> Result<Vec<ObjectRef>> {
         let database = self.database.lock().await;
-        let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
-        let Some(row) = row else {
+        let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
             return Ok(Vec::new());
         };
-        let event: MediaFinalizedV1 = serde_json::from_value(row.get(0))
-            .map_err(|_| anyhow!("Stored processing source is invalid"))?;
-        let mut objects = vec![event.source];
-        objects.extend(event.replicas);
+        let mut objects = event_objects(row.get(0))?;
+        for provider in [StorageProvider::Gcs, StorageProvider::B2] {
+            if objects.iter().any(|object| object.provider == provider) {
+                continue;
+            }
+            let recorded = serde_json::json!({ "provider": provider });
+            let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 AND (payload->'source' @> $2 OR payload->'replicas' @> jsonb_build_array($2)) ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash, &recorded]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
+            if let Some(row) = row {
+                objects.extend(
+                    event_objects(row.get(0))?
+                        .into_iter()
+                        .filter(|object| object.provider == provider),
+                );
+            }
+        }
         Ok(objects)
     }
 
@@ -411,6 +444,15 @@ impl ProcessingOutbox {
         }
         Ok(delivered)
     }
+}
+
+/// A stored event's verified copies, its authoritative source first.
+fn event_objects(payload: serde_json::Value) -> Result<Vec<ObjectRef>> {
+    let event: MediaFinalizedV1 = serde_json::from_value(payload)
+        .map_err(|_| anyhow!("Stored processing source is invalid"))?;
+    let mut objects = vec![event.source];
+    objects.extend(event.replicas);
+    Ok(objects)
 }
 
 /// A receipt names the event its session committed. A mismatch is corrupt or
@@ -484,6 +526,16 @@ pub(crate) mod tests {
             .unwrap()
         });
         MediaStorage::new(mode, Some(gcs), "fixture-gcs".into(), b2).unwrap()
+    }
+
+    /// Copies named by the newest finalization for these bytes. Unlike
+    /// `source_objects`, this shows finalization order directly.
+    pub(crate) async fn newest_event_objects(
+        outbox: &ProcessingOutbox,
+        hash: &str,
+    ) -> Vec<ObjectRef> {
+        let row = outbox.database.lock().await.query_one("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.unwrap();
+        event_objects(row.get(0)).unwrap()
     }
 
     pub(crate) async fn isolated_database_url() -> Option<String> {
@@ -611,9 +663,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             outbox.source_objects(&hash).await.unwrap(),
-            vec![original.clone(), replica]
+            vec![original.clone(), replica.clone()]
         );
-        // A later explicit GCS finalization may reuse its old job identity.
+        // A later explicit GCS finalization may reuse its old job identity. It
+        // becomes the newest event, but does not drop the B2 copy already required.
         outbox
             .begin_upload(&hash, 3, "video/mp4", &owner, &base)
             .await
@@ -622,7 +675,10 @@ pub(crate) mod tests {
             .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![original.clone()])
             .await
             .unwrap();
-        assert_eq!(outbox.source_objects(&hash).await.unwrap(), vec![original]);
+        assert_eq!(
+            outbox.source_objects(&hash).await.unwrap(),
+            vec![original, replica]
+        );
         let db = outbox.database.lock().await;
         db.execute(
             "DELETE FROM upload_processing_outbox WHERE payload->>'sha256'=$1",
@@ -1025,7 +1081,74 @@ pub(crate) mod tests {
             }
             assert!(outbox.pending_intents(10).await.unwrap().is_empty());
         }
+        // The stale GCS intent's completion is now the newest event for these
+        // bytes, but the first owner already required a B2 copy of them.
+        // Derivative writers must keep that destination rather than narrow to GCS.
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let providers: Vec<StorageProvider> = outbox
+            .source_objects(&hash)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|object| object.provider)
+            .collect();
+        assert_eq!(providers, vec![StorageProvider::Gcs, StorageProvider::B2]);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn source_objects_keep_each_recorded_provider_at_its_newest_version() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let storage = fixture_storage(WriteMode::Gcs, Some("fixture-b2"));
+        let hash = format!("{:064x}", rand::random::<u128>());
+        let object = |provider, bucket: &str, version: &str| ObjectRef {
+            provider,
+            bucket: bucket.into(),
+            key: hash.clone(),
+            version: Some(version.into()),
+        };
+        let gcs_v1 = object(StorageProvider::Gcs, "fixture-gcs", "v1");
+        let b2_v1 = object(StorageProvider::B2, "fixture-b2", "b2-v1");
+        let gcs_v2 = object(StorageProvider::Gcs, "fixture-gcs", "v2");
+        let b2_v2 = object(StorageProvider::B2, "fixture-b2", "b2-v2");
+        let finalize = |owner: u8, mode: WriteMode, objects: Vec<ObjectRef>| {
+            let outbox = outbox.clone();
+            let storage = storage.with_mode(mode).unwrap();
+            let hash = hash.clone();
+            async move {
+                let owner = format!("{owner:064x}");
+                outbox
+                    .begin_upload(&hash, 3, "video/mp4", &owner, &storage)
+                    .await
+                    .unwrap();
+                outbox
+                    .enqueue_upload(&hash, 3, "video/mp4", &owner, objects)
+                    .await
+                    .unwrap();
+            }
+        };
+        finalize(1, WriteMode::Dual, vec![gcs_v1, b2_v1.clone()]).await;
+        finalize(2, WriteMode::Gcs, vec![gcs_v2.clone()]).await;
+        assert_eq!(
+            outbox.source_objects(&hash).await.unwrap(),
+            vec![gcs_v2.clone(), b2_v1],
+            "a newer GCS-only event keeps the older B2 copy"
+        );
+        finalize(3, WriteMode::B2, vec![b2_v2.clone()]).await;
+        assert_eq!(
+            outbox.source_objects(&hash).await.unwrap(),
+            vec![b2_v2, gcs_v2],
+            "the newest event leads; a provider it lacks comes from its newest event"
+        );
     }
 
     #[tokio::test]

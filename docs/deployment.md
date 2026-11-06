@@ -174,8 +174,41 @@ upload changes policy: its durable session receipt is acknowledged without
 changing the newer intent or artifact source ordering. Startup adds the
 `upload_processing_session_receipts` table under the existing schema lock. Its
 receipt/event/intent transaction distinguishes a new session reusing an event
-identity from replay of a previously completed session. Keep receipts and their
-referenced outbox events for the supported session lifetime.
+identity from replay of a previously completed session. Expired-session cleanup,
+both the background sweep and a request that finds an expired session, deletes
+the session's receipt just before the session itself. Once a session expires,
+`complete` returns 410 or 404 before any receipt is read, so a receipt lasts no
+longer than its session. A failed receipt delete keeps the session for the next
+pass. The outbox events that receipts referenced are retained; this
+repository has no outbox retention job.
+
+Thumbnail and derivative writes use every copy recorded for the same bytes,
+across owners, not only the newest finalization. The newest event still leads
+and supplies its versions; a provider it lacks comes from the newest event that
+recorded one. A later GCS-only completion therefore cannot narrow derivatives of
+media that already has a B2 copy. That completion might be a GCS intent left
+unfinished from before dual admission, a background recovery of one, or an
+upload accepted after admission returns to GCS. Keep the B2 binding while such
+media can still need derivatives: without it, their derivative writes fail with
+a mapping error instead of silently skipping B2. The same holds for GCS. Once
+any event for the bytes records a GCS copy, their derivatives require GCS, so a
+B2-only deployment without GCS compatibility cannot generate them. Retiring GCS
+therefore needs an explicit change to how derivatives treat recorded GCS copies;
+removing the GCS binding alone does not do it.
+
+<!-- TODO(#33): remove this paragraph with the pre-receipt replay path. -->
+A resumable session completed before the receipts schema existed has no
+receipt. If its client replays `complete` while the owner's current intent has
+the same policy, the replay counts as a new completion and makes its event the
+newest for those bytes again, as it did before receipts. This is accepted for the
+transition. Derivatives keep every recorded provider either way, so the reorder
+can only change which event's object versions lead. Uploads reuse the object
+already stored for the bytes rather than rewrite it, so those are the same
+objects unless the media was erased and uploaded again within the window. The
+window closes once those sessions expire, one `RESUMABLE_SESSION_TTL_SECS`
+(24 hours by default) after the receipts schema is live. As a precaution, do not
+enable dual admission in an environment until that much time has passed since
+the receipts schema went live there.
 
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping

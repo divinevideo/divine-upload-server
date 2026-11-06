@@ -50,7 +50,11 @@ impl ResumableRuntime {
         })
     }
     /// Bounded cleanup of expired durable sessions; does not enumerate legacy GCS manifests.
-    pub async fn sweep_expired(&self, limit: i64) -> Result<u64> {
+    pub async fn sweep_expired(
+        &self,
+        limit: i64,
+        outbox: Option<&crate::outbox::ProcessingOutbox>,
+    ) -> Result<u64> {
         let Some(db) = &self.store.database else {
             return Ok(0);
         };
@@ -76,6 +80,11 @@ impl ResumableRuntime {
                 } else if session.finalized_object.is_none() {
                     self.backend.cancel_session(&session).await?;
                     self.backend.delete_object(&session.temp_object).await?;
+                }
+                // Before the session, so a failure leaves it for the next pass
+                // rather than orphaning a receipt no sweep will find again.
+                if let Some(outbox) = outbox {
+                    outbox.forget_session_receipt(&id).await?;
                 }
                 self.store.delete(&id).await?;
                 db.execute(
@@ -589,6 +598,74 @@ mod tests {
         assert!(store.load(&original.upload_id).await.unwrap().is_none());
     }
     #[tokio::test]
+    async fn sweep_forgets_the_completion_receipt_of_an_expired_session() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::StorageProvider;
+        // A fresh schema, so the sweep sees only this test's sessions.
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let storage = fixture_storage(WriteMode::Gcs, None);
+        let runtime = ResumableRuntime::new(storage.clone(), None, String::new(), Some(&url))
+            .await
+            .unwrap();
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let mut completed = session();
+        completed.final_sha256 = random_hex(32);
+        completed.next_offset = completed.declared_size;
+        completed.storage_complete = true;
+        completed.finalized_object = Some(completed.final_sha256.clone());
+        // Not staged: a finalized session's sweep then needs no provider I/O.
+        completed.session_url = "https://upload.invalid/session".into();
+        completed.expires_at_epoch_secs = 0;
+        runtime.store.save(&completed).await.unwrap();
+        let (hash, size, owner) = (
+            completed.final_sha256.clone(),
+            completed.declared_size,
+            completed.owner.clone(),
+        );
+        outbox
+            .begin_upload(&hash, size, "video/mp4", &owner, &storage)
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session(
+                &completed.upload_id,
+                &hash,
+                size,
+                &owner,
+                vec![ObjectRef {
+                    provider: StorageProvider::Gcs,
+                    bucket: "fixture-gcs".into(),
+                    key: hash.clone(),
+                    version: Some("1".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.sweep_expired(100, Some(&outbox)).await.unwrap(), 1);
+        assert!(runtime
+            .store
+            .load(&completed.upload_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !outbox
+                .has_session_receipt(&completed.upload_id, &hash, size, &owner)
+                .await
+                .unwrap(),
+            "an expired session can never be replayed, so its receipt must go with it"
+        );
+    }
+    #[tokio::test]
     async fn postgres_session_lock_excludes_another_connection() {
         if std::env::var("TEST_COORDINATION_DATABASE_URL").is_err() {
             eprintln!("Skipping PostgreSQL integration: TEST_COORDINATION_DATABASE_URL unset");
@@ -703,7 +780,7 @@ mod tests {
         first.expires_at_epoch_secs = 0;
         first.temp_object = format!("__resumable/staged/b2//66697874757265/{}", first.upload_id);
         runtime.store.save(&first).await.unwrap();
-        let first_pass = runtime.sweep_expired(100).await;
+        let first_pass = runtime.sweep_expired(100, None).await;
         let first_gone = runtime
             .store
             .load(&first.upload_id)
@@ -720,7 +797,7 @@ mod tests {
             later.push(value);
         }
         for _ in 0..5 {
-            let _ = runtime.sweep_expired(1).await;
+            let _ = runtime.sweep_expired(1, None).await;
         }
         let mut remaining = 0;
         for value in &later {
@@ -1006,7 +1083,7 @@ mod integration_tests {
         let mut expired = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
         expired.expires_at_epoch_secs = now_epoch_secs() - 1;
         runtime.store.save(&expired).await.unwrap();
-        assert_eq!(runtime.sweep_expired(100).await.unwrap(), 1);
+        assert_eq!(runtime.sweep_expired(100, None).await.unwrap(), 1);
         let count: i64 = runtime
             .store
             .database
@@ -1107,7 +1184,7 @@ mod integration_tests {
             .unwrap();
         record.expires_at_epoch_secs = now_epoch_secs() - 1;
         b2_runtime.store.save(&record).await.unwrap();
-        assert_eq!(b2_runtime.sweep_expired(100).await.unwrap(), 1);
+        assert_eq!(b2_runtime.sweep_expired(100, None).await.unwrap(), 1);
         assert!(objects
             .lock()
             .unwrap()
@@ -1229,7 +1306,7 @@ mod integration_tests {
         uncertain_record.expires_at_epoch_secs = now_epoch_secs() - 1;
         b2_runtime.store.save(&uncertain_record).await.unwrap();
         // The fixture returns 404 for its absent chunk. Absence at this instant cannot exclude a late PUT.
-        let cleanup = b2_runtime.sweep_expired(100).await;
+        let cleanup = b2_runtime.sweep_expired(100, None).await;
         let retained = b2_runtime.store.load(&uncertain.upload_id).await.unwrap();
         let reservations: i64 = db
             .query_one(
