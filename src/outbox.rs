@@ -273,12 +273,13 @@ impl ProcessingOutbox {
             if intent.size > budget {
                 continue;
             }
-            if intent.gcs_bucket != storage.gcs_bucket()
-                || intent.b2_bucket.as_deref() != storage.b2_bucket()
-            {
+            let mode: WriteMode = intent.mode.parse()?;
+            let available =
+                required_destinations(mode, &intent.gcs_bucket, intent.b2_bucket.as_deref())
+                    .is_ok_and(|destinations| destinations_configured(storage, &destinations));
+            if !available {
                 continue;
             }
-            let mode: WriteMode = intent.mode.parse()?;
             let pinned = storage.with_mode(mode)?;
             let modes = match mode {
                 WriteMode::Gcs => vec![WriteMode::Gcs],
@@ -1152,8 +1153,28 @@ pub(crate) mod tests {
             "secret".into(),
         )
         .unwrap()
-        .with_endpoint(endpoint);
-        let storage = MediaStorage::new(WriteMode::B2, None, "".into(), Some(b2)).unwrap();
+        .with_endpoint(endpoint.clone());
+        let storage = MediaStorage::new(WriteMode::B2, None, "".into(), Some(b2.clone())).unwrap();
+        // The same readable object behind a changed required bucket.
+        let moved_b2 = MediaStorage::new(
+            WriteMode::B2,
+            None,
+            "".into(),
+            Some(
+                B2Store::new(
+                    "moved-bucket".into(),
+                    "us-west-001".into(),
+                    "key".into(),
+                    "secret".into(),
+                )
+                .unwrap()
+                .with_endpoint(endpoint),
+            ),
+        )
+        .unwrap();
+        // A later deployment configures a GCS bucket that B2 mode never writes.
+        let gained_gcs_bucket =
+            MediaStorage::new(WriteMode::B2, None, "fixture-gcs".into(), Some(b2)).unwrap();
         let db = crate::coordination::connect(&database_url).await.unwrap();
         db.batch_execute(SCHEMA).await.unwrap();
         let outbox = ProcessingOutbox {
@@ -1179,6 +1200,25 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|intent| intent.sha256 == hash));
+        assert_eq!(
+            outbox.recover_intents(&moved_b2, 1000, size).await.unwrap(),
+            0,
+            "a changed required bucket must never be recovered"
+        );
+        assert_eq!(outbox.pending_intents(1000).await.unwrap().len(), 1);
+        assert_eq!(
+            outbox
+                .recover_intents(&gained_gcs_bucket, 1000, size)
+                .await
+                .unwrap(),
+            1,
+            "an unused adapter's bucket must not strand a recoverable intent"
+        );
+        let second_owner = "d".repeat(64);
+        outbox
+            .begin_upload(&hash, size, "video/mp4", &second_owner, &storage)
+            .await
+            .unwrap();
         assert_eq!(
             outbox.recover_intents(&storage, 1000, size).await.unwrap(),
             1
