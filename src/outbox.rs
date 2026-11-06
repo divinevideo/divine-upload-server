@@ -235,6 +235,10 @@ impl ProcessingOutbox {
         event.replicas = objects;
         event.refresh_job_id()?;
         let payload = serde_json::to_value(&event)?;
+        // TODO(#33): remove this pre-receipt replay path, its lookup query and
+        // the matching contract and deployment text once every session completed
+        // before receipts has expired: one session lifetime after the receipts
+        // schema is live in every environment.
         let historical_replay = upload_id.is_some()
             && !matches_intent
             && transaction

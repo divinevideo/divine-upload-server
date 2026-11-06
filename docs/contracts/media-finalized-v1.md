@@ -78,6 +78,7 @@ Resumable completion records a per-session receipt atomically with the outbox
 event and intent completion. A repeated session uses that receipt without
 changing the current intent or refreshing finalization order. A new session
 still completes its own admission even when it reuses a historical event ID.
+<!-- TODO(#33): remove the next sentence with the pre-receipt replay path once sessions completed before receipts have expired everywhere. -->
 For completed sessions predating receipts, an exact historical event may be
 adopted when the current intent has a different policy; this does not mutate the
 newer intent. A receipt is deleted with its session when the expired session is
