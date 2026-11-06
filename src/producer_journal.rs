@@ -114,10 +114,21 @@ fn validate_lease(lease: &Lease) -> Result<()> {
     Ok(())
 }
 
-async fn live_job<C: GenericClient + Sync>(client: &C, lease: &Lease) -> Result<()> {
+async fn live_job(client: &tokio_postgres::Transaction<'_>, lease: &Lease) -> Result<()> {
     validate_lease(lease)?;
+    if client
+        .query_opt(
+            "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 FOR UPDATE",
+            &[&lease.processing_job_id],
+        )
+        .await?
+        .is_none()
+    {
+        return Err(JournalError::Stale.into());
+    }
+    // Time predicates must be evaluated after any wait for the identity lock.
     if client.query_opt(
-        "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 AND lease_generation=$2 AND input_revision=$3 AND state='running' AND lease_until>clock_timestamp() AND attempt_deadline>clock_timestamp() FOR UPDATE",
+        "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 AND lease_generation=$2 AND input_revision=$3 AND state='running' AND lease_until>clock_timestamp() AND attempt_deadline>clock_timestamp()",
         &[&lease.processing_job_id,&lease.lease_generation,&lease.input_revision],
     ).await?.is_none() {
         return Err(JournalError::Stale.into());

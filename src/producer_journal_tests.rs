@@ -10,6 +10,53 @@ const PREPARE: &str = "/internal/media-processing/attempts/prepare";
 const INSPECT: &str = "/internal/media-processing/attempts/inspect";
 const DISPATCH: &str = "/internal/media-processing/attempts/dispatch";
 
+#[tokio::test]
+async fn planned_replay_lock_wait_cannot_accept_expired_lease() {
+    let Some((one, two, assignment)) = fixture().await else {
+        return;
+    };
+    let lease = serde_json::to_value(Lease::from(&assignment)).unwrap();
+    let begun = call(one.clone(), BEGIN, serde_json::json!({"lease":lease})).await;
+    assert_eq!(begun.0, StatusCode::OK);
+    let id = begun.1["attempt"]["attempt_id"].as_str().unwrap();
+    let plan = serde_json::json!({"lease":lease,"attempt_id":id,"artifacts":artifacts()});
+    let prepared = call(one.clone(), PREPARE, plan.clone()).await;
+    assert_eq!(prepared.0, StatusCode::OK);
+    let waiter_pid: i32 = one
+        .store
+        .database
+        .lock()
+        .await
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    one.store.database.lock().await.execute(
+        "UPDATE media_processing_jobs SET lease_until=clock_timestamp()+interval '2 seconds' WHERE processing_job_id=$1",
+        &[&assignment.processing_job_id],
+    ).await.unwrap();
+    let mut holder = two.store.database.lock().await;
+    let tx = holder.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 FOR UPDATE",
+        &[&assignment.processing_job_id],
+    )
+    .await
+    .unwrap();
+    let request = tokio::spawn(call(one.clone(), PREPARE, plan));
+    database_tests::wait_for_expiry_while_locked(&tx, waiter_pid, &assignment.processing_job_id)
+        .await;
+    tx.commit().await.unwrap();
+    drop(holder);
+    assert_eq!(request.await.unwrap().0, StatusCode::CONFLICT);
+    assert_eq!(
+        call(two.clone(), INSPECT, serde_json::json!({"attempt_id":id}))
+            .await
+            .1,
+        prepared.1
+    );
+}
+
 fn settings(enabled: bool) -> InboxSettings {
     InboxSettings::from_lookup(|key| match key {
         "MEDIA_FINALIZED_INBOX_ENABLED" => Some("true".into()),

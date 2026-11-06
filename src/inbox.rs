@@ -316,8 +316,28 @@ impl InboxStore {
     }
 
     async fn renew(&self, assignment: &Lease) -> Result<bool> {
-        let client = self.database.lock().await;
-        Ok(client.execute("UPDATE media_processing_jobs SET lease_until=LEAST(clock_timestamp()+interval '60 seconds',attempt_deadline) WHERE processing_job_id=$1 AND lease_generation=$2 AND input_revision=$3 AND state='running' AND lease_until>clock_timestamp() AND attempt_deadline>clock_timestamp()",&[&assignment.processing_job_id,&assignment.lease_generation,&assignment.input_revision]).await.map_err(|_|anyhow!("assignment renewal failed"))?==1)
+        let mut client = self.database.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| anyhow!("assignment renewal transaction unavailable"))?;
+        // Acquire exclusion before evaluating time, including lock-only waits.
+        if tx
+            .query_opt(
+                "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 FOR UPDATE",
+                &[&assignment.processing_job_id],
+            )
+            .await
+            .map_err(|_| anyhow!("assignment renewal lookup failed"))?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let renewed = tx.execute("UPDATE media_processing_jobs SET lease_until=LEAST(clock_timestamp()+interval '60 seconds',attempt_deadline) WHERE processing_job_id=$1 AND lease_generation=$2 AND input_revision=$3 AND state='running' AND lease_until>clock_timestamp() AND attempt_deadline>clock_timestamp()",&[&assignment.processing_job_id,&assignment.lease_generation,&assignment.input_revision]).await.map_err(|_|anyhow!("assignment renewal failed"))?==1;
+        tx.commit()
+            .await
+            .map_err(|_| anyhow!("assignment renewal commit failed"))?;
+        Ok(renewed)
     }
 
     async fn complete(&self, assignment: &Lease, marker: &ObjectRef) -> Result<bool> {

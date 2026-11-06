@@ -1,6 +1,111 @@
 use super::*;
 use crate::storage::StorageProvider;
 
+pub(super) async fn wait_for_expiry_while_locked(
+    holder: &tokio_postgres::Transaction<'_>,
+    waiter_pid: i32,
+    job_id: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let waiting: bool = holder
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')",
+                    &[&waiter_pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("request must actually wait on the other connection's row lock");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let expired: bool = holder
+                .query_one(
+                    "SELECT LEAST(lease_until,attempt_deadline)<=clock_timestamp() FROM media_processing_jobs WHERE processing_job_id=$1",
+                    &[&job_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if expired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("database clock must cross the reservation boundary");
+}
+
+async fn renewal_after_lock_wait(expire_lease: bool) {
+    let Some((store, second)) = stores().await else {
+        return;
+    };
+    let event = event();
+    store.accept(&event, &event.job_id).await.unwrap();
+    let assignment = store.claim().await.unwrap().unwrap();
+    let lease = Lease::from(&assignment);
+    let waiter_pid: i32 = store
+        .database
+        .lock()
+        .await
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    store.database.lock().await.execute(
+        "UPDATE media_processing_jobs SET lease_until=clock_timestamp()+CASE WHEN $2 THEN interval '2 seconds' ELSE interval '60 seconds' END,attempt_deadline=clock_timestamp()+CASE WHEN $2 THEN interval '60 seconds' ELSE interval '2 seconds' END WHERE processing_job_id=$1",
+        &[&lease.processing_job_id,&expire_lease],
+    ).await.unwrap();
+    let before: f64 = store.database.lock().await.query_one(
+        "SELECT extract(epoch FROM lease_until)::double precision FROM media_processing_jobs WHERE processing_job_id=$1",
+        &[&lease.processing_job_id],
+    ).await.unwrap().get(0);
+    let mut holder = second.database.lock().await;
+    let tx = holder.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT 1 FROM media_processing_jobs WHERE processing_job_id=$1 FOR UPDATE",
+        &[&lease.processing_job_id],
+    )
+    .await
+    .unwrap();
+    let waiting_store = store.clone();
+    let waiting_lease = lease.clone();
+    let request = tokio::spawn(async move { waiting_store.renew(&waiting_lease).await });
+    wait_for_expiry_while_locked(&tx, waiter_pid, &lease.processing_job_id).await;
+    tx.commit().await.unwrap();
+    drop(holder);
+    assert!(
+        !request.await.unwrap().unwrap(),
+        "renewal must reject expiry crossed during a lock-only wait"
+    );
+    let after: f64 = store.database.lock().await.query_one(
+        "SELECT extract(epoch FROM lease_until)::double precision FROM media_processing_jobs WHERE processing_job_id=$1",
+        &[&lease.processing_job_id],
+    ).await.unwrap().get(0);
+    assert_eq!(
+        before, after,
+        "a rejected renewal must not extend the lease"
+    );
+}
+
+#[tokio::test]
+async fn renewal_lock_wait_cannot_revive_expired_lease() {
+    renewal_after_lock_wait(true).await;
+}
+
+#[tokio::test]
+async fn renewal_lock_wait_cannot_accept_expired_deadline() {
+    renewal_after_lock_wait(false).await;
+}
+
 pub(super) fn event() -> MediaFinalizedV1 {
     MediaFinalizedV1::new(
         &"a".repeat(64),
