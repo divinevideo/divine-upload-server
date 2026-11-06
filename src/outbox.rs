@@ -164,11 +164,7 @@ impl ProcessingOutbox {
                 "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1",
                 &[&upload_id],
             ).await.map_err(|_| anyhow!("processing receipt lookup failed"))? {
-                let event: MediaFinalizedV1 = serde_json::from_value(receipt.get(0))?;
-                if event.sha256 != hash || event.size != size || event.owner.as_deref() != Some(owner) {
-                    return Err(IntentConflict.into());
-                }
-                return Ok(());
+                return check_session_receipt(receipt.get(0), hash, size, owner);
             }
         }
         // MIME declarations may change on a retry of identical content. Retain
@@ -391,6 +387,22 @@ impl ProcessingOutbox {
         }
         Ok(delivered)
     }
+}
+
+/// A receipt names the event its session committed. A mismatch is corrupt or
+/// foreign state, not a storage-policy conflict the client could resolve.
+fn check_session_receipt(
+    payload: serde_json::Value,
+    hash: &str,
+    size: u64,
+    owner: &str,
+) -> Result<()> {
+    let event: MediaFinalizedV1 = serde_json::from_value(payload)
+        .map_err(|_| anyhow!("stored session receipt event is invalid"))?;
+    if event.sha256 != hash || event.size != size || event.owner.as_deref() != Some(owner) {
+        bail!("session receipt does not match the completed upload");
+    }
+    Ok(())
 }
 
 /// Destinations a recorded intent requires, in finalization order. Only these
@@ -730,6 +742,64 @@ pub(crate) mod tests {
         assert_eq!(pending[0].mode, "gcs");
         assert_eq!(pending[0].gcs_bucket, "fixture-gcs");
         assert_eq!(pending[0].b2_bucket, None);
+    }
+
+    #[tokio::test]
+    async fn mismatched_session_receipt_is_an_integrity_error_not_a_policy_conflict() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let source = ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        };
+        outbox
+            .begin_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session("upload-1", &hash, 3, &owner, vec![source.clone()])
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session("upload-1", &hash, 3, &owner, vec![source.clone()])
+            .await
+            .expect("a matching receipt acknowledges the replay");
+        let other_hash = "d".repeat(64);
+        let other_owner = "c".repeat(64);
+        for (field, hash, size, owner) in [
+            ("hash", other_hash.as_str(), 3, owner.as_str()),
+            ("size", hash.as_str(), 4, owner.as_str()),
+            ("owner", hash.as_str(), 3, other_owner.as_str()),
+        ] {
+            let error = outbox
+                .enqueue_completed_session("upload-1", hash, size, owner, vec![source.clone()])
+                .await
+                .unwrap_err();
+            assert!(
+                !error.is::<IntentConflict>(),
+                "a {field} mismatch must not ask the client to reconcile storage policy"
+            );
+            assert_eq!(
+                error.to_string(),
+                "session receipt does not match the completed upload",
+                "{field} mismatch"
+            );
+        }
     }
 
     #[tokio::test]
