@@ -104,8 +104,6 @@ pub struct CompleteUploadResponse {
     /// downstream hooks more than once.
     #[serde(skip)]
     pub newly_stored: bool,
-    #[serde(skip)]
-    pub objects: Vec<crate::storage::ObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,7 +586,7 @@ where
         session: &UploadSession,
         newly_stored: bool,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
-        let mut response = self.build_complete_upload_response(
+        let response = self.build_complete_upload_response(
             &session.final_sha256,
             session.declared_size,
             &session.content_type,
@@ -602,7 +600,7 @@ where
                 .final_objects(session)
                 .await
                 .map_err(internal_error)?;
-            response.objects = outbox
+            outbox
                 .enqueue_completed_session(
                     &session.upload_id,
                     &session.final_sha256,
@@ -689,7 +687,6 @@ where
             thumbnail: None,
             streaming,
             newly_stored,
-            objects: Vec::new(),
         }
     }
 

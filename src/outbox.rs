@@ -116,7 +116,6 @@ impl ProcessingOutbox {
     ) -> Result<()> {
         self.enqueue_upload_inner(hash, size, owner, objects, None)
             .await
-            .map(|_| ())
     }
 
     /// A completed session may be replayed after a newer upload changes the
@@ -128,7 +127,7 @@ impl ProcessingOutbox {
         size: u64,
         owner: &str,
         objects: Vec<ObjectRef>,
-    ) -> Result<Vec<ObjectRef>> {
+    ) -> Result<()> {
         self.enqueue_upload_inner(hash, size, owner, objects, Some(upload_id))
             .await
     }
@@ -140,7 +139,7 @@ impl ProcessingOutbox {
         owner: &str,
         mut objects: Vec<ObjectRef>,
         upload_id: Option<&str>,
-    ) -> Result<Vec<ObjectRef>> {
+    ) -> Result<()> {
         let stored_size =
             i64::try_from(size).map_err(|_| anyhow!("upload size exceeds database range"))?;
         if objects.is_empty() {
@@ -169,7 +168,7 @@ impl ProcessingOutbox {
                 if event.sha256 != hash || event.size != size || event.owner.as_deref() != Some(owner) {
                     return Err(IntentConflict.into());
                 }
-                return Ok(std::iter::once(event.source).chain(event.replicas).collect());
+                return Ok(());
             }
         }
         // MIME declarations may change on a retry of identical content. Retain
@@ -230,10 +229,7 @@ impl ProcessingOutbox {
         transaction
             .commit()
             .await
-            .map_err(|_| anyhow!("processing event commit failed"))?;
-        Ok(std::iter::once(event.source)
-            .chain(event.replicas)
-            .collect())
+            .map_err(|_| anyhow!("processing event commit failed"))
     }
 
     /// Reads a bounded page of unfinished intents so upload recovery can reconcile
