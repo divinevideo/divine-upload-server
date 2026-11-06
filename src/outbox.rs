@@ -412,10 +412,28 @@ fn retry_delay(attempt: i32) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-    async fn isolated_database_url() -> Option<String> {
+
+    /// Anonymous GCS plus an optional B2 adapter; constructing it performs no I/O.
+    pub(crate) fn fixture_storage(mode: WriteMode, b2_bucket: Option<&str>) -> MediaStorage {
+        let gcs = google_cloud_storage::client::Client::new(
+            google_cloud_storage::client::ClientConfig::default().anonymous(),
+        );
+        let b2 = b2_bucket.map(|bucket| {
+            crate::storage::B2Store::new(
+                bucket.into(),
+                "us-west-001".into(),
+                "fixture".into(),
+                "fixture".into(),
+            )
+            .unwrap()
+        });
+        MediaStorage::new(mode, Some(gcs), "fixture-gcs".into(), b2).unwrap()
+    }
+
+    pub(crate) async fn isolated_database_url() -> Option<String> {
         let base = std::env::var("TEST_COORDINATION_DATABASE_URL").ok()?;
         let client = crate::coordination::connect(&base).await.unwrap();
         let schema = format!("outbox_test_{:032x}", rand::random::<u128>());
@@ -579,36 +597,12 @@ mod tests {
         let Some(url) = isolated_database_url().await else {
             return;
         };
-        use crate::storage::B2Store;
         let outbox =
             ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
                 .await
                 .unwrap();
-        let gcs = google_cloud_storage::client::Client::new(
-            google_cloud_storage::client::ClientConfig::default().anonymous(),
-        );
-        let gcs_only = MediaStorage::new(
-            WriteMode::Gcs,
-            Some(gcs.clone()),
-            "fixture-gcs".into(),
-            None,
-        )
-        .unwrap();
-        let both = MediaStorage::new(
-            WriteMode::Dual,
-            Some(gcs.clone()),
-            "fixture-gcs".into(),
-            Some(
-                B2Store::new(
-                    "fixture-b2".into(),
-                    "us-west-001".into(),
-                    "fixture".into(),
-                    "fixture".into(),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let gcs_only = fixture_storage(WriteMode::Gcs, None);
+        let both = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
         let hash = "a".repeat(64);
         let gcs_owner = "b".repeat(64);
         outbox
@@ -629,21 +623,7 @@ mod tests {
             .begin_upload(&hash, 3, "video/mp4", &dual_owner, &both)
             .await
             .unwrap();
-        let changed = MediaStorage::new(
-            WriteMode::Gcs,
-            Some(gcs),
-            "fixture-gcs".into(),
-            Some(
-                B2Store::new(
-                    "other-b2".into(),
-                    "us-west-001".into(),
-                    "fixture".into(),
-                    "fixture".into(),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let changed = fixture_storage(WriteMode::Gcs, Some("other-b2"));
         for incompatible in [&gcs_only, &changed] {
             let result = outbox
                 .begin_or_resume_upload(&hash, 3, "video/mp4", &dual_owner, incompatible)
@@ -676,28 +656,12 @@ mod tests {
         let Some(url) = isolated_database_url().await else {
             return;
         };
-        use crate::storage::{B2Store, StorageProvider};
+        use crate::storage::StorageProvider;
         let outbox =
             ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
                 .await
                 .unwrap();
-        let storage = MediaStorage::new(
-            WriteMode::Dual,
-            Some(google_cloud_storage::client::Client::new(
-                google_cloud_storage::client::ClientConfig::default().anonymous(),
-            )),
-            "fixture-gcs".into(),
-            Some(
-                B2Store::new(
-                    "fixture-b2".into(),
-                    "us-west-001".into(),
-                    "fixture".into(),
-                    "fixture".into(),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
         let hash = "a".repeat(64);
         let owner = "b".repeat(64);
         let gcs = ObjectRef {

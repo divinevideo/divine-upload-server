@@ -1603,42 +1603,19 @@ mod tests {
 
     #[tokio::test]
     async fn completed_session_replay_preserves_a_newer_upload_policy() {
-        let Ok(base) = std::env::var("TEST_COORDINATION_DATABASE_URL") else {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
             return;
         };
-        use crate::storage::{B2Store, MediaStorage, ObjectRef, StorageProvider, WriteMode};
-        let db = crate::coordination::connect(&base).await.unwrap();
-        let schema = format!("session_replay_{}", random_hex(16));
-        db.batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .await
-            .unwrap();
-        let mut url = url::Url::parse(&base).unwrap();
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
         let outbox = crate::outbox::ProcessingOutbox::connect(
-            url.as_str(),
+            &url,
             "https://processing.invalid/finalized",
             "fixture",
         )
         .await
         .unwrap();
-        let storage = MediaStorage::new(
-            WriteMode::Dual,
-            Some(GcsClient::new(
-                google_cloud_storage::client::ClientConfig::default().anonymous(),
-            )),
-            "fixture-gcs".into(),
-            Some(
-                B2Store::new(
-                    "fixture-b2".into(),
-                    "us-west-001".into(),
-                    "fixture".into(),
-                    "fixture".into(),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
         let hash = hex::encode(Sha256::digest(b"hello"));
         let gcs = ObjectRef {
             provider: StorageProvider::Gcs,
