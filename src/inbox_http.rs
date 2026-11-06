@@ -72,9 +72,16 @@ fn token_matches(request: &Request, expected: &str) -> bool {
     one.verify_slice(&two.finalize().into_bytes()).is_ok()
 }
 
-fn parse<T: DeserializeOwned>(body: &[u8]) -> std::result::Result<T, Response> {
-    serde_json::from_slice(body)
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid processing request"))
+struct InvalidRequest;
+
+impl From<InvalidRequest> for Response {
+    fn from(_: InvalidRequest) -> Self {
+        error(StatusCode::BAD_REQUEST, "invalid processing request")
+    }
+}
+
+fn parse<T: DeserializeOwned>(body: &[u8]) -> std::result::Result<T, InvalidRequest> {
+    serde_json::from_slice(body).map_err(|_| InvalidRequest)
 }
 
 #[derive(Deserialize)]
