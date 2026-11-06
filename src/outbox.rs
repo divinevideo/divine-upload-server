@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 
 const SCHEMA: &str = include_str!("../database/migrations/002_processing_outbox.sql");
+const SESSION_RECEIPT_EVENT: &str = "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1";
 
 #[derive(Debug, thiserror::Error)]
 #[error("Upload intent requires its recorded storage policy and destination mapping; retain the required providers or reconcile the intent")]
@@ -132,6 +133,28 @@ impl ProcessingOutbox {
             .await
     }
 
+    /// Whether this session already committed its processing event, so a
+    /// replay can be answered without provider lookups. Finalization still
+    /// rechecks the receipt under its lock.
+    pub async fn has_session_receipt(
+        &self,
+        upload_id: &str,
+        hash: &str,
+        size: u64,
+        owner: &str,
+    ) -> Result<bool> {
+        let client = self.database.lock().await;
+        let Some(receipt) = client
+            .query_opt(SESSION_RECEIPT_EVENT, &[&upload_id])
+            .await
+            .map_err(|_| anyhow!("processing receipt lookup failed"))?
+        else {
+            return Ok(false);
+        };
+        check_session_receipt(receipt.get(0), hash, size, owner)?;
+        Ok(true)
+    }
+
     async fn enqueue_upload_inner(
         &self,
         hash: &str,
@@ -160,10 +183,11 @@ impl ProcessingOutbox {
                 )
                 .await
                 .map_err(|_| anyhow!("processing receipt lock failed"))?;
-            if let Some(receipt) = transaction.query_opt(
-                "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1",
-                &[&upload_id],
-            ).await.map_err(|_| anyhow!("processing receipt lookup failed"))? {
+            if let Some(receipt) = transaction
+                .query_opt(SESSION_RECEIPT_EVENT, &[&upload_id])
+                .await
+                .map_err(|_| anyhow!("processing receipt lookup failed"))?
+            {
                 return check_session_receipt(receipt.get(0), hash, size, owner);
             }
         }

@@ -512,6 +512,27 @@ where
         }
 
         if session.finalized_object.is_some() {
+            // A committed receipt answers the replay without asking storage for
+            // the final objects again.
+            if let Some(outbox) = &self.outbox {
+                if outbox
+                    .has_session_receipt(
+                        &session.upload_id,
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.owner,
+                    )
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return Ok(self.build_complete_upload_response(
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.content_type,
+                        false,
+                    ));
+                }
+            }
             return self.completed_response(&session, false).await;
         }
 
@@ -1596,6 +1617,106 @@ mod tests {
             .expect_err("non-contiguous chunk should fail");
 
         assert!(matches!(error, ResumableError::RangeNotSatisfiable(_)));
+    }
+
+    #[tokio::test]
+    async fn receipt_backed_replay_needs_no_final_object_lookup() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let store = InMemoryStore::default();
+        let manager_with = |backend: FakeBackend| {
+            ResumableManager::new(
+                backend,
+                store.clone(),
+                "https://upload.example",
+                "https://media.example",
+                DEFAULT_RESUMABLE_CHUNK_SIZE,
+                DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+            )
+            .with_outbox(Some(outbox.clone()))
+        };
+        let manager = manager_with(FakeBackend {
+            final_refs: vec![ObjectRef {
+                provider: StorageProvider::Gcs,
+                bucket: "fixture-gcs".into(),
+                key: hash.clone(),
+                version: Some("1".into()),
+            }],
+            ..Default::default()
+        });
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+        session.next_offset = 5;
+        session.storage_complete = true;
+        session.finalized_object = Some(hash.clone());
+        store.save(&session).await.unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        manager
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(outbox
+            .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert!(!outbox
+            .has_session_receipt("unknown-upload", &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert_eq!(
+            outbox
+                .has_session_receipt(&init.upload_id, &hash, 6, &owner)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session receipt does not match the completed upload"
+        );
+
+        // Storage can no longer answer (provider disabled or object moved), but
+        // the durable receipt already records the committed completion.
+        let unavailable = manager_with(FakeBackend {
+            fail_final_object_lookup: true,
+            ..Default::default()
+        });
+        let replay = unavailable.complete_session(&init.upload_id, &owner).await;
+        assert!(
+            replay.is_ok(),
+            "receipt-backed replay failed: {:?}",
+            replay.err()
+        );
+        assert!(!replay.unwrap().newly_stored);
     }
 
     #[tokio::test]
