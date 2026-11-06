@@ -5,6 +5,23 @@ use axum::{
 };
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn producer_journal_routes_are_disabled_by_default() {
+    for path in [
+        "/internal/media-processing/attempts/begin",
+        "/internal/media-processing/attempts/prepare",
+        "/internal/media-processing/attempts/inspect",
+        "/internal/media-processing/attempts/dispatch",
+    ] {
+        let response = router(None)
+            .oneshot(request(path, "fixture-worker-token", "", b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+    }
+}
+
 #[test]
 fn explicit_enablement_requires_separate_tokens() {
     assert!(InboxSettings::from_lookup(|_| None).unwrap().is_none());
@@ -29,6 +46,7 @@ async fn runtime() -> Option<InboxRuntime> {
         settings: Arc::new(InboxSettings {
             intake_token: "fixture-intake-token".into(),
             worker_token: "fixture-worker-token".into(),
+            producer_journal_enabled: false,
         }),
         deadline: std::time::Duration::from_secs(10),
     })

@@ -67,12 +67,23 @@ impl From<&Assignment> for Lease {
 struct InboxSettings {
     intake_token: String,
     worker_token: String,
+    producer_journal_enabled: bool,
 }
 
 impl InboxSettings {
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Option<Self>> {
+        let producer_journal_enabled = match lookup("MEDIA_PROCESSING_JOURNAL_ENABLED").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => bail!("MEDIA_PROCESSING_JOURNAL_ENABLED must be true or false"),
+        };
         match lookup("MEDIA_FINALIZED_INBOX_ENABLED").as_deref() {
-            None | Some("false") => return Ok(None),
+            None | Some("false") => {
+                if producer_journal_enabled {
+                    bail!("producer journal requires the finalization inbox");
+                }
+                return Ok(None);
+            }
             Some("true") => {}
             _ => bail!("MEDIA_FINALIZED_INBOX_ENABLED must be true or false"),
         }
@@ -94,6 +105,7 @@ impl InboxSettings {
         Ok(Some(Self {
             intake_token,
             worker_token,
+            producer_journal_enabled,
         }))
     }
 }
@@ -108,6 +120,9 @@ pub struct InboxRuntime {
 #[path = "inbox_http.rs"]
 mod http;
 pub use http::{configured, router};
+
+#[path = "producer_journal.rs"]
+mod journal;
 
 const INBOX_SCHEMA: &str = include_str!("../database/migrations/003_finalization_inbox.sql");
 
@@ -177,6 +192,10 @@ impl InboxStore {
             .batch_execute(INBOX_SCHEMA)
             .await
             .map_err(|_| anyhow!("inbox schema initialization failed"))?;
+        client
+            .batch_execute(journal::SCHEMA)
+            .await
+            .map_err(|_| anyhow!("producer journal schema initialization failed"))?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
         })
@@ -356,6 +375,10 @@ mod database_tests;
 #[cfg(test)]
 #[path = "inbox_http_tests.rs"]
 mod http_tests;
+
+#[cfg(test)]
+#[path = "producer_journal_tests.rs"]
+mod journal_tests;
 
 fn is_hash(value: &str) -> bool {
     value.len() == 64
