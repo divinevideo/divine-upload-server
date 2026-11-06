@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 const SCHEMA: &str = include_str!("../database/migrations/002_processing_outbox.sql");
 
 #[derive(Debug, thiserror::Error)]
-#[error("Upload intent is pinned to another storage policy; retry against its original provider configuration or reconcile before switching modes")]
+#[error("Upload intent requires its recorded storage policy and destination mapping; retain the required providers or reconcile the intent")]
 pub struct IntentConflict;
 
 #[derive(Clone)]
@@ -54,6 +54,34 @@ impl ProcessingOutbox {
         owner: &str,
         storage: &MediaStorage,
     ) -> Result<()> {
+        self.reserve_upload(hash, size, content_type, owner, storage, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Direct and mirror requests have no session policy of their own. Resume
+    /// the pending intent before writing; only a new intent uses admission mode.
+    pub async fn begin_or_resume_upload(
+        &self,
+        hash: &str,
+        size: u64,
+        content_type: &str,
+        owner: &str,
+        storage: &MediaStorage,
+    ) -> Result<MediaStorage> {
+        self.reserve_upload(hash, size, content_type, owner, storage, true)
+            .await
+    }
+
+    async fn reserve_upload(
+        &self,
+        hash: &str,
+        size: u64,
+        content_type: &str,
+        owner: &str,
+        storage: &MediaStorage,
+        resume_recorded: bool,
+    ) -> Result<MediaStorage> {
         let size =
             i64::try_from(size).map_err(|_| anyhow!("upload size exceeds database range"))?;
         let mode = serde_json::to_value(storage.mode)?
@@ -64,14 +92,21 @@ impl ProcessingOutbox {
         let b2_bucket = storage.b2_bucket();
         let client = self.database.lock().await;
         let row=client.query_one("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO UPDATE SET updated_at=now(), write_mode=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.write_mode ELSE upload_processing_intents.write_mode END, gcs_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.gcs_bucket ELSE upload_processing_intents.gcs_bucket END, b2_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.b2_bucket ELSE upload_processing_intents.b2_bucket END, completed=upload_processing_intents.completed AND upload_processing_intents.write_mode=EXCLUDED.write_mode AND upload_processing_intents.gcs_bucket=EXCLUDED.gcs_bucket AND upload_processing_intents.b2_bucket IS NOT DISTINCT FROM EXCLUDED.b2_bucket WHERE upload_processing_intents.size=EXCLUDED.size RETURNING size,content_type,write_mode,gcs_bucket,b2_bucket",&[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
-        if row.get::<_, i64>(0) != size
-            || row.get::<_, String>(2) != mode
-            || row.get::<_, String>(3) != gcs_bucket
-            || row.get::<_, Option<String>>(4).as_deref() != b2_bucket
-        {
+        let recorded_mode: WriteMode = row.get::<_, String>(2).parse()?;
+        let same_gcs = row.get::<_, String>(3) == gcs_bucket;
+        let same_b2 = row.get::<_, Option<String>>(4).as_deref() == b2_bucket;
+        let compatible = if resume_recorded {
+            (recorded_mode == WriteMode::B2 || same_gcs)
+                && (recorded_mode == WriteMode::Gcs || same_b2)
+        } else {
+            recorded_mode == storage.mode && same_gcs && same_b2
+        };
+        if row.get::<_, i64>(0) != size || !compatible {
             return Err(IntentConflict.into());
         }
-        Ok(())
+        storage
+            .with_mode(recorded_mode)
+            .map_err(|_| IntentConflict.into())
     }
 
     pub async fn enqueue_upload(
@@ -95,11 +130,33 @@ impl ProcessingOutbox {
         // MIME declarations may change on a retry of identical content. Retain
         // the first intent's metadata instead of rejecting a valid hash forever.
         let intent = transaction.query_opt(
-            "SELECT content_type FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND size=$3 FOR UPDATE",
+            "SELECT content_type,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND size=$3 FOR UPDATE",
             &[&hash, &owner, &stored_size],
         ).await.map_err(|_| anyhow!("upload intent lookup failed"))?
             .ok_or_else(|| anyhow!("processing event has no matching upload intent"))?;
         let content_type: String = intent.get(0);
+        let mode: WriteMode = intent.get::<_, String>(1).parse()?;
+        let gcs_bucket: String = intent.get(2);
+        let b2_bucket: Option<String> = intent.get(3);
+        use crate::storage::StorageProvider::{Gcs, B2};
+        let expected = match mode {
+            WriteMode::Gcs => vec![(Gcs, gcs_bucket.as_str())],
+            WriteMode::B2 => vec![(B2, b2_bucket.as_deref().ok_or(IntentConflict)?)],
+            WriteMode::Dual => vec![
+                (Gcs, gcs_bucket.as_str()),
+                (B2, b2_bucket.as_deref().ok_or(IntentConflict)?),
+            ],
+        };
+        if objects.len() != expected.len()
+            || objects
+                .iter()
+                .zip(expected)
+                .any(|(object, (provider, bucket))| {
+                    object.provider != provider || object.bucket != bucket
+                })
+        {
+            return Err(IntentConflict.into());
+        }
         // Storage orders the currently authoritative source first. Replicas are durable
         // additional copies, never additional processing jobs for the same upload.
         let source = objects.remove(0);
@@ -447,6 +504,321 @@ mod tests {
         assert_eq!(retry_delay(1), 10);
         assert!(retry_delay(2) > retry_delay(1));
         assert!(retry_delay(i32::MAX) <= 86400);
+    }
+
+    #[tokio::test]
+    async fn resumed_intent_requires_original_active_destinations() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        use crate::storage::B2Store;
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let gcs = google_cloud_storage::client::Client::new(
+            google_cloud_storage::client::ClientConfig::default().anonymous(),
+        );
+        let gcs_only = MediaStorage::new(
+            WriteMode::Gcs,
+            Some(gcs.clone()),
+            "fixture-gcs".into(),
+            None,
+        )
+        .unwrap();
+        let both = MediaStorage::new(
+            WriteMode::Dual,
+            Some(gcs.clone()),
+            "fixture-gcs".into(),
+            Some(
+                B2Store::new(
+                    "fixture-b2".into(),
+                    "us-west-001".into(),
+                    "fixture".into(),
+                    "fixture".into(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let hash = "a".repeat(64);
+        let gcs_owner = "b".repeat(64);
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &gcs_owner, &gcs_only)
+            .await
+            .unwrap();
+        let resumed = outbox
+            .begin_or_resume_upload(&hash, 3, "video/mp4", &gcs_owner, &both)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.mode,
+            WriteMode::Gcs,
+            "adding an unused B2 adapter must not strand an older GCS intent"
+        );
+        let dual_owner = "c".repeat(64);
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &dual_owner, &both)
+            .await
+            .unwrap();
+        let changed = MediaStorage::new(
+            WriteMode::Gcs,
+            Some(gcs),
+            "fixture-gcs".into(),
+            Some(
+                B2Store::new(
+                    "other-b2".into(),
+                    "us-west-001".into(),
+                    "fixture".into(),
+                    "fixture".into(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        for incompatible in [&gcs_only, &changed] {
+            let result = outbox
+                .begin_or_resume_upload(&hash, 3, "video/mp4", &dual_owner, incompatible)
+                .await;
+            assert!(result.err().unwrap().is::<IntentConflict>());
+        }
+        let pending = outbox.pending_intents(10).await.unwrap();
+        let dual_intent = pending.iter().find(|i| i.owner == dual_owner).unwrap();
+        assert_eq!(dual_intent.mode, "dual");
+        assert_eq!(dual_intent.b2_bucket.as_deref(), Some("fixture-b2"));
+        let new_owner = "d".repeat(64);
+        assert_eq!(
+            outbox
+                .begin_or_resume_upload(
+                    &hash,
+                    3,
+                    "video/mp4",
+                    &new_owner,
+                    &both.with_mode(WriteMode::Gcs).unwrap()
+                )
+                .await
+                .unwrap()
+                .mode,
+            WriteMode::Gcs
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_rejects_destinations_that_do_not_match_the_intent() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        use crate::storage::{B2Store, StorageProvider};
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let storage = MediaStorage::new(
+            WriteMode::Dual,
+            Some(google_cloud_storage::client::Client::new(
+                google_cloud_storage::client::ClientConfig::default().anonymous(),
+            )),
+            "fixture-gcs".into(),
+            Some(
+                B2Store::new(
+                    "fixture-b2".into(),
+                    "us-west-001".into(),
+                    "fixture".into(),
+                    "fixture".into(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let gcs = ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        };
+        let b2 = ObjectRef {
+            provider: StorageProvider::B2,
+            bucket: "fixture-b2".into(),
+            key: hash.clone(),
+            version: Some("v1".into()),
+        };
+        let mut wrong_bucket = b2.clone();
+        wrong_bucket.bucket = "another-bucket".into();
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &storage)
+            .await
+            .unwrap();
+        for objects in [
+            vec![gcs.clone()],
+            vec![gcs.clone(), gcs.clone()],
+            vec![b2.clone(), gcs.clone()],
+            vec![gcs.clone(), wrong_bucket],
+            vec![gcs.clone(), b2.clone(), b2.clone()],
+        ] {
+            let result = outbox
+                .enqueue_upload(&hash, 3, "video/mp4", &owner, objects)
+                .await;
+            assert!(
+                result.is_err(),
+                "mismatched destination set must not complete a dual intent"
+            );
+            assert_eq!(outbox.pending_intents(10).await.unwrap().len(), 1);
+            assert!(outbox.source_objects(&hash).await.unwrap().is_empty());
+        }
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![gcs.clone(), b2.clone()])
+            .await
+            .unwrap();
+        // A late dual attempt cannot overwrite a subsequent GCS admission's
+        // pending state after the earlier upload has already completed.
+        outbox
+            .begin_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                &storage.with_mode(WriteMode::Gcs).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![gcs.clone(), b2])
+            .await
+            .is_err());
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![gcs])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_retry_after_mode_switch_preserves_pending_destinations() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        use axum::{
+            http::{Method, Uri},
+            response::IntoResponse,
+            routing::any,
+            Json, Router,
+        };
+        use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bytes = bytes::Bytes::from_static(b"pending-original");
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let size = bytes.len() as u64;
+        let b2_reads = Arc::new(AtomicUsize::new(0));
+        let seen = b2_reads.clone();
+        let body = bytes.clone();
+        let fixture_hash = hash.clone();
+        let app = Router::new().route("/*path", any(move |method: Method, uri: Uri| {
+            let body = body.clone();
+            let hash = fixture_hash.clone();
+            let seen = seen.clone();
+            async move {
+                assert!(method == Method::GET || method == Method::HEAD,
+                    "already stored originals must be verified without overwriting");
+                if uri.path().starts_with("/storage/") {
+                    if uri.query().unwrap_or_default().contains("alt=media") {
+                        return body.into_response();
+                    }
+                    return Json(serde_json::json!({"name":hash,"bucket":"fixture-gcs","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"fixture","size":body.len().to_string(),"contentType":"application/octet-stream"})).into_response();
+                }
+                if method == Method::GET { seen.fetch_add(1, Ordering::SeqCst); }
+                let mut response = if method == Method::HEAD { "".into_response() } else { body.clone().into_response() };
+                response.headers_mut().insert("x-amz-version-id", "fixture-v1".parse().unwrap());
+                response.headers_mut().insert("content-length", body.len().to_string().parse().unwrap());
+                response
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let b2 = crate::storage::B2Store::new(
+            "fixture-b2".into(),
+            "us-west-001".into(),
+            "fixture".into(),
+            "fixture".into(),
+        )
+        .unwrap()
+        .with_endpoint(endpoint.clone());
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let dual =
+            MediaStorage::new(WriteMode::Dual, Some(gcs), "fixture-gcs".into(), Some(b2)).unwrap();
+        dual.initialize_coordination(Some(&url)).await.unwrap();
+
+        for (index, (original, current)) in [
+            (WriteMode::Dual, WriteMode::Gcs),
+            (WriteMode::Gcs, WriteMode::Dual),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let owner = format!("{:064x}", index + 1);
+            let outbox =
+                ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                    .await
+                    .unwrap();
+            outbox
+                .begin_upload(
+                    &hash,
+                    size,
+                    "application/octet-stream",
+                    &owner,
+                    &dual.with_mode(original).unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(outbox);
+            let outbox =
+                ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                    .await
+                    .unwrap();
+            let before = b2_reads.load(Ordering::SeqCst);
+            let result = crate::stream_to_gcs_with_hash(
+                &dual.with_mode(current).unwrap(),
+                Some(&outbox),
+                "application/octet-stream",
+                axum::body::Body::from(bytes.clone()),
+                &owner,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "pending {original:?} retry under {current:?} admission failed: {:?}",
+                result.err()
+            );
+            let payload: serde_json::Value = outbox
+                .database
+                .lock()
+                .await
+                .query_one(
+                    "SELECT payload FROM upload_processing_outbox WHERE payload->>'owner'=$1",
+                    &[&owner],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(payload["source"]["provider"], "gcs");
+            if original == WriteMode::Dual {
+                assert_eq!(payload["replicas"][0]["provider"], "b2");
+                assert!(b2_reads.load(Ordering::SeqCst) > before);
+            } else {
+                assert!(payload.get("replicas").is_none());
+                assert_eq!(b2_reads.load(Ordering::SeqCst), before);
+            }
+            assert!(outbox.pending_intents(10).await.unwrap().is_empty());
+        }
+        server.abort();
     }
 
     #[tokio::test]

@@ -885,7 +885,14 @@ async fn process_upload(
         .to_string();
 
     // Stream body while hashing (with owner metadata for durability)
-    let (sha256_hash, size, all_bytes, newly_stored, spooled_dimensions) = stream_to_gcs_with_hash(
+    let StoredUpload {
+        sha256: sha256_hash,
+        size,
+        derivative_bytes: all_bytes,
+        newly_stored,
+        spooled_dimensions,
+        storage: upload_storage,
+    } = stream_to_gcs_with_hash(
         &state.media_storage,
         state.processing_outbox.as_ref(),
         &content_type,
@@ -897,7 +904,7 @@ async fn process_upload(
     // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
     let thumbnail_url = if thumbnail::is_video_type(&content_type) && !all_bytes.is_empty() {
         match extract_and_upload_thumbnail(
-            &state.media_storage,
+            &upload_storage,
             &state.config.cdn_base_url,
             &sha256_hash,
             &all_bytes,
@@ -999,13 +1006,22 @@ async fn process_upload(
     })
 }
 
+struct StoredUpload {
+    sha256: String,
+    size: u64,
+    derivative_bytes: Vec<u8>,
+    newly_stored: bool,
+    spooled_dimensions: Option<String>,
+    storage: storage::MediaStorage,
+}
+
 async fn stream_to_gcs_with_hash(
     client: &storage::MediaStorage,
     outbox: Option<&outbox::ProcessingOutbox>,
     content_type: &str,
     body: Body,
     owner: &str,
-) -> Result<(String, u64, Vec<u8>, bool, Option<String>)> {
+) -> Result<StoredUpload> {
     use tokio::io::AsyncWriteExt;
     let spool = NamedTempFile::new()?;
     let mut file = tokio::fs::File::from_std(spool.reopen()?);
@@ -1023,11 +1039,13 @@ async fn stream_to_gcs_with_hash(
     }
     file.flush().await?;
     let sha256_hash = hex::encode(hasher.finalize());
-    if let Some(outbox) = outbox {
+    let client = if let Some(outbox) = outbox {
         outbox
-            .begin_upload(&sha256_hash, total_size, content_type, owner, client)
-            .await?;
-    }
+            .begin_or_resume_upload(&sha256_hash, total_size, content_type, owner, client)
+            .await?
+    } else {
+        client.clone()
+    };
     let written = client
         .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
         .await?;
@@ -1063,13 +1081,14 @@ async fn stream_to_gcs_with_hash(
     } else {
         Vec::new()
     };
-    Ok((
-        sha256_hash,
-        total_size,
+    Ok(StoredUpload {
+        sha256: sha256_hash,
+        size: total_size,
         derivative_bytes,
-        written.newly_stored,
+        newly_stored: written.newly_stored,
         spooled_dimensions,
-    ))
+        storage: client,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -3281,19 +3300,20 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
     let trusted_owner =
         migration_owner(request.owner.as_deref(), state.processing_outbox.is_some());
     let owner = trusted_owner.unwrap_or("");
-    if let Some(outbox) = &state.processing_outbox {
+    let storage = if let Some(outbox) = &state.processing_outbox {
         outbox
-            .begin_upload(
+            .begin_or_resume_upload(
                 &sha256_hash,
                 total_size,
                 &content_type,
                 owner,
                 &state.media_storage,
             )
-            .await?;
-    }
-    let written = state
-        .media_storage
+            .await?
+    } else {
+        state.media_storage.clone()
+    };
+    let written = storage
         .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
         .await?;
 

@@ -1,6 +1,6 @@
 # Production GCS and B2 Dual Writes Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking. This is a proposed plan for user review, not authorization to implement or activate it.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking. The user authorized execution after revision 4. Track partial progress below; production activation still requires the plan’s acceptance evidence.
 
 **Revision:** 4 — reviewed the supplied Claude revision 3 against the local revision 2 and uploader code. Changes below are planning decisions, not implemented capabilities.
 
@@ -10,7 +10,14 @@
 
 **Tech Stack:** Existing Rust uploader and Blossom processing code; PostgreSQL coordination/outbox; private Backblaze B2; GCS; Kubernetes/ArgoCD/Kustomize and OpenTofu/Terragrunt in divine-iac-coreconfig.
 
-**Spec:** User request in this session: plan first, reach dual writing before full cutover. Protocol baseline: `docs/contracts/media-finalized-v1.md`. Prior uploader implementation: `docs/superpowers/plans/2026-11-05-upload-server-b2-support.md`. Cross-repo constraints: divine-blossom `docs/superpowers/plans/2026-10-21-gcs-b2-cutover.md` and `docs/runbooks/b2-original-sync.md`. Strict dual success is approved; the implementation sequence and other proposed design decisions below await review.
+**Spec:** User request in this session: plan first, reach dual writing before full cutover. Protocol baseline: `docs/contracts/media-finalized-v1.md`. Prior uploader implementation: `docs/superpowers/plans/2026-11-05-upload-server-b2-support.md`. Cross-repo constraints: divine-blossom `docs/superpowers/plans/2026-10-21-gcs-b2-cutover.md` and `docs/runbooks/b2-original-sync.md`. Strict dual success and plan execution are approved. Task 1 resolves the remaining resource and interface details from evidence.
+
+## Execution progress
+
+- Task 1: in progress. Rechecked production uploader, Cloud Run processing/queues, Fastly bindings and coreconfig storage/database definitions. Raw-authority ownership and bindings remain unresolved; approved delivery is not assumed to be raw authority. Capacity/cost/latency acceptance remains outstanding.
+- Task 3A, independent retry slice: implemented recorded-policy resolution for direct/mirror retries and exact destination-set validation in the finalization transaction, with regression tests. This is not completion of shared writer/eraser coordination or Task 3B admission control.
+- Baseline verification: 112 Rust tests passed against a dedicated disposable PostgreSQL database before changes. Deployment and full real-provider acceptance are not claimed by local tests.
+- Tasks 2, 3B, 4–7: not activated. Continue independent contract/code work while resource discovery proceeds; preserve GCS production admission.
 
 ## Proposed design and scope
 
@@ -244,7 +251,7 @@ Prepare the cutover evidence alongside dual work, not after it:
 
 After full dual observation passes, hold a separate, explicit go/no-go for B2-primary reads and B2-only new admission. Existing media must have verified B2 coverage or an explicit GCS fallback; GCS dependency is not retired while that fallback is needed. Keep Google URLs and unrelated state/backups intact. Remove compatibility/access only after proven drain and the relevant retention decision. Default read routing, B2-only production admission and deletion of historical GCS media are not authorized by this planning request.
 
-## Planning decisions awaiting user review
+## Decision status
 
 1. Resolved: the user selected strict dual success; both copies must be verified before upload success.
 2. Prefer extending existing Blossom processing with durable intake/jobs; Task 1 chooses the runtime based on restart/retry and isolation evidence. A separate finalizer service is a fallback, not a committed architecture.

@@ -156,13 +156,19 @@ stored-object metadata or ownership-registration events. Its events use a null
 owner. Do not infer ownership from these mirror events before a separately
 verified caller/upload authorization contract is deployed.
 
-Before every provider-mode or destination-bucket change, drain or reconcile all
-unfinished upload intents as well as accepted sessions. An intent remains pinned
-to its original mapping. A retry against another mapping returns HTTP 409 rather
-than retargeting unknown provider outcomes. Keep an endpoint with the original
-configuration to finish an explicit byte retry, or reconcile through the approved
-operator process. Do not delete an intent or silently change its mapping merely
-to unblock a mode switch. Retry repair assumes the pinned mapping is retained.
+Changing new-upload mode does not change unfinished intents. With the outbox
+enabled, direct and mirror byte retries resolve the recorded policy before
+provider I/O at the normal endpoint. Retain both provider adapters, credentials
+and required bucket mappings when returning new admission to GCS: existing dual
+work still requires B2 and may remain pending during its outage. Resumable
+finalization must match the session's recorded policy; it cannot adopt a different
+pending intent's destinations. Finalization refuses missing, extra, reordered or
+wrong-bucket references rather than marking such an intent complete.
+
+Before changing a required destination bucket or removing a provider, drain or
+reconcile affected unfinished intents and accepted sessions. A mismatched mapping
+returns HTTP 409 rather than retargeting unknown provider outcomes. Do not delete
+an intent or silently change its mapping to clear that conflict.
 This repository does not implement a general abandonment/retargeting tool.
 Defining and exercising the companion operator reconciliation procedure is an
 activation prerequisite before enabling the outbox or changing a mapping with
@@ -170,8 +176,11 @@ unfinished intents, including abandoned uploads with no completed source. It mus
 drain writers, distinguish never-started writes from uncertain accepted writes,
 and inspect exact provider versions before any authorized state removal. A HEAD
 404 alone does not establish that a delayed write cannot commit. Until that
-procedure exists, retain the original mapping rather than proceeding with the
-mode switch or deleting rows to clear 409s.
+procedure exists, retain the original required destinations rather than changing
+their mapping or deleting rows to clear 409s. A mode-only change with all recorded
+destinations retained does not require retargeting an intent. This retry behavior
+does not provide the shared admission-policy store or atomic fleet handover in
+the production rollout plan.
 
 Mirror fetches accept HTTPS allowlisted hosts (including dot-separated subdomains),
 reject URL credentials and redirects, and have a total timeout per fetch attempt:

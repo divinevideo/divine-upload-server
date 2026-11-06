@@ -140,10 +140,13 @@ Do not roll back to an older GCS-only image after accepting B2 uploads.
 The legacy `backfill-thumbnails.py` deletion helper supports GCS only and rejects
 B2/dual selection; it must not delete one copy while another remains cached.
 
-Mode changes must drain or reconcile unfinished processing intents before moving
-their provider/bucket mapping. A mismatched retry returns 409 and keeps the old
-mapping; retry repair requires the original configuration. See the deployment
-runbook for reconciliation. With the outbox enabled, unauthenticated `/migrate`
+With the outbox enabled, direct and mirror retries use an unfinished intent's
+recorded provider policy, even after the new-upload mode changes. Keep every
+required provider and bucket available: an unavailable or changed destination
+returns 409 rather than retargeting the intent. A dual retry still requires both
+copies after GCS admission is restored. Resumable sessions retain their own
+policy. See the deployment runbook for reconciliation before changing bucket
+mappings. With the outbox enabled, unauthenticated `/migrate`
 events always have a null owner instead of trusting the request's declaration.
 Thumbnail generation and mirroring have independent configurable admission pools
 (`MAX_CONCURRENT_THUMBNAILS`, default 2; `MAX_CONCURRENT_MIRRORS`, default 1), separate
