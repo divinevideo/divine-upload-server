@@ -164,6 +164,9 @@ work still requires B2 and may remain pending during its outage. Resumable
 finalization must match the session's recorded policy; it cannot adopt a different
 pending intent's destinations. Finalization refuses missing, extra, reordered or
 wrong-bucket references rather than marking such an intent complete.
+An already committed resumable completion remains replayable after a later
+upload changes policy: an exact existing event is acknowledged without changing
+the newer intent or artifact source ordering.
 
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping

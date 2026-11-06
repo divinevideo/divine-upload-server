@@ -14,7 +14,7 @@
 
 ## Execution progress
 
-- Task 1: in progress. Rechecked production uploader, Cloud Run processing/queues, Fastly bindings and coreconfig storage/database definitions. Raw-authority ownership and bindings remain unresolved; approved delivery is not assumed to be raw authority. Capacity/cost/latency acceptance remains outstanding.
+- Task 1: in progress. Rechecked production uploader, Cloud Run processing/queues, Fastly bindings and coreconfig storage/database definitions. Verified the existing private serving bucket against its operator-managed state and live Blossom binding. Upload-authority bindings remain to be reconciled with that resource inventory; no new bucket is assumed necessary from incomplete discovery. Capacity/cost/latency acceptance remains outstanding.
 - Task 3A, independent retry slice: implemented recorded-policy resolution for direct/mirror retries and exact destination-set validation in the finalization transaction, with regression tests. This is not completion of shared writer/eraser coordination or Task 3B admission control.
 - Baseline verification: 112 Rust tests passed against a dedicated disposable PostgreSQL database before changes. Deployment and full real-provider acceptance are not claimed by local tests.
 - Tasks 2, 3B, 4–7: not activated. Continue independent contract/code work while resource discovery proceeds; preserve GCS production admission.

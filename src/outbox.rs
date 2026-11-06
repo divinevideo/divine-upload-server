@@ -115,7 +115,32 @@ impl ProcessingOutbox {
         size: u64,
         _content_type: &str,
         owner: &str,
+        objects: Vec<ObjectRef>,
+    ) -> Result<()> {
+        self.enqueue_upload_inner(hash, size, owner, objects, false)
+            .await
+    }
+
+    /// A completed session may be replayed after a newer upload changes the
+    /// mutable intent. An exact event already committed needs no new admission.
+    pub async fn enqueue_completed_session(
+        &self,
+        hash: &str,
+        size: u64,
+        owner: &str,
+        objects: Vec<ObjectRef>,
+    ) -> Result<()> {
+        self.enqueue_upload_inner(hash, size, owner, objects, true)
+            .await
+    }
+
+    async fn enqueue_upload_inner(
+        &self,
+        hash: &str,
+        size: u64,
+        owner: &str,
         mut objects: Vec<ObjectRef>,
+        replay_committed: bool,
     ) -> Result<()> {
         let stored_size =
             i64::try_from(size).map_err(|_| anyhow!("upload size exceeds database range"))?;
@@ -147,16 +172,13 @@ impl ProcessingOutbox {
                 (B2, b2_bucket.as_deref().ok_or(IntentConflict)?),
             ],
         };
-        if objects.len() != expected.len()
-            || objects
+        let matches_intent = objects.len() == expected.len()
+            && objects
                 .iter()
                 .zip(expected)
-                .any(|(object, (provider, bucket))| {
-                    object.provider != provider || object.bucket != bucket
-                })
-        {
-            return Err(IntentConflict.into());
-        }
+                .all(|(object, (provider, bucket))| {
+                    object.provider == provider && object.bucket == bucket
+                });
         // Storage orders the currently authoritative source first. Replicas are durable
         // additional copies, never additional processing jobs for the same upload.
         let source = objects.remove(0);
@@ -167,6 +189,23 @@ impl ProcessingOutbox {
         event.replicas = objects;
         event.refresh_job_id()?;
         let payload = serde_json::to_value(&event)?;
+        if replay_committed
+            && transaction
+                .query_opt(
+                    "SELECT 1 FROM upload_processing_outbox WHERE job_id=$1 AND payload=$2",
+                    &[&event.job_id, &payload],
+                )
+                .await
+                .map_err(|_| anyhow!("completed processing event lookup failed"))?
+                .is_some()
+        {
+            // Do not complete a newer intent or refresh finalized_at: either
+            // would let an old session overwrite a newer upload's policy.
+            return Ok(());
+        }
+        if !matches_intent {
+            return Err(IntentConflict.into());
+        }
         transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
         let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
         if updated != 1 {
