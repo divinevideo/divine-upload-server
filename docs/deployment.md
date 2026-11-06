@@ -196,6 +196,20 @@ B2-only deployment without GCS compatibility cannot generate them. Retiring GCS
 therefore needs an explicit change to how derivatives treat recorded GCS copies;
 removing the GCS binding alone does not do it.
 
+<!-- TODO(#33): remove this paragraph with the pre-receipt replay path. -->
+A resumable session completed before the receipts schema existed has no
+receipt. If its client replays `complete` while the owner's current intent has
+the same policy, the replay counts as a new completion and makes its event the
+newest for those bytes again, as it did before receipts. This is accepted for the
+transition. Derivatives keep every recorded provider either way, so the reorder
+can only change which event's object versions lead. Uploads reuse the object
+already stored for the bytes rather than rewrite it, so those are the same
+objects unless the media was erased and uploaded again within the window. The
+window closes once those sessions expire, one `RESUMABLE_SESSION_TTL_SECS`
+(24 hours by default) after the receipts schema is live. As a precaution, do not
+enable dual admission in an environment until that much time has passed since
+the receipts schema went live there.
+
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping
 returns HTTP 409 rather than retargeting unknown provider outcomes. Do not delete
