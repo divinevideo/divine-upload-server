@@ -675,6 +675,16 @@ where
         {
             return;
         }
+        // Before the session, so a failure leaves both for the background sweep.
+        if let Some(outbox) = &self.outbox {
+            if outbox
+                .forget_session_receipt(&session.upload_id)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         let _ = self.store.delete(&session.upload_id).await;
     }
 
@@ -1717,6 +1727,90 @@ mod tests {
             replay.err()
         );
         assert!(!replay.unwrap().newly_stored);
+    }
+
+    #[tokio::test]
+    async fn expired_session_cleanup_forgets_its_completion_receipt() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            FakeBackend::default(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session(
+                &init.upload_id,
+                &hash,
+                5,
+                &owner,
+                vec![ObjectRef {
+                    provider: StorageProvider::Gcs,
+                    bucket: "fixture-gcs".into(),
+                    key: hash.clone(),
+                    version: Some("1".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+        session.next_offset = 5;
+        session.storage_complete = true;
+        session.finalized_object = Some(hash.clone());
+        session.expires_at_epoch_secs = now_epoch_secs() - 1;
+        store.save(&session).await.unwrap();
+
+        assert!(matches!(
+            manager.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Gone(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert!(
+            !outbox
+                .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+                .await
+                .unwrap(),
+            "an expired session can never be replayed, so its receipt must go with it"
+        );
     }
 
     #[tokio::test]

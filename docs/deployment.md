@@ -174,8 +174,13 @@ upload changes policy: its durable session receipt is acknowledged without
 changing the newer intent or artifact source ordering. Startup adds the
 `upload_processing_session_receipts` table under the existing schema lock. Its
 receipt/event/intent transaction distinguishes a new session reusing an event
-identity from replay of a previously completed session. Keep receipts and their
-referenced outbox events for the supported session lifetime.
+identity from replay of a previously completed session. Expired-session cleanup,
+both the background sweep and a request that finds an expired session, deletes
+the session's receipt just before the session itself. Once a session expires,
+`complete` returns 410 or 404 before any receipt is read, so a receipt lasts no
+longer than its session. A failed receipt delete keeps the session for the next
+pass. The outbox events that receipts referenced are retained; this
+repository has no outbox retention job.
 
 Thumbnail and derivative writes use every copy recorded for the same bytes,
 across owners, not only the newest finalization. The newest event still leads

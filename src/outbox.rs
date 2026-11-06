@@ -155,6 +155,21 @@ impl ProcessingOutbox {
         Ok(true)
     }
 
+    /// Drop the receipt of a session being deleted after expiry. An expired
+    /// session's `complete` is refused before any receipt is read, so the receipt
+    /// can never answer a replay again. Its outbox event is retained.
+    pub async fn forget_session_receipt(&self, upload_id: &str) -> Result<()> {
+        let client = self.database.lock().await;
+        client
+            .execute(
+                "DELETE FROM upload_processing_session_receipts WHERE upload_id=$1",
+                &[&upload_id],
+            )
+            .await
+            .map_err(|_| anyhow!("processing receipt cleanup failed"))?;
+        Ok(())
+    }
+
     async fn enqueue_upload_inner(
         &self,
         hash: &str,
