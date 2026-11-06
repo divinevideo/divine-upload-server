@@ -63,7 +63,7 @@ Strict dual success, full artifact coverage, ownership/erasure protection and th
 
 ## Verified starting point and unknowns
 
-- Coreconfig PR 2455 deployed source `2efac310e3b55dd5e667a0863bb7348231930c73`; both production pods matched published digest `sha256:fa0bd2d1b0e3e3838548b7f52bf183b95272f171fc7ed301607819e612f6e241`. Storage remained GCS because no dual settings were bound.
+- Production ran source `2efac310e3b55dd5e667a0863bb7348231930c73`; every serving instance was verified against the published image for that commit. Storage remained GCS because no dual settings were bound.
 - Live signed direct/resumable uploads, HEAD offsets, completion byte readback and abort passed in GCS mode. These were synthetic protocol smoke tests, not actual-client saturation or B2 tests. Local suite: 112 Rust tests with disposable PostgreSQL, 16 Python tests.
 - The uploader already has B2 signing/multipart, verified dual originals/thumbnails, PostgreSQL intents/outbox, explicit retry repair and provider-pinned sessions.
 - Blossom has a live approved-media B2 replica and copy/erasure coordination for that delivery destination. This is not proof of an authoritative raw bucket or coverage of uploader writes.
