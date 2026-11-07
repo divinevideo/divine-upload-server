@@ -221,7 +221,7 @@ impl InboxStore {
         if !journal::valid_id(id) {
             return Err(journal::JournalError::Invalid.into());
         }
-        let row=self.database.lock().await.query_opt("SELECT gate_claim_request,gate_claim_outcome,gate_observation FROM media_storage_attempts WHERE attempt_id=$1",&[&id]).await?.ok_or(journal::JournalError::Stale)?;
+        let row=self.database.lock().await.query_opt("SELECT gate_claim_request,gate_claim_outcome,gate_observation FROM media_storage_attempts WHERE attempt_id=$1 AND subject_kind='producer'",&[&id]).await?.ok_or(journal::JournalError::Stale)?;
         Ok(Receipt {
             attempt_id: id.into(),
             request: row.get(0),
