@@ -142,6 +142,11 @@ impl Client {
             bail!("invalid parent gate credential");
         }
         let http = reqwest::Client::builder()
+            // reqwest can replay protocol-refused HTTP/2 requests, and Hyper can
+            // recover unstarted pooled requests. Use a fresh HTTP/1 connection
+            // for this one-shot mutation boundary instead of those retry paths.
+            .http1_only()
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
             .connect_timeout(Duration::from_secs(2))

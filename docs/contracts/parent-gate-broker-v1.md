@@ -5,7 +5,8 @@ producer journal enabled, configured `MEDIA_PARENT_GATE_URL` ending exactly in
 `/admin/api/b2-parent-gate/` and separate `MEDIA_PARENT_GATE_TOKEN`. The token
 corresponds to the edge-only `b2_storage_coordination_token` logical binding;
 worker/intake credentials cannot substitute. No credential is created here.
-HTTPS only, no URL credentials/query/fragment, redirects/proxy discovery disabled,
+HTTPS only, fresh HTTP/1 connections without an idle pool, no URL
+credentials/query/fragment, redirects/proxy discovery disabled,
 three-second total network deadline and8KiB maximum response. No raw network or
 provider error, credential or policy payload is returned/logged.
 
@@ -50,6 +51,8 @@ Missing settlement keeps the gate unavailable/pending, never TTL-cleared.
 
 Real PostgreSQL two-connection and loopback HTTP tests cover commit-before-send,
 one-shot concurrency, accepted request/response loss, historical uncertainty,
-restart/readback and resurrection prevention after intermediate owners. CI uses
+retained readback through an independent database connection and resurrection
+prevention after intermediate owners. An actual service-process kill/restart
+drill remains integration acceptance, not a test performed by this source stage. CI uses
 an explicitly disposable PostgreSQL database. Skips without that database are
 not durability proof. Real provider/erasure/performance acceptance remains root-owned.
