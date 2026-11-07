@@ -23,10 +23,12 @@ pub async fn configured(database_url: Option<&str>) -> Result<Option<InboxRuntim
     })
     .await
     .map_err(|_| anyhow!("inbox database initialization deadline exceeded"))??;
+    let parent_gate = parent_gate::Client::configured(&settings)?;
     Ok(Some(InboxRuntime {
         store,
         settings: Arc::new(settings),
         deadline: Duration::from_secs(10),
+        parent_gate,
     }))
 }
 
@@ -41,6 +43,14 @@ pub fn router(runtime: Option<InboxRuntime>) -> Router {
         .route("/internal/media-processing/attempts/prepare", post(handle))
         .route("/internal/media-processing/attempts/inspect", post(handle))
         .route("/internal/media-processing/attempts/dispatch", post(handle))
+        .route(
+            "/internal/media-processing/attempts/gate/claim",
+            post(handle),
+        )
+        .route(
+            "/internal/media-processing/attempts/gate/inspect",
+            post(handle),
+        )
         .with_state(runtime)
 }
 
@@ -151,6 +161,30 @@ async fn handle(State(runtime): State<Option<InboxRuntime>>, request: Request) -
         };
     let operation = async {
         match path.as_str() {
+            "/internal/media-processing/attempts/gate/claim" => {
+                let client = runtime.parent_gate.as_ref().ok_or_else(|| {
+                    error(StatusCode::SERVICE_UNAVAILABLE, "parent gate disabled")
+                })?;
+                let input: parent_gate::BeginClaim = parse(&body)?;
+                let receipt = runtime
+                    .store
+                    .gate_claim(client, input)
+                    .await
+                    .map_err(database_error)?;
+                Ok(serde_json::json!({"gate":receipt}))
+            }
+            "/internal/media-processing/attempts/gate/inspect" => {
+                let client = runtime.parent_gate.as_ref().ok_or_else(|| {
+                    error(StatusCode::SERVICE_UNAVAILABLE, "parent gate disabled")
+                })?;
+                let input: parent_gate::Inspect = parse(&body)?;
+                let receipt = runtime
+                    .store
+                    .gate_inspect(client, &input.attempt_id)
+                    .await
+                    .map_err(database_error)?;
+                Ok(serde_json::json!({"gate":receipt}))
+            }
             "/internal/media-processing/attempts/begin" => {
                 let input: journal::Begin = parse(&body)?;
                 let attempt = runtime

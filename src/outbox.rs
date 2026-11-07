@@ -33,14 +33,18 @@ pub struct PendingUpload {
     pub b2_bucket: Option<String>,
 }
 
+pub(crate) async fn initialize_schema(client: &Client) -> Result<()> {
+    client
+        .batch_execute(SCHEMA)
+        .await
+        .map_err(|_| anyhow!("processing database schema initialization failed"))
+}
+
 impl ProcessingOutbox {
     pub async fn connect(database_url: &str, endpoint: &str, bearer_token: &str) -> Result<Self> {
         let consumer = ProcessingClient::new(endpoint, bearer_token)?;
         let client = crate::coordination::connect(database_url).await?;
-        client
-            .batch_execute(SCHEMA)
-            .await
-            .map_err(|_| anyhow!("processing database schema initialization failed"))?;
+        initialize_schema(&client).await?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
             consumer,
@@ -457,7 +461,7 @@ fn event_objects(payload: serde_json::Value) -> Result<Vec<ObjectRef>> {
 
 /// A receipt names the event its session committed. A mismatch is corrupt or
 /// foreign state, not a storage-policy conflict the client could resolve.
-fn check_session_receipt(
+pub(crate) fn check_session_receipt(
     payload: serde_json::Value,
     hash: &str,
     size: u64,
@@ -473,7 +477,7 @@ fn check_session_receipt(
 
 /// Destinations a recorded intent requires, in finalization order. Only these
 /// buckets bind the intent: a configured adapter its mode never writes does not.
-fn required_destinations<'a>(
+pub(crate) fn required_destinations<'a>(
     mode: WriteMode,
     gcs_bucket: &'a str,
     b2_bucket: Option<&'a str>,
@@ -1053,6 +1057,7 @@ pub(crate) mod tests {
                 "application/octet-stream",
                 axum::body::Body::from(bytes.clone()),
                 &owner,
+                None,
             )
             .await;
             assert!(

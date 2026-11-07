@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct InboxStore {
-    database: Arc<Mutex<tokio_postgres::Client>>,
+    pub(crate) database: Arc<Mutex<tokio_postgres::Client>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,7 +115,11 @@ pub struct InboxRuntime {
     store: InboxStore,
     settings: Arc<InboxSettings>,
     deadline: std::time::Duration,
+    parent_gate: Option<Arc<parent_gate::Client>>,
 }
+
+#[path = "parent_gate.rs"]
+mod parent_gate;
 
 #[path = "inbox_http.rs"]
 mod http;
@@ -183,11 +187,18 @@ impl InboxStore {
             pipeline_version: input.pipeline_version,
         }))
     }
-    async fn from_client(client: tokio_postgres::Client) -> Result<Self> {
+    pub(crate) async fn from_client(client: tokio_postgres::Client) -> Result<Self> {
         client
             .batch_execute("SET statement_timeout='5s'; SET lock_timeout='3s';")
             .await
             .map_err(|_| anyhow!("inbox database limits initialization failed"))?;
+        client
+            .batch_execute(include_str!(
+                "../database/migrations/001_upload_coordination.sql"
+            ))
+            .await
+            .map_err(|_| anyhow!("upload session schema initialization failed"))?;
+        crate::outbox::initialize_schema(&client).await?;
         client
             .batch_execute(INBOX_SCHEMA)
             .await
@@ -196,6 +207,16 @@ impl InboxStore {
             .batch_execute(journal::SCHEMA)
             .await
             .map_err(|_| anyhow!("producer journal schema initialization failed"))?;
+        client
+            .batch_execute(parent_gate::SCHEMA)
+            .await
+            .map_err(|_| anyhow!("parent gate journal schema initialization failed"))?;
+        client
+            .batch_execute(include_str!(
+                "../database/migrations/006_original_write_authority.sql"
+            ))
+            .await
+            .map_err(|_| anyhow!("original preparation schema initialization failed"))?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
         })
@@ -549,3 +570,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "original_write_tests.rs"]
+mod original_write_tests;
