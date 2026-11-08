@@ -10,11 +10,51 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 
 const SCHEMA: &str = include_str!("../database/migrations/002_processing_outbox.sql");
+fn schema() -> String {
+    format!(
+        "{SCHEMA}\n{}",
+        include_str!("../database/migrations/007_sync_thumbnail_barrier.sql")
+    )
+}
 const SESSION_RECEIPT_EVENT: &str = "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1";
 
 #[derive(Debug, thiserror::Error)]
 #[error("Upload intent requires its recorded storage policy and destination mapping; retain the required providers or reconcile the intent")]
 pub struct IntentConflict;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Dual upload is pending verified thumbnail finalization; retry the same upload")]
+pub struct ThumbnailPending;
+
+pub struct DirectUploadIntent {
+    pub storage: MediaStorage,
+    pub thumbnail: Option<ThumbnailReservation>,
+}
+
+#[derive(Clone)]
+pub struct ThumbnailReservation {
+    generation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VerifiedThumbnail {
+    pub sha256: String,
+    pub size: u64,
+    pub objects: Vec<ObjectRef>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ThumbnailReceipt {
+    originals: Vec<ObjectRef>,
+    thumbnail: VerifiedThumbnail,
+}
+
+#[derive(Clone, Copy)]
+enum UploadAdmission {
+    Session,
+    Resume,
+    Direct,
+}
 
 #[derive(Clone)]
 pub struct ProcessingOutbox {
@@ -31,11 +71,12 @@ pub struct PendingUpload {
     pub mode: String,
     pub gcs_bucket: String,
     pub b2_bucket: Option<String>,
+    pub sync_thumbnail_pending: bool,
 }
 
 pub(crate) async fn initialize_schema(client: &Client) -> Result<()> {
     client
-        .batch_execute(SCHEMA)
+        .batch_execute(&schema())
         .await
         .map_err(|_| anyhow!("processing database schema initialization failed"))
 }
@@ -59,9 +100,16 @@ impl ProcessingOutbox {
         owner: &str,
         storage: &MediaStorage,
     ) -> Result<()> {
-        self.reserve_upload(hash, size, content_type, owner, storage, false)
-            .await
-            .map(|_| ())
+        self.reserve_upload(
+            hash,
+            size,
+            content_type,
+            owner,
+            storage,
+            UploadAdmission::Session,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Direct and mirror requests have no session policy of their own. Resume
@@ -74,8 +122,35 @@ impl ProcessingOutbox {
         owner: &str,
         storage: &MediaStorage,
     ) -> Result<MediaStorage> {
-        self.reserve_upload(hash, size, content_type, owner, storage, true)
-            .await
+        self.reserve_upload(
+            hash,
+            size,
+            content_type,
+            owner,
+            storage,
+            UploadAdmission::Resume,
+        )
+        .await
+        .map(|intent| intent.storage)
+    }
+
+    pub async fn begin_direct_upload(
+        &self,
+        hash: &str,
+        size: u64,
+        content_type: &str,
+        owner: &str,
+        storage: &MediaStorage,
+    ) -> Result<DirectUploadIntent> {
+        self.reserve_upload(
+            hash,
+            size,
+            content_type,
+            owner,
+            storage,
+            UploadAdmission::Direct,
+        )
+        .await
     }
 
     async fn reserve_upload(
@@ -85,8 +160,8 @@ impl ProcessingOutbox {
         content_type: &str,
         owner: &str,
         storage: &MediaStorage,
-        resume_recorded: bool,
-    ) -> Result<MediaStorage> {
+        admission: UploadAdmission,
+    ) -> Result<DirectUploadIntent> {
         let size =
             i64::try_from(size).map_err(|_| anyhow!("upload size exceeds database range"))?;
         let mode = serde_json::to_value(storage.mode)?
@@ -95,20 +170,88 @@ impl ProcessingOutbox {
             .to_owned();
         let gcs_bucket = storage.gcs_bucket();
         let b2_bucket = storage.b2_bucket();
-        let client = self.database.lock().await;
-        let row=client.query_one("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO UPDATE SET updated_at=now(), write_mode=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.write_mode ELSE upload_processing_intents.write_mode END, gcs_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.gcs_bucket ELSE upload_processing_intents.gcs_bucket END, b2_bucket=CASE WHEN upload_processing_intents.completed THEN EXCLUDED.b2_bucket ELSE upload_processing_intents.b2_bucket END, completed=upload_processing_intents.completed AND upload_processing_intents.write_mode=EXCLUDED.write_mode AND upload_processing_intents.gcs_bucket=EXCLUDED.gcs_bucket AND upload_processing_intents.b2_bucket IS NOT DISTINCT FROM EXCLUDED.b2_bucket WHERE upload_processing_intents.size=EXCLUDED.size RETURNING size,content_type,write_mode,gcs_bucket,b2_bucket",&[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
+        let mut client = self.database.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| anyhow!("upload intent transaction failed"))?;
+        tx.execute("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO NOTHING", &[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
+        let previous = tx.query_one("SELECT completed,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 FOR UPDATE", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
+        let changed = previous.get::<_, String>(1) != mode
+            || previous.get::<_, String>(2) != gcs_bucket
+            || previous.get::<_, Option<String>>(3).as_deref() != b2_bucket;
+        if previous.get::<_, bool>(0) && (changed || matches!(admission, UploadAdmission::Direct)) {
+            tx.execute("UPDATE upload_processing_intents SET write_mode=$3,gcs_bucket=$4,b2_bucket=$5,completed=false,sync_thumbnail_generation=NULL,sync_thumbnail_required=false,sync_thumbnail_receipt=NULL WHERE sha256=$1 AND owner=$2", &[&hash,&owner,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent readmission failed"))?;
+        }
+        let row = tx.query_one("SELECT size,content_type,write_mode,gcs_bucket,b2_bucket,sync_thumbnail_required,sync_thumbnail_generation FROM upload_processing_intents WHERE sha256=$1 AND owner=$2", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
         let recorded_mode: WriteMode = row.get::<_, String>(2).parse()?;
         let recorded_gcs: String = row.get(3);
         let recorded_b2: Option<String> = row.get(4);
         let available = required_destinations(recorded_mode, &recorded_gcs, recorded_b2.as_deref())
             .is_ok_and(|destinations| destinations_configured(storage, &destinations));
-        let compatible = available && (resume_recorded || recorded_mode == storage.mode);
+        let compatible = available
+            && (!matches!(admission, UploadAdmission::Session) || recorded_mode == storage.mode);
         if row.get::<_, i64>(0) != size || !compatible {
             return Err(IntentConflict.into());
         }
-        storage
+        let required = row.get::<_, bool>(5)
+            || (matches!(admission, UploadAdmission::Direct)
+                && recorded_mode == WriteMode::Dual
+                && size > 0
+                && size <= crate::thumbnail::MAX_SYNC_VIDEO_BYTES as i64
+                && crate::thumbnail::is_video_type(&row.get::<_, String>(1)));
+        let mut generation: Option<String> = row.get(6);
+        if required && generation.is_none() {
+            generation = Some(format!("{:032x}", rand::random::<u128>()));
+            tx.execute("UPDATE upload_processing_intents SET completed=false,sync_thumbnail_required=true,sync_thumbnail_generation=$3,sync_thumbnail_receipt=NULL WHERE sha256=$1 AND owner=$2", &[&hash,&owner,&generation]).await.map_err(|_|anyhow!("thumbnail reservation failed"))?;
+        }
+        tx.execute(
+            "UPDATE upload_processing_intents SET updated_at=now() WHERE sha256=$1 AND owner=$2",
+            &[&hash, &owner],
+        )
+        .await
+        .map_err(|_| anyhow!("upload intent scheduling failed"))?;
+        let storage = storage
             .with_mode(recorded_mode)
-            .map_err(|_| IntentConflict.into())
+            .map_err(|_| IntentConflict)?;
+        tx.commit()
+            .await
+            .map_err(|_| anyhow!("upload intent commit failed"))?;
+        Ok(DirectUploadIntent {
+            storage,
+            thumbnail: if required {
+                Some(ThumbnailReservation {
+                    generation: generation.ok_or(ThumbnailPending)?,
+                })
+            } else {
+                None
+            },
+        })
+    }
+
+    pub async fn record_thumbnail(
+        &self,
+        hash: &str,
+        owner: &str,
+        reservation: &ThumbnailReservation,
+        originals: Vec<ObjectRef>,
+        thumbnail: VerifiedThumbnail,
+    ) -> Result<()> {
+        let mut client = self.database.lock().await;
+        let tx = client.transaction().await.map_err(|_| ThumbnailPending)?;
+        let row = tx.query_opt("SELECT write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND sync_thumbnail_required AND sync_thumbnail_generation=$3 FOR UPDATE", &[&hash,&owner,&reservation.generation]).await.map_err(|_|ThumbnailPending)?.ok_or(ThumbnailPending)?;
+        let mode: WriteMode = row.get::<_, String>(0).parse()?;
+        let gcs_bucket: String = row.get(1);
+        let b2_bucket: Option<String> = row.get(2);
+        let expected = required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?;
+        let receipt = ThumbnailReceipt {
+            originals,
+            thumbnail,
+        };
+        validate_thumbnail_receipt(hash, &receipt, &expected)?;
+        tx.execute("UPDATE upload_processing_intents SET sync_thumbnail_receipt=$3 WHERE sha256=$1 AND owner=$2", &[&hash,&owner,&serde_json::to_value(receipt)?]).await.map_err(|_|ThumbnailPending)?;
+        tx.commit().await.map_err(|_| ThumbnailPending)?;
+        Ok(())
     }
 
     pub async fn enqueue_upload(
@@ -213,7 +356,7 @@ impl ProcessingOutbox {
         // MIME declarations may change on a retry of identical content. Retain
         // the first intent's metadata instead of rejecting a valid hash forever.
         let intent = transaction.query_opt(
-            "SELECT content_type,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND size=$3 FOR UPDATE",
+            "SELECT content_type,write_mode,gcs_bucket,b2_bucket,sync_thumbnail_required,sync_thumbnail_receipt FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND size=$3 FOR UPDATE",
             &[&hash, &owner, &stored_size],
         ).await.map_err(|_| anyhow!("upload intent lookup failed"))?
             .ok_or_else(|| anyhow!("processing event has no matching upload intent"))?;
@@ -222,6 +365,7 @@ impl ProcessingOutbox {
         let gcs_bucket: String = intent.get(2);
         let b2_bucket: Option<String> = intent.get(3);
         let expected = required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?;
+        let original_objects = objects.clone();
         let matches_intent = objects.len() == expected.len()
             && objects
                 .iter()
@@ -257,6 +401,22 @@ impl ProcessingOutbox {
             return Err(IntentConflict.into());
         }
         if !historical_replay {
+            if intent.get::<_, bool>(4) {
+                let receipt: ThumbnailReceipt = serde_json::from_value(
+                    intent
+                        .get::<_, Option<serde_json::Value>>(5)
+                        .ok_or(ThumbnailPending)?,
+                )
+                .map_err(|_| ThumbnailPending)?;
+                validate_thumbnail_receipt(
+                    hash,
+                    &receipt,
+                    &required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?,
+                )?;
+                if receipt.originals != original_objects {
+                    return Err(ThumbnailPending.into());
+                }
+            }
             transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
             let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
             if updated != 1 {
@@ -279,7 +439,7 @@ impl ProcessingOutbox {
     /// provider outcomes. It does not infer that missing local state means no bytes.
     pub async fn pending_intents(&self, limit: u32) -> Result<Vec<PendingUpload>> {
         let client = self.database.lock().await;
-        let rows=client.query("SELECT sha256,size,content_type,owner,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE NOT completed ORDER BY updated_at LIMIT $1",&[&(limit.min(1000) as i64)]).await.map_err(|_|anyhow!("upload intent scan failed"))?;
+        let rows=client.query("SELECT sha256,size,content_type,owner,write_mode,gcs_bucket,b2_bucket,sync_thumbnail_required AND sync_thumbnail_receipt IS NULL FROM upload_processing_intents WHERE NOT completed ORDER BY updated_at LIMIT $1",&[&(limit.min(1000) as i64)]).await.map_err(|_|anyhow!("upload intent scan failed"))?;
         Ok(rows
             .into_iter()
             .map(|row| PendingUpload {
@@ -290,6 +450,7 @@ impl ProcessingOutbox {
                 mode: row.get(4),
                 gcs_bucket: row.get(5),
                 b2_bucket: row.get(6),
+                sync_thumbnail_pending: row.get(7),
             })
             .collect())
     }
@@ -308,6 +469,9 @@ impl ProcessingOutbox {
             {
                 let db = self.database.lock().await;
                 db.execute("UPDATE upload_processing_intents SET updated_at=now() WHERE sha256=$1 AND owner=$2",&[&intent.sha256,&intent.owner]).await.map_err(|_|anyhow!("upload recovery scheduling failed"))?;
+            }
+            if intent.sync_thumbnail_pending {
+                continue;
             }
             if intent.size > budget {
                 continue;
@@ -377,14 +541,19 @@ impl ProcessingOutbox {
             // Background reconciliation never writes media: a lone surviving copy
             // could be racing erasure. Only an explicit upload retry may repair it.
             if objects.len() == modes.len() {
-                self.enqueue_upload(
-                    &intent.sha256,
-                    intent.size,
-                    &intent.content_type,
-                    &intent.owner,
-                    objects,
-                )
-                .await?;
+                let result = self
+                    .enqueue_upload(
+                        &intent.sha256,
+                        intent.size,
+                        &intent.content_type,
+                        &intent.owner,
+                        objects,
+                    )
+                    .await;
+                if result.as_ref().is_err_and(|e| e.is::<ThumbnailPending>()) {
+                    continue;
+                }
+                result?;
                 recovered += 1;
             }
         }
@@ -506,6 +675,40 @@ fn destinations_configured(
     })
 }
 
+fn validate_thumbnail_receipt(
+    hash: &str,
+    receipt: &ThumbnailReceipt,
+    expected: &[(StorageProvider, &str)],
+) -> Result<()> {
+    let matches = |objects: &[ObjectRef], key: &str| {
+        objects.len() == 2
+            && expected.len() == 2
+            && objects
+                .iter()
+                .zip(expected)
+                .all(|(object, (provider, bucket))| {
+                    object.provider == *provider
+                        && object.bucket == *bucket
+                        && object.key == key
+                        && object.version.as_ref().is_some_and(|v| !v.is_empty())
+                })
+    };
+    if !matches(&receipt.originals, hash)
+        || !matches(&receipt.thumbnail.objects, &format!("{hash}.jpg"))
+        || receipt.thumbnail.size == 0
+        || receipt.thumbnail.size > crate::thumbnail::MAX_SYNC_VIDEO_BYTES as u64
+        || receipt.thumbnail.sha256.len() != 64
+        || !receipt
+            .thumbnail
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ThumbnailPending.into());
+    }
+    Ok(())
+}
+
 fn retry_delay(attempt: i32) -> i64 {
     (5_i64.saturating_mul(1_i64 << attempt.clamp(0, 14))).min(86400)
 }
@@ -514,6 +717,346 @@ fn retry_delay(attempt: i32) -> i64 {
 pub(crate) mod tests {
     use super::*;
     static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn thumbnail_refs(hash: &str, version: &str) -> Vec<ObjectRef> {
+        vec![
+            (StorageProvider::Gcs, "fixture-gcs"),
+            (StorageProvider::B2, "fixture-b2"),
+        ]
+        .into_iter()
+        .map(|(provider, bucket)| ObjectRef {
+            provider,
+            bucket: bucket.into(),
+            key: hash.into(),
+            version: Some(version.into()),
+        })
+        .collect()
+    }
+
+    fn thumbnail_proof(hash: &str) -> VerifiedThumbnail {
+        VerifiedThumbnail {
+            sha256: "c".repeat(64),
+            size: 12,
+            objects: thumbnail_refs(&format!("{hash}.jpg"), "jpeg-v1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thumbnail_receipt_is_bound_to_original_versions_and_readmission() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processor.invalid/finalized", "fixture-token")
+                .await
+                .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        let first = outbox
+            .begin_direct_upload(&hash, 3, "Video/MP4; codecs=avc1", &owner, &storage)
+            .await
+            .unwrap()
+            .thumbnail
+            .unwrap();
+        let originals = thumbnail_refs(&hash, "original-v1");
+        let mut partial = thumbnail_proof(&hash);
+        partial.objects.pop();
+        assert!(outbox
+            .record_thumbnail(&hash, &owner, &first, originals.clone(), partial)
+            .await
+            .is_err());
+        assert!(outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals.clone())
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        outbox
+            .record_thumbnail(
+                &hash,
+                &owner,
+                &first,
+                originals.clone(),
+                thumbnail_proof(&hash),
+            )
+            .await
+            .unwrap();
+        assert!(outbox
+            .enqueue_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                thumbnail_refs(&hash, "original-v2")
+            )
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        // A pending retry retains its accepted dual mapping even after static
+        // admission changes, including when the retry declares a different MIME.
+        let gcs = storage.with_mode(WriteMode::Gcs).unwrap();
+        let retry = outbox
+            .begin_direct_upload(&hash, 3, "application/octet-stream", &owner, &gcs)
+            .await
+            .unwrap();
+        assert_eq!(retry.storage.mode, WriteMode::Dual);
+        assert_eq!(retry.thumbnail.unwrap().generation, first.generation);
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals.clone())
+            .await
+            .unwrap();
+        let repeated = outbox
+            .begin_direct_upload(&hash, 3, "video/mp4", &owner, &storage)
+            .await
+            .unwrap()
+            .thumbnail
+            .unwrap();
+        assert_ne!(
+            first.generation, repeated.generation,
+            "a completed direct admission must not reuse a prior thumbnail receipt"
+        );
+        assert!(outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals.clone())
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        outbox
+            .record_thumbnail(
+                &hash,
+                &owner,
+                &repeated,
+                originals.clone(),
+                thumbnail_proof(&hash),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals.clone())
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &gcs)
+            .await
+            .unwrap();
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![originals[0].clone()])
+            .await
+            .unwrap();
+        let second = outbox
+            .begin_direct_upload(&hash, 3, "video/mp4", &owner, &storage)
+            .await
+            .unwrap()
+            .thumbnail
+            .unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert!(outbox
+            .record_thumbnail(
+                &hash,
+                &owner,
+                &first,
+                originals.clone(),
+                thumbnail_proof(&hash)
+            )
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        assert!(outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals.clone())
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        outbox
+            .record_thumbnail(
+                &hash,
+                &owner,
+                &second,
+                originals.clone(),
+                thumbnail_proof(&hash),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, originals)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_thumbnail_barrier_scope_preserves_other_upload_paths() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processor.invalid/finalized", "fixture-token")
+                .await
+                .unwrap();
+        let dual = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        let gcs = dual.with_mode(WriteMode::Gcs).unwrap();
+        for (index, (size, mime, storage)) in [
+            (3, "video/mp4", &gcs),
+            (0, "video/mp4", &dual),
+            (3, "image/jpeg", &dual),
+            (
+                crate::thumbnail::MAX_SYNC_VIDEO_BYTES as u64 + 1,
+                "video/mp4",
+                &dual,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hash = format!("{index:064x}");
+            assert!(outbox
+                .begin_direct_upload(&hash, size, mime, &"b".repeat(64), storage)
+                .await
+                .unwrap()
+                .thumbnail
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_dual_original_waits_for_sync_thumbnail_before_finalization() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        use axum::{
+            http::{Method, StatusCode, Uri},
+            response::IntoResponse,
+            routing::any,
+            Json, Router,
+        };
+        use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
+        use sha2::{Digest, Sha256};
+        let bytes = bytes::Bytes::from_static(b"synthetic-invalid-video");
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let jpeg_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let availability = jpeg_available.clone();
+        let fixture_hash = hash.clone();
+        let fixture_bytes = bytes.clone();
+        let app = Router::new().route("/*path", any(move |method: Method, uri: Uri| {
+            let mut hash = fixture_hash.clone(); let mut bytes = fixture_bytes.clone(); let availability=availability.clone();
+            async move {
+                let thumbnail=uri.path().ends_with(".jpg");
+                if thumbnail { hash.push_str(".jpg"); bytes=bytes::Bytes::from_static(b"existing-synthetic-jpeg"); }
+                if method != Method::GET && method != Method::HEAD { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+                if uri.path().starts_with("/storage/") && !uri.query().unwrap_or_default().contains("alt=media") {
+                    return Json(serde_json::json!({"name":hash,"bucket":"fixture-gcs","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"fixture","size":bytes.len().to_string(),"contentType":"video/mp4"})).into_response();
+                }
+                if thumbnail && !uri.path().starts_with("/storage/") && !availability.load(std::sync::atomic::Ordering::SeqCst) {return StatusCode::NOT_FOUND.into_response();}
+                let mut response = bytes.clone().into_response();
+                response.headers_mut().insert("x-amz-version-id", "b2-v1".parse().unwrap());
+                response.headers_mut().insert("content-length", bytes.len().to_string().parse().unwrap());
+                response
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint.clone(),
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let b2 = crate::storage::B2Store::new(
+            "fixture-b2".into(),
+            "us-west-001".into(),
+            "fixture".into(),
+            "fixture".into(),
+        )
+        .unwrap()
+        .with_endpoint(endpoint);
+        let storage =
+            MediaStorage::new(WriteMode::Dual, Some(gcs), "fixture-gcs".into(), Some(b2)).unwrap();
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processor.invalid/finalized", "fixture-token")
+                .await
+                .unwrap();
+        let owner = "b".repeat(64);
+        let stored = super::super::stream_to_gcs_with_hash(
+            &storage,
+            Some(&outbox),
+            "video/mp4",
+            axum::body::Body::from(bytes.clone()),
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = outbox.database.lock().await;
+        let count: i64 = client
+            .query_one("SELECT count(*) FROM upload_processing_outbox", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, 0,
+            "verified originals alone must not finalize a direct dual video"
+        );
+        let complete: bool = client
+            .query_one(
+                "SELECT completed FROM upload_processing_intents WHERE sha256=$1",
+                &[&hash],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!complete);
+        drop(client);
+        assert_eq!(
+            outbox.pending_intents(10).await.unwrap().len(),
+            1,
+            "unverified thumbnails must remain visible as pending work"
+        );
+        let peer =
+            ProcessingOutbox::connect(&url, "https://processor.invalid/finalized", "fixture-token")
+                .await
+                .unwrap();
+        assert_eq!(peer.recover_intents(&storage, 10, 10000).await.unwrap(), 0);
+        let (reservation, originals) = stored.thumbnail_finalization.unwrap();
+        assert!(
+            super::super::extract_and_upload_thumbnail(
+                &storage,
+                "https://media.example",
+                &hash,
+                &bytes
+            )
+            .await
+            .is_err(),
+            "failed B2 JPEG must remain pending"
+        );
+        assert!(outbox
+            .enqueue_upload(
+                &hash,
+                bytes.len() as u64,
+                "video/mp4",
+                &owner,
+                originals.clone()
+            )
+            .await
+            .unwrap_err()
+            .is::<ThumbnailPending>());
+        jpeg_available.store(true, std::sync::atomic::Ordering::SeqCst);
+        let thumbnail = super::super::extract_and_upload_thumbnail(
+            &storage,
+            "https://media.example",
+            &hash,
+            &bytes,
+        )
+        .await
+        .unwrap();
+        outbox
+            .record_thumbnail(&hash, &owner, &reservation, originals, thumbnail.verified)
+            .await
+            .unwrap();
+        // Simulate a crash between durable thumbnail receipt and enqueue. A
+        // different process may now reconcile the exact original versions.
+        assert_eq!(peer.recover_intents(&storage, 10, 10000).await.unwrap(), 1);
+        assert!(peer.pending_intents(10).await.unwrap().is_empty());
+        server.abort();
+    }
 
     /// Anonymous GCS plus an optional B2 adapter; constructing it performs no I/O.
     pub(crate) fn fixture_storage(mode: WriteMode, b2_bucket: Option<&str>) -> MediaStorage {
@@ -575,7 +1118,7 @@ pub(crate) mod tests {
                         .batch_execute(include_str!("storage/multipart.sql"))
                         .await
                         .unwrap();
-                    client.batch_execute(SCHEMA).await.unwrap();
+                    client.batch_execute(&schema()).await.unwrap();
                     client
                         .batch_execute(include_str!(
                             "../database/migrations/001_upload_coordination.sql"
@@ -1223,7 +1766,7 @@ pub(crate) mod tests {
         let endpoint = format!("http://{}/finalized", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let db = crate::coordination::connect(&database_url).await.unwrap();
-        db.batch_execute(SCHEMA).await.unwrap();
+        db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
             consumer: ProcessingClient::new_for_test(&endpoint, "fixture-token").unwrap(),
@@ -1394,7 +1937,7 @@ pub(crate) mod tests {
         let gained_gcs_bucket =
             MediaStorage::new(WriteMode::B2, None, "fixture-gcs".into(), Some(b2)).unwrap();
         let db = crate::coordination::connect(&database_url).await.unwrap();
-        db.batch_execute(SCHEMA).await.unwrap();
+        db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
             consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
@@ -1545,7 +2088,7 @@ pub(crate) mod tests {
         let storage =
             MediaStorage::new(WriteMode::Dual, Some(gcs), "fixture-gcs".into(), Some(b2)).unwrap();
         let db = crate::coordination::connect(&database_url).await.unwrap();
-        db.batch_execute(SCHEMA).await.unwrap();
+        db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
             consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")

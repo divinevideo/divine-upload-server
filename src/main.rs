@@ -683,7 +683,9 @@ async fn handle_upload(
                 return response;
             }
             error!("Upload error: {}", e);
-            let status = if e.is::<outbox::IntentConflict>() {
+            let status = if e.is::<outbox::ThumbnailPending>() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if e.is::<outbox::IntentConflict>() {
                 StatusCode::CONFLICT
             } else if e.downcast_ref::<resources::ResourceError>().is_some() {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -692,13 +694,19 @@ async fn handle_upload(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (
+            let mut response = (
                 status,
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            response
         }
     }
 }
@@ -922,6 +930,7 @@ async fn process_upload(
         newly_stored,
         spooled_dimensions,
         storage: upload_storage,
+        thumbnail_finalization,
     } = stream_to_gcs_with_hash(
         &state.media_storage,
         state.processing_outbox.as_ref(),
@@ -935,8 +944,12 @@ async fn process_upload(
     )
     .await?;
 
-    // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
-    let thumbnail_url = if thumbnail::is_video_type(&content_type) && !all_bytes.is_empty() {
+    // GCS retains best-effort thumbnails. Protected dual requests cannot
+    // finalize until their exact original and thumbnail copies are recorded.
+    let thumbnail_url = if (thumbnail::is_video_type(&content_type)
+        || thumbnail_finalization.is_some())
+        && !all_bytes.is_empty()
+    {
         match extract_and_upload_thumbnail(
             &upload_storage,
             &state.config.cdn_base_url,
@@ -945,11 +958,40 @@ async fn process_upload(
         )
         .await
         {
-            Ok(url) => {
+            Ok(thumbnail) => {
+                if let Some((reservation, originals)) = thumbnail_finalization {
+                    let outbox = state
+                        .processing_outbox
+                        .as_ref()
+                        .ok_or(outbox::ThumbnailPending)?;
+                    outbox
+                        .record_thumbnail(
+                            &sha256_hash,
+                            &auth_event.pubkey,
+                            &reservation,
+                            originals.clone(),
+                            thumbnail.verified,
+                        )
+                        .await
+                        .map_err(|_| outbox::ThumbnailPending)?;
+                    outbox
+                        .enqueue_upload(
+                            &sha256_hash,
+                            size,
+                            &content_type,
+                            &auth_event.pubkey,
+                            originals,
+                        )
+                        .await
+                        .map_err(|_| outbox::ThumbnailPending)?;
+                }
                 info!("Generated thumbnail for {}", sha256_hash);
-                Some(url)
+                Some(thumbnail.url)
             }
             Err(e) => {
+                if thumbnail_finalization.is_some() {
+                    return Err(outbox::ThumbnailPending.into());
+                }
                 error!("Thumbnail extraction failed for {}: {}", sha256_hash, e);
                 None
             }
@@ -1047,6 +1089,7 @@ struct StoredUpload {
     newly_stored: bool,
     spooled_dimensions: Option<String>,
     storage: storage::MediaStorage,
+    thumbnail_finalization: Option<(outbox::ThumbnailReservation, Vec<storage::ObjectRef>)>,
 }
 
 async fn stream_to_gcs_with_hash(
@@ -1083,17 +1126,20 @@ async fn stream_to_gcs_with_hash(
             .await?;
         return Err(original_write::Error::Unavailable.into());
     }
-    let client = if let Some(outbox) = outbox {
-        outbox
-            .begin_or_resume_upload(&sha256_hash, total_size, content_type, owner, client)
-            .await?
+    let (client, thumbnail_reservation) = if let Some(outbox) = outbox {
+        let intent = outbox
+            .begin_direct_upload(&sha256_hash, total_size, content_type, owner, client)
+            .await?;
+        (intent.storage, intent.thumbnail)
     } else {
-        client.clone()
+        (client.clone(), None)
     };
     let written = client
         .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
         .await?;
-    if let Some(outbox) = outbox {
+    let thumbnail_finalization =
+        thumbnail_reservation.map(|reservation| (reservation, written.objects.clone()));
+    if let Some(outbox) = outbox.filter(|_| thumbnail_finalization.is_none()) {
         outbox
             .enqueue_upload(
                 &sha256_hash,
@@ -1114,7 +1160,8 @@ async fn stream_to_gcs_with_hash(
     } else {
         None
     };
-    let derivative_bytes = if thumbnail::is_video_type(content_type)
+    let derivative_bytes = if (thumbnail::is_video_type(content_type)
+        || thumbnail_finalization.is_some())
         && total_size <= thumbnail::MAX_SYNC_VIDEO_BYTES as u64
     {
         let original = tokio::fs::read(spool.path()).await?;
@@ -1132,6 +1179,7 @@ async fn stream_to_gcs_with_hash(
         newly_stored: written.newly_stored,
         spooled_dimensions,
         storage: client,
+        thumbnail_finalization,
     })
 }
 
@@ -1222,41 +1270,38 @@ async fn trigger_nsfw_scan(
     }
 }
 
-/// Extract thumbnail from video and upload to GCS
-/// Returns the thumbnail URL on success
+struct StoredThumbnail {
+    url: String,
+    verified: outbox::VerifiedThumbnail,
+}
+
+/// Extract or reuse a thumbnail, verifying every recorded destination.
 async fn extract_and_upload_thumbnail(
     client: &storage::MediaStorage,
     cdn_base_url: &str,
     hash: &str,
     video_data: &[u8],
-) -> Result<String> {
+) -> Result<StoredThumbnail> {
     let thumb_path = format!("{}.jpg", hash);
-    if client.stat(&thumb_path).await?.is_some() {
+    let bytes = if client.stat(&thumb_path).await?.is_some() {
         // Reuse a prior valid thumbnail rather than comparing a regenerated
         // JPEG (which may differ by input preparation or encoder version).
         // This explicit upload retry can still repair a missing dual replica.
-        let bytes = client.read(&thumb_path).await?;
-        client.put(&thumb_path, bytes, "image/jpeg", None).await?;
-        return Ok(format!("{}/{}.jpg", cdn_base_url, hash));
-    }
-    // Extract thumbnail using ffmpeg
-    let thumb_result = thumbnail::extract_thumbnail(video_data)?;
-
-    // Upload thumbnail to GCS with path: {hash}.jpg (same as video hash but with .jpg extension)
-    // This allows serving via CDN at media.divine.video/{hash}.jpg
-    let thumb_path = format!("{}.jpg", hash);
-
-    client
-        .put(
-            &thumb_path,
-            Bytes::from(thumb_result.data),
-            "image/jpeg",
-            None,
-        )
-        .await?;
-
-    // Return CDN URL for thumbnail - stored at {hash}.jpg, served via CDN
-    Ok(format!("{}/{}.jpg", cdn_base_url, hash))
+        client.read(&thumb_path).await?
+    } else {
+        Bytes::from(thumbnail::extract_thumbnail(video_data)?.data)
+    };
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let size = bytes.len() as u64;
+    let written = client.put(&thumb_path, bytes, "image/jpeg", None).await?;
+    Ok(StoredThumbnail {
+        url: format!("{}/{}.jpg", cdn_base_url, hash),
+        verified: outbox::VerifiedThumbnail {
+            sha256,
+            size,
+            objects: written.objects,
+        },
+    })
 }
 
 fn media_source_candidates(hash: &str) -> [String; 3] {
@@ -1940,7 +1985,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(url, "https://media.example/hash.jpg");
+        assert_eq!(url.url, "https://media.example/hash.jpg");
         server.abort();
     }
 
