@@ -4,7 +4,11 @@ For new direct-upload intents with an accepted dual storage policy, a recognized
 video MIME type, and nonempty input no larger than 100 MiB, original finalization
 also requires a durable synchronous-thumbnail receipt. GCS-only uploads retain their existing
 best-effort thumbnail behavior. Large videos, resumable uploads, mirrors,
-migration and on-demand generation are outside this synchronous requirement.
+migration and on-demand generation do not establish a new synchronous
+requirement. When another route reuses the same owner's pending protected
+intent, it retains the accepted requirement and cannot bypass it. An explicit
+direct retry must supply the missing thumbnail receipt before that shared
+intent can finalize.
 
 Before original storage I/O, the uploader reserves this requirement in the
 existing PostgreSQL intent. The reservation retains the accepted destination
