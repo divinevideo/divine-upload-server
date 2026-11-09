@@ -567,25 +567,7 @@ impl ProcessingOutbox {
     /// to GCS) must not drop a destination this media already requires.
     pub async fn source_objects(&self, hash: &str) -> Result<Vec<ObjectRef>> {
         let database = self.database.lock().await;
-        let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
-            return Ok(Vec::new());
-        };
-        let mut objects = event_objects(row.get(0))?;
-        for provider in [StorageProvider::Gcs, StorageProvider::B2] {
-            if objects.iter().any(|object| object.provider == provider) {
-                continue;
-            }
-            let recorded = serde_json::json!({ "provider": provider });
-            let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 AND (payload->'source' @> $2 OR payload->'replicas' @> jsonb_build_array($2)) ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash, &recorded]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
-            if let Some(row) = row {
-                objects.extend(
-                    event_objects(row.get(0))?
-                        .into_iter()
-                        .filter(|object| object.provider == provider),
-                );
-            }
-        }
-        Ok(objects)
+        source_objects_from_client(&database, hash).await
     }
 
     pub async fn dispatch_once(&self, limit: u32) -> Result<u64> {
@@ -620,6 +602,34 @@ impl ProcessingOutbox {
 }
 
 /// A stored event's verified copies, its authoritative source first.
+/// Accepted finalization history, with the newest event's source first.
+/// Missing providers may be appended from older events. This is not current
+/// provider selection, policy approval, or a storage/erasure fence.
+pub(crate) async fn source_objects_from_client(
+    database: &Client,
+    hash: &str,
+) -> Result<Vec<ObjectRef>> {
+    let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
+            return Ok(Vec::new());
+        };
+    let mut objects = event_objects(row.get(0))?;
+    for provider in [StorageProvider::Gcs, StorageProvider::B2] {
+        if objects.iter().any(|object| object.provider == provider) {
+            continue;
+        }
+        let recorded = serde_json::json!({ "provider": provider });
+        let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 AND (payload->'source' @> $2 OR payload->'replicas' @> jsonb_build_array($2)) ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash, &recorded]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
+        if let Some(row) = row {
+            objects.extend(
+                event_objects(row.get(0))?
+                    .into_iter()
+                    .filter(|object| object.provider == provider),
+            );
+        }
+    }
+    Ok(objects)
+}
+
 fn event_objects(payload: serde_json::Value) -> Result<Vec<ObjectRef>> {
     let event: MediaFinalizedV1 = serde_json::from_value(payload)
         .map_err(|_| anyhow!("Stored processing source is invalid"))?;
