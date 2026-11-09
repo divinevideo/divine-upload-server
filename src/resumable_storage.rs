@@ -236,6 +236,13 @@ pub struct MediaResumableBackend {
     database: Option<Arc<tokio_postgres::Client>>,
 }
 impl MediaResumableBackend {
+    pub(crate) fn finalization_storage(&self, session: &UploadSession) -> Result<MediaStorage> {
+        if session.session_url == "staged-v1" {
+            self.staged_store(&session.temp_object)
+        } else {
+            self.storage.with_mode(WriteMode::Gcs)
+        }
+    }
     fn legacy(&self) -> Result<&GcsResumableBackend> {
         self.legacy
             .as_ref()

@@ -144,7 +144,7 @@ pub(super) async fn read_attempt<C: GenericClient + Sync>(
     id: &str,
 ) -> Result<Option<Attempt>> {
     let Some(row) = client.query_opt(
-        "SELECT a.processing_job_id,a.lease_generation,a.input_revision,a.input,a.phase,COALESCE((SELECT jsonb_agg(jsonb_build_object('filename',o.filename,'target',o.target,'sha256',o.sha256,'size',o.size,'content_type',o.content_type,'metadata',o.metadata) ORDER BY o.position) FROM media_storage_operations o WHERE o.attempt_id=a.attempt_id),'[]'::jsonb) FROM media_storage_attempts a WHERE attempt_id=$1",
+        "SELECT a.processing_job_id,a.lease_generation,a.input_revision,a.input,a.phase,COALESCE((SELECT jsonb_agg(jsonb_build_object('filename',o.filename,'target',o.target,'sha256',o.sha256,'size',o.size,'content_type',o.content_type,'metadata',o.metadata) ORDER BY o.position) FROM media_storage_operations o WHERE o.attempt_id=a.attempt_id),'[]'::jsonb) FROM media_storage_attempts a WHERE attempt_id=$1 AND subject_kind='producer'",
         &[&id],
     ).await? else { return Ok(None); };
     let input: ProcessingInput = serde_json::from_value(row.get(3))?;

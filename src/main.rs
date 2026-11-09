@@ -1,6 +1,8 @@
 // ABOUTME: Rust upload service for Blossom blob uploads
 // ABOUTME: Handles resumable sessions, streaming upload to GCS, and media follow-up hooks
 
+mod original_write;
+
 mod coordination;
 mod inbox;
 mod media_type;
@@ -149,6 +151,7 @@ fn gcs_compatibility(mode: storage::WriteMode, value: Option<&str>) -> Result<bo
 
 // App state shared across handlers
 struct AppState {
+    original_write: Option<original_write::Runtime>,
     media_storage: storage::MediaStorage,
     processing_outbox: Option<outbox::ProcessingOutbox>,
     resumable_runtime: resumable::ResumableRuntime,
@@ -416,6 +419,8 @@ async fn main() -> Result<()> {
         .build()
         .expect("failed to build HTTP client");
 
+    let original_enabled =
+        original_write::enabled(env::var("MEDIA_ORIGINAL_WRITE_ENABLED").ok().as_deref())?;
     let database_url = env::var("COORDINATION_DATABASE_URL").ok();
     media_storage
         .initialize_coordination(database_url.as_deref())
@@ -424,7 +429,7 @@ async fn main() -> Result<()> {
         env::var("MEDIA_FINALIZED_URL").ok(),
         env::var("MEDIA_FINALIZED_TOKEN").ok(),
     ) {
-        (None, None) if config.media_write_provider == "gcs" => None,
+        (None, None) if config.media_write_provider == "gcs" || original_enabled => None,
         (Some(endpoint), Some(token)) => Some(
             outbox::ProcessingOutbox::connect(
                 database_url.as_deref().ok_or_else(|| {
@@ -446,6 +451,12 @@ async fn main() -> Result<()> {
         gcs_client.clone(),
         config.gcs_bucket.clone(),
         database_url.as_deref(),
+    )
+    .await?;
+    let original_write = original_write::Runtime::configured(
+        database_url.as_deref(),
+        media_storage.clone(),
+        resumable_runtime.backend.clone(),
     )
     .await?;
     let cleanup_runtime = resumable_runtime.clone();
@@ -495,6 +506,7 @@ async fn main() -> Result<()> {
     }
 
     let state = Arc::new(AppState {
+        original_write,
         media_storage,
         processing_outbox,
         resumable_runtime,
@@ -667,6 +679,9 @@ async fn handle_upload(
     match process_upload(state, headers, body).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
+            if let Some(response) = original_write::error_response(&e) {
+                return response;
+            }
             error!("Upload error: {}", e);
             let status = if e.is::<outbox::ThumbnailPending>() {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -709,6 +724,7 @@ fn resumable_manager(
         state.config.resumable_session_ttl_secs,
     )
     .with_outbox(state.processing_outbox.clone())
+    .with_original_write(state.original_write.clone())
 }
 
 async fn handle_resumable_init(
@@ -845,8 +861,8 @@ async fn handle_resumable_complete(
     };
 
     let manager = resumable_manager(state.as_ref());
-    match manager
-        .complete_session(&upload_id, &auth_event.pubkey)
+    let mut result = match manager
+        .complete_authorized_session(&upload_id, &auth_event)
         .await
     {
         Ok(response) => {
@@ -861,7 +877,14 @@ async fn handle_resumable_complete(
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => resumable_error_response(error),
+    };
+    if state.original_write.is_some() {
+        result.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
     }
+    result
 }
 
 async fn handle_resumable_abort(
@@ -914,6 +937,10 @@ async fn process_upload(
         &content_type,
         body,
         &auth_event.pubkey,
+        state
+            .original_write
+            .as_ref()
+            .map(|runtime| (runtime, &auth_event)),
     )
     .await?;
 
@@ -1071,6 +1098,7 @@ async fn stream_to_gcs_with_hash(
     content_type: &str,
     body: Body,
     owner: &str,
+    original: Option<(&original_write::Runtime, &NostrEvent)>,
 ) -> Result<StoredUpload> {
     use tokio::io::AsyncWriteExt;
     let spool = NamedTempFile::new()?;
@@ -1089,6 +1117,15 @@ async fn stream_to_gcs_with_hash(
     }
     file.flush().await?;
     let sha256_hash = hex::encode(hasher.finalize());
+    if let Some((original, auth)) = original {
+        if auth.pubkey != owner {
+            return Err(original_write::Error::Invalid.into());
+        }
+        original
+            .prepare_direct(auth, &sha256_hash, total_size, content_type)
+            .await?;
+        return Err(original_write::Error::Unavailable.into());
+    }
     let (client, thumbnail_reservation) = if let Some(outbox) = outbox {
         let intent = outbox
             .begin_direct_upload(&sha256_hash, total_size, content_type, owner, client)
@@ -2029,8 +2066,12 @@ mod tests {
         assert!(super::gcs_compatibility(WriteMode::B2, Some("invalid")).is_err());
     }
 
-    fn test_state(transcriber_url: Option<&str>, transcribe_slots: usize) -> Arc<AppState> {
+    pub(crate) fn test_state(
+        transcriber_url: Option<&str>,
+        transcribe_slots: usize,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
+            original_write: None,
             processing_outbox: None,
             resumable_runtime: resumable::ResumableRuntime::legacy_for_test(),
             media_storage: storage::MediaStorage::new(
@@ -3218,6 +3259,9 @@ async fn handle_migrate(
     match process_migrate(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
+            if let Some(response) = original_write::error_response(&e) {
+                return response;
+            }
             error!("Migration error: {}", e);
             (
                 if e.is::<outbox::IntentConflict>() {
@@ -3237,6 +3281,9 @@ async fn handle_migrate(
 }
 
 async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Result<MigrateResponse> {
+    if state.original_write.is_some() {
+        return Err(original_write::Error::Unavailable.into());
+    }
     info!("Migration request for: {}", request.source_url);
 
     // Validate URL is from allowed Blossom/CDN sources
