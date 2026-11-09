@@ -92,6 +92,7 @@ All configuration comes from environment variables. The table below lists the co
 | `CDN_BASE_URL` | `https://media.divine.video` | Base URL for returned blob and thumbnail URLs. |
 | `UPLOAD_BASE_URL` | `https://upload.divine.video` | Base URL used to build opaque session `uploadUrl`s. |
 | `PORT` | `8080` | Listen port. |
+| `COORDINATION_DATABASE_CA_FILE` | — | Optional public PEM CA bundle for the coordination database; adds trust alongside OS roots while retaining chain and hostname verification. |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
@@ -107,6 +108,15 @@ All configuration comes from environment variables. The table below lists the co
 On the chunk `PUT` path the server independently caps the collected body at 16 MiB and shares the `MAX_CONCURRENT_UPLOADS` admission slots. A chunk must also satisfy that the `Content-Range` total equals the session's declared size, that the range lies inside that size, that the range start equals the session's next offset, that the range length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size does not reject larger aligned chunks within the 16 MiB body cap and the declared size.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
+
+Coordination connections upgrade `sslmode=prefer` to required TLS. A configured
+CA file must contain valid PEM certificates within 1 MiB; unreadable, empty or
+malformed bundles fail closed. A configured CA file with `sslmode=disable` is
+rejected. Without a CA file, explicit plaintext remains available only to local
+development endpoints. Use a direct, session-safe PostgreSQL endpoint: the
+existing advisory locks are not compatible with transaction pooling. Public CA
+distribution, approved database references and credential bindings are separate
+deployment prerequisites; this option creates none of them.
 
 ## B2 and dual-write transition
 
