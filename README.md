@@ -179,6 +179,14 @@ persists attempt nonces and immutable seven-artifact plans. Journal scope cannot
 dispatch provider writes or commit new processing results without the remaining
 authenticated parent-exclusion integration.
 
+The default-off [original-upload preparation boundary](docs/contracts/original-write-preparation-v1.md)
+records signed upload authorization and accepted storage destinations before
+original finalization. `MEDIA_ORIGINAL_WRITE_ENABLED=true` requires PostgreSQL
+and deliberately returns unavailable before new original provider I/O; it does
+not enable upload execution. Existing committed resumable receipts remain
+readable. Keep this flag off until the shared writer/policy and settlement
+integration is complete.
+
 ---
 
 Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)

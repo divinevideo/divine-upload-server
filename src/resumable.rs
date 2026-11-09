@@ -289,6 +289,7 @@ pub struct ResumableManager<B, S> {
     chunk_size: u64,
     session_ttl_secs: u64,
     outbox: Option<crate::outbox::ProcessingOutbox>,
+    original_write: Option<crate::original_write::Runtime>,
 }
 
 impl<B, S> ResumableManager<B, S>
@@ -312,9 +313,27 @@ where
             chunk_size,
             session_ttl_secs,
             outbox: None,
+            original_write: None,
         }
     }
 
+    pub(crate) fn with_original_write(
+        mut self,
+        runtime: Option<crate::original_write::Runtime>,
+    ) -> Self {
+        self.original_write = runtime;
+        self
+    }
+    pub(crate) async fn complete_authorized_session(
+        &self,
+        id: &str,
+        auth: &crate::NostrEvent,
+    ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
+        if self.original_write.is_none() {
+            return self.complete_session(id, &auth.pubkey).await;
+        }
+        self.complete_inner(id, &auth.pubkey, Some(auth)).await
+    }
     pub fn with_outbox(mut self, outbox: Option<crate::outbox::ProcessingOutbox>) -> Self {
         self.outbox = outbox;
         self
@@ -485,6 +504,41 @@ where
         upload_id: &str,
         owner: &str,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
+        self.complete_inner(upload_id, owner, None).await
+    }
+    async fn complete_inner(
+        &self,
+        upload_id: &str,
+        owner: &str,
+        auth: Option<&crate::NostrEvent>,
+    ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
+        if let Some(runtime) = &self.original_write {
+            return match runtime.prepare_session(upload_id, owner, auth).await {
+                Ok(crate::original_write::SessionPreparation::Committed(session)) => Ok(self
+                    .build_complete_upload_response(
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.content_type,
+                        false,
+                    )),
+                Ok(crate::original_write::SessionPreparation::Prepared) => {
+                    Err(ResumableError::Unavailable(
+                        crate::original_write::Error::Unavailable.to_string(),
+                    ))
+                }
+                Err(error) => Err(match error.downcast_ref::<crate::original_write::Error>() {
+                    Some(crate::original_write::Error::Conflict) => {
+                        ResumableError::Conflict(error.to_string())
+                    }
+                    Some(crate::original_write::Error::Invalid) => {
+                        ResumableError::Unauthorized(error.to_string())
+                    }
+                    _ => ResumableError::Unavailable(
+                        crate::original_write::Error::Unavailable.to_string(),
+                    ),
+                }),
+            };
+        }
         let _guard = self.store.lock(upload_id).await.map_err(internal_error)?;
         let mut session = self
             .store
@@ -1072,7 +1126,7 @@ fn random_hex(num_bytes: usize) -> String {
     hex::encode(bytes)
 }
 
-fn now_epoch_secs() -> u64 {
+pub(crate) fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
