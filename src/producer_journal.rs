@@ -85,19 +85,19 @@ struct PlannedArtifact {
 #[derive(Serialize)]
 pub(super) struct Attempt {
     attempt_id: String,
-    processing_job_id: String,
-    lease_generation: i64,
-    input_revision: i64,
+    pub(super) processing_job_id: String,
+    pub(super) lease_generation: i64,
+    pub(super) input_revision: i64,
     source: ObjectRef,
-    sha256: String,
+    pub(super) sha256: String,
     size: u64,
     content_type_hint: String,
     pipeline_version: u32,
-    phase: String,
+    pub(super) phase: String,
     artifacts: Vec<PlannedArtifact>,
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     id.len() == 32
         && id
             .bytes()
@@ -114,7 +114,10 @@ fn validate_lease(lease: &Lease) -> Result<()> {
     Ok(())
 }
 
-async fn live_job(client: &tokio_postgres::Transaction<'_>, lease: &Lease) -> Result<()> {
+pub(super) async fn live_job(
+    client: &tokio_postgres::Transaction<'_>,
+    lease: &Lease,
+) -> Result<()> {
     validate_lease(lease)?;
     if client
         .query_opt(
@@ -136,7 +139,10 @@ async fn live_job(client: &tokio_postgres::Transaction<'_>, lease: &Lease) -> Re
     Ok(())
 }
 
-async fn read_attempt<C: GenericClient + Sync>(client: &C, id: &str) -> Result<Option<Attempt>> {
+pub(super) async fn read_attempt<C: GenericClient + Sync>(
+    client: &C,
+    id: &str,
+) -> Result<Option<Attempt>> {
     let Some(row) = client.query_opt(
         "SELECT a.processing_job_id,a.lease_generation,a.input_revision,a.input,a.phase,COALESCE((SELECT jsonb_agg(jsonb_build_object('filename',o.filename,'target',o.target,'sha256',o.sha256,'size',o.size,'content_type',o.content_type,'metadata',o.metadata) ORDER BY o.position) FROM media_storage_operations o WHERE o.attempt_id=a.attempt_id),'[]'::jsonb) FROM media_storage_attempts a WHERE attempt_id=$1",
         &[&id],

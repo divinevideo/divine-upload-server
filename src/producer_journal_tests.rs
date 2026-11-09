@@ -78,6 +78,7 @@ async fn fixture() -> Option<(InboxRuntime, InboxRuntime, Assignment)> {
         store,
         settings: Arc::new(settings(true)),
         deadline: std::time::Duration::from_secs(10),
+        parent_gate: None,
     };
     Some((runtime(one), runtime(two), assignment))
 }

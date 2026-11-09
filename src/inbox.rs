@@ -115,7 +115,11 @@ pub struct InboxRuntime {
     store: InboxStore,
     settings: Arc<InboxSettings>,
     deadline: std::time::Duration,
+    parent_gate: Option<Arc<parent_gate::Client>>,
 }
+
+#[path = "parent_gate.rs"]
+mod parent_gate;
 
 #[path = "inbox_http.rs"]
 mod http;
@@ -196,6 +200,10 @@ impl InboxStore {
             .batch_execute(journal::SCHEMA)
             .await
             .map_err(|_| anyhow!("producer journal schema initialization failed"))?;
+        client
+            .batch_execute(parent_gate::SCHEMA)
+            .await
+            .map_err(|_| anyhow!("parent gate journal schema initialization failed"))?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
         })

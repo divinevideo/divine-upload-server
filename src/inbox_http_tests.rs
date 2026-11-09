@@ -12,6 +12,8 @@ async fn producer_journal_routes_are_disabled_by_default() {
         "/internal/media-processing/attempts/prepare",
         "/internal/media-processing/attempts/inspect",
         "/internal/media-processing/attempts/dispatch",
+        "/internal/media-processing/attempts/gate/claim",
+        "/internal/media-processing/attempts/gate/inspect",
     ] {
         let response = router(None)
             .oneshot(request(path, "fixture-worker-token", "", b"{}".to_vec()))
@@ -49,6 +51,7 @@ async fn runtime() -> Option<InboxRuntime> {
             producer_journal_enabled: false,
         }),
         deadline: std::time::Duration::from_secs(10),
+        parent_gate: None,
     })
 }
 
