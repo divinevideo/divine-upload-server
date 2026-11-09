@@ -39,7 +39,7 @@ fn tls_connector(ca_file: Option<&std::path::Path>) -> Result<native_tls::TlsCon
                 .find(END)
                 .ok_or_else(|| anyhow!("invalid coordination CA bundle"))?
                 + END.len();
-            let certificate = native_tls::Certificate::from_pem(remaining[..end].as_bytes())
+            let certificate = native_tls::Certificate::from_pem(&remaining.as_bytes()[..end])
                 .map_err(|_| anyhow!("invalid coordination CA certificate"))?;
             builder.add_root_certificate(certificate);
             remaining = remaining[end..].trim();
