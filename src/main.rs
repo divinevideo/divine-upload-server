@@ -3472,7 +3472,11 @@ async fn finish_migrate_storage(
         None
     };
     let processing_outbox = state.processing_outbox.as_ref().or(historical.as_ref());
-    let trusted_owner = migration_owner(request.owner.as_deref(), processing_outbox.is_some());
+    let has_processing_history = state.media_storage.coordination_url().await.is_some();
+    let trusted_owner = migration_owner(
+        request.owner.as_deref(),
+        processing_outbox.is_some() || has_processing_history,
+    );
     let owner = trusted_owner.unwrap_or("");
     let resolved = outbox::resolve_admission(
         &state.media_storage,

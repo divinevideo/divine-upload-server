@@ -167,6 +167,8 @@ otherwise an existing PostgreSQL contract retains its accepted policy; otherwise
 the current mode selects new admission. Contradictory accepted records fail
 without rewriting either policy. This precedence also applies when an existing
 outbox is configured during GCS rollback.
+Mirror processing registrations remain anonymous with retained history, whether
+or not a dispatcher is configured.
 Completed historical source contracts are read independently of dispatcher
 availability for on-demand thumbnails. Event provenance is retained: a B2-only
 event combined with an older GCS-only event keeps the historical dual ordering;

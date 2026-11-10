@@ -17,6 +17,77 @@ struct Copy {
     owner: Option<String>,
     mime: String,
 }
+
+#[tokio::test]
+async fn mirror_registration_stays_anonymous_with_retained_history() {
+    for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
+        for global in [false, true] {
+            let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                return;
+            };
+            let outbox = crate::outbox::ProcessingOutbox::connect(
+                &url,
+                "https://processor.invalid/finalized",
+                "fixture-token",
+            )
+            .await
+            .unwrap();
+            let f = Fixture::new().await;
+            let owner = "e".repeat(64);
+            let hash = hex::encode(Sha256::digest(b"original"));
+            outbox
+                .begin_upload(
+                    &hash,
+                    8,
+                    "application/octet-stream",
+                    &owner,
+                    &f.storage.with_mode(WriteMode::B2).unwrap(),
+                )
+                .await
+                .unwrap();
+            let configured = f.storage.with_mode(mode).unwrap();
+            *configured.database_url.lock().await = Some(url.clone());
+            let mut state = crate::tests::test_state(None, 1);
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.media_storage = configured;
+            mutable.processing_outbox = global.then_some(outbox);
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), b"original").unwrap();
+            crate::finish_migrate_storage(
+                &state,
+                &crate::MigrateRequest {
+                    source_url: "https://cdn.divine.video/fixture".into(),
+                    expected_hash: Some(hash.clone()),
+                    owner: Some(owner.clone()),
+                },
+                hash.clone(),
+                8,
+                "application/octet-stream".into(),
+                file.path(),
+            )
+            .await
+            .unwrap();
+            let db = crate::coordination::connect(&url).await.unwrap();
+            assert!(!db
+                .query_one(
+                    "SELECT completed FROM upload_processing_intents WHERE sha256=$1 AND owner=$2",
+                    &[&hash, &owner],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0));
+            let rows = db
+                .query("SELECT payload FROM upload_processing_outbox", &[])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(global));
+            for row in rows {
+                let payload: serde_json::Value = row.get(0);
+                assert!(payload["owner"].is_null());
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct Objects {
     records: std::collections::HashMap<String, (i64, Bytes)>,
