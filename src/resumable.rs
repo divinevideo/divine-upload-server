@@ -118,6 +118,9 @@ pub struct UploadSessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadSession {
+    /// Server-recorded processing disposition at admission; absent in old manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_outbox_required: Option<bool>,
     #[serde(default)]
     pub revision: i64,
     #[serde(default)]
@@ -366,6 +369,7 @@ where
         let expires_at_epoch_secs = now_epoch_secs().saturating_add(self.session_ttl_secs);
 
         let session = UploadSession {
+            processing_outbox_required: Some(self.outbox.is_some()),
             revision: 0,
             chunk_size: self.chunk_size,
             upload_id: upload_id.clone(),
@@ -566,7 +570,11 @@ where
             return Err(ResumableError::Gone("Upload session expired".to_string()));
         }
 
-        let historical = if self.outbox.is_none() {
+        let configured = self
+            .outbox
+            .as_ref()
+            .filter(|_| session.processing_outbox_required != Some(false));
+        let historical = if configured.is_none() {
             self.backend
                 .historical_processing(&session)
                 .await
@@ -574,7 +582,7 @@ where
         } else {
             None
         };
-        let outbox = self.outbox.as_ref().or(historical.as_ref());
+        let outbox = configured.or(historical.as_ref());
         if session.next_offset != session.declared_size {
             return Err(ResumableError::Conflict(format!(
                 "Upload incomplete: {} of {} bytes committed",
@@ -741,6 +749,16 @@ where
     }
 
     async fn cleanup_expired_session(&self, session: &UploadSession) {
+        // Resolve before any cleanup. On failure keep the discovery record and
+        // its receipt together for a later pass under the original configuration.
+        let historical = if self.outbox.is_none() {
+            match self.backend.historical_processing(session).await {
+                Ok(outbox) => outbox,
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         if session.finalized_object.is_none()
             && (self.backend.cancel_session(session).await.is_err()
                 || self
@@ -752,7 +770,7 @@ where
             return;
         }
         // Before the session, so a failure leaves both for the background sweep.
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = self.outbox.as_ref().or(historical.as_ref()) {
             if outbox
                 .forget_session_receipt(&session.upload_id)
                 .await
@@ -1270,7 +1288,7 @@ fn is_video_content_type(content_type: &str) -> bool {
 pub struct SessionBusy;
 
 fn internal_error(error: anyhow::Error) -> ResumableError {
-    if error.is::<SessionBusy>() {
+    if error.is::<SessionBusy>() || error.is::<crate::outbox::HistoricalSessionUnavailable>() {
         ResumableError::Unavailable(error.to_string())
     } else if error.is::<crate::outbox::IntentConflict>() {
         ResumableError::Conflict(error.to_string())

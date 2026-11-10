@@ -333,10 +333,14 @@ impl ResumableBackend for MediaResumableBackend {
                 &session.final_sha256,
                 &session.owner,
                 matches!(mode, WriteMode::B2 | WriteMode::Dual),
+                session.processing_outbox_required,
             )
             .await;
         }
 
+        if session.processing_outbox_required == Some(true) {
+            return Err(crate::outbox::HistoricalSessionUnavailable.into());
+        }
         Ok(None)
     }
     async fn is_committed_retry(
@@ -695,6 +699,7 @@ mod tests {
     }
     fn session() -> UploadSession {
         UploadSession {
+            processing_outbox_required: None,
             revision: 0,
             chunk_size: 1024 * 1024,
             upload_id: format!("test_{}", random_hex(12)),

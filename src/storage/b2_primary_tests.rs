@@ -1407,7 +1407,7 @@ async fn b2_primary_review_mirror_none_outbox_preserves_anonymous_b2_intent() {
     assert_eq!(payload["source"]["provider"], "b2");
 }
 #[tokio::test]
-async fn b2_primary_review_primary_session_completes_with_historical_outbox_after_rollback() {
+async fn b2_primary_review_primary_session_keeps_legacy_processing_after_outbox_rollback() {
     use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
     let Some(url) = crate::outbox::tests::isolated_database_url().await else {
         return;
@@ -1481,6 +1481,7 @@ async fn b2_primary_review_primary_session_completes_with_historical_outbox_afte
         .await
         .expect("exact B2+GCS receipts must survive rollback/outbox wiring");
     assert_eq!(result.sha256, hash);
+    assert!(!result.processing_via_outbox);
     assert!(
         !manager
             .complete_session(&init.upload_id, &owner)
@@ -1497,7 +1498,7 @@ async fn b2_primary_review_primary_session_completes_with_historical_outbox_afte
         .await
         .unwrap()
         .get::<_, i64>(0),
-        1
+        0
     );
     assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
 }
@@ -1579,6 +1580,7 @@ async fn b2_primary_review_old_staged_session_retains_its_historical_processing_
     .await
     .unwrap();
     let session = UploadSession {
+        processing_outbox_required: None,
         revision: 0,
         chunk_size: 1024,
         upload_id: "up_historical".into(),
@@ -2666,4 +2668,383 @@ async fn b2_primary_fifth_review_explicit_single_event_keeps_b2_authoritative_or
             WriteMode::B2Primary
         );
     }
+}
+
+async fn native_first_completion_migration(
+    remove_birth_proof: bool,
+    enabled: bool,
+    configured_after: bool,
+) {
+    use crate::resumable::{
+        ResumableError, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
+    };
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let old = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let owner = "e".repeat(64);
+    let hash = hex::encode(Sha256::digest(b"original"));
+    let runtime = ResumableRuntime::new(
+        f.storage.with_mode(WriteMode::Gcs).unwrap(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        Some(&url),
+    )
+    .await
+    .unwrap();
+    let original = ResumableManager::new(
+        runtime.backend,
+        runtime.store,
+        "https://upload.invalid",
+        "https://media.invalid",
+        256 * 1024,
+        300,
+    )
+    .with_outbox(enabled.then_some(old.clone()));
+    let init = original
+        .init_session(
+            &owner,
+            ResumableUploadInitRequest {
+                sha256: hash,
+                size: 8,
+                content_type: "application/octet-stream".into(),
+                file_name: None,
+            },
+        )
+        .await
+        .unwrap();
+    original
+        .upload_chunk(
+            &init.upload_id,
+            Some(&init.required_headers["Authorization"]),
+            "bytes 0-7/8",
+            Bytes::from_static(b"original"),
+        )
+        .await
+        .unwrap();
+    let db = crate::coordination::connect(&url).await.unwrap();
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM upload_processing_intents", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    if remove_birth_proof {
+        db.execute(
+            "UPDATE upload_sessions SET state=state-'processing_outbox_required'",
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+    let runtime = ResumableRuntime::new(
+        f.storage.clone(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        Some(&url),
+    )
+    .await
+    .unwrap();
+    let migrated = ResumableManager::new(
+        runtime.backend,
+        runtime.store,
+        "https://upload.invalid",
+        "https://media.invalid",
+        256 * 1024,
+        300,
+    )
+    .with_outbox(configured_after.then_some(old));
+    let result = migrated.complete_session(&init.upload_id, &owner).await;
+    if remove_birth_proof {
+        assert!(matches!(result,Err(ResumableError::Unavailable(_))),"ambiguous pre-field PG session must fail before promotion, not silently lose a processing contract");
+        assert!(f.objects.lock().unwrap().writes.is_empty());
+        // The existing original configuration can finish the preserved session.
+        assert!(
+            original
+                .complete_session(&init.upload_id, &owner)
+                .await
+                .unwrap()
+                .processing_via_outbox
+        );
+    } else {
+        assert_eq!(result.unwrap().processing_via_outbox, enabled, "init must retain its accepted processing disposition before any completion intent exists");
+    }
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM upload_processing_session_receipts",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        i64::from(enabled)
+    );
+}
+#[tokio::test]
+async fn b2_primary_next_review_native_session_birth_processing_survives_before_first_complete() {
+    native_first_completion_migration(false, true, false).await;
+}
+#[tokio::test]
+async fn b2_primary_next_review_unmarked_native_pg_session_does_not_guess_processing() {
+    native_first_completion_migration(true, true, false).await;
+}
+
+#[tokio::test]
+async fn b2_primary_next_review_native_legacy_birth_not_retargeted_to_later_outbox() {
+    native_first_completion_migration(false, false, true).await;
+}
+
+#[tokio::test]
+async fn b2_primary_next_review_retained_pg_tracker_is_not_a_new_multipart_dependency() {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let f = Fixture::new().await;
+    f.storage
+        .with_mode(WriteMode::B2)
+        .unwrap()
+        .initialize_coordination(Some(&url))
+        .await
+        .unwrap();
+    let db = crate::coordination::connect(&url).await.unwrap();
+    db.batch_execute("CREATE FUNCTION reject_tracker_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture forbids modern PG tracker writes'; END $$; CREATE TRIGGER reject_tracker BEFORE INSERT OR UPDATE OR DELETE ON b2_multipart_intents FOR EACH ROW EXECUTE FUNCTION reject_tracker_write();").await.unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), vec![42; 9 * 1024 * 1024]).unwrap();
+    f.storage
+        .put_file(
+            "media",
+            file.path(),
+            "application/octet-stream",
+            Some(&"e".repeat(64)),
+        )
+        .await
+        .expect("new primary multipart must use only its GCS admission tracker");
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM b2_multipart_intents", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn b2_primary_next_review_foreground_expiry_forgets_historical_receipt_before_session() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, SessionStore, UploadSession};
+    for (action, fault) in [
+        ("head", "none"),
+        ("complete", "none"),
+        ("head", "lookup"),
+        ("complete", "lookup"),
+        ("head", "forget"),
+        ("complete", "forget"),
+    ] {
+        let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processor.invalid/finalized",
+            "fixture-token",
+        )
+        .await
+        .unwrap();
+        let f = Fixture::new().await;
+        let owner = "e".repeat(64);
+        let hash = hex::encode(Sha256::digest(b"original"));
+        let id = "up_expired_fixture";
+        let gcs = f.storage.with_mode(WriteMode::Gcs).unwrap();
+        let runtime = ResumableRuntime::new(
+            gcs.clone(),
+            f.storage.gcs.clone(),
+            "fixture-gcs".into(),
+            Some(&url),
+        )
+        .await
+        .unwrap();
+        let session = UploadSession {
+            processing_outbox_required: None,
+            revision: 0,
+            chunk_size: 1024,
+            upload_id: id.into(),
+            owner: owner.clone(),
+            final_sha256: hash.clone(),
+            declared_size: 8,
+            content_type: "application/octet-stream".into(),
+            file_name: None,
+            expires_at_epoch_secs: 0,
+            next_offset: 8,
+            session_url: "https://fixture.invalid/completed".into(),
+            session_token: "fixture-token".into(),
+            temp_object: "__resumable/uploads/up_expired_fixture/blob".into(),
+            storage_complete: true,
+            finalized_object: Some(hash.clone()),
+        };
+        runtime.store.save(&session).await.unwrap();
+        outbox
+            .begin_upload(&hash, 8, "application/octet-stream", &owner, &gcs)
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session(
+                id,
+                &hash,
+                8,
+                &owner,
+                vec![ObjectRef {
+                    provider: StorageProvider::Gcs,
+                    bucket: "fixture-gcs".into(),
+                    key: hash.clone(),
+                    version: Some("1".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let runtime = ResumableRuntime::new(
+            f.storage.clone(),
+            f.storage.gcs.clone(),
+            "fixture-gcs".into(),
+            Some(&url),
+        )
+        .await
+        .unwrap();
+        let manager = ResumableManager::new(
+            runtime.backend,
+            runtime.store,
+            "https://upload.invalid",
+            "https://media.invalid",
+            1024,
+            300,
+        );
+        let db = crate::coordination::connect(&url).await.unwrap();
+        if fault == "lookup" {
+            db.batch_execute(
+                "ALTER TABLE upload_processing_session_receipts RENAME TO retained_receipts",
+            )
+            .await
+            .unwrap();
+        } else if fault == "forget" {
+            db.batch_execute("CREATE FUNCTION reject_forget() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture receipt failure'; END $$; CREATE TRIGGER reject_forget BEFORE DELETE ON upload_processing_session_receipts FOR EACH ROW EXECUTE FUNCTION reject_forget();").await.unwrap();
+        }
+        if action == "head" {
+            assert!(manager
+                .head_session(id, Some("Bearer fixture-token"))
+                .await
+                .is_err());
+        } else {
+            assert!(manager.complete_session(id, &owner).await.is_err());
+        }
+        if fault != "none" {
+            assert_eq!(
+                db.query_one("SELECT count(*) FROM upload_sessions", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                1,
+                "failed cleanup must retain discovery row"
+            );
+            if fault == "lookup" {
+                db.batch_execute(
+                    "ALTER TABLE retained_receipts RENAME TO upload_processing_session_receipts",
+                )
+                .await
+                .unwrap();
+            } else {
+                db.batch_execute(
+                    "DROP TRIGGER reject_forget ON upload_processing_session_receipts",
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                db.query_one(
+                    "SELECT count(*) FROM upload_processing_session_receipts",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+                1
+            );
+            assert!(manager
+                .head_session(id, Some("Bearer fixture-token"))
+                .await
+                .is_err());
+        }
+        let db = crate::coordination::connect(&url).await.unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM upload_processing_session_receipts",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            0,
+            "{action} must remove receipt before deleting the discovery row"
+        );
+        assert_eq!(
+            db.query_one("SELECT count(*) FROM upload_sessions", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(
+            db.query_one("SELECT count(*) FROM upload_processing_outbox", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert!(f.objects.lock().unwrap().writes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn b2_primary_next_review_retained_database_does_not_create_new_pg_tracker() {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let f = Fixture::new().await;
+    f.storage.initialize_coordination(Some(&url)).await.unwrap();
+    let db = crate::coordination::connect(&url).await.unwrap();
+    assert!(!db
+        .query_one(
+            "SELECT to_regclass('b2_multipart_intents') IS NOT NULL",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    // A positively selected historical B2 file path can still initialize its
+    // original tracker, independently of new primary admissions.
+    f.storage
+        .with_mode(WriteMode::B2)
+        .unwrap()
+        .put_file(
+            "media",
+            std::path::Path::new("Cargo.toml"),
+            "application/octet-stream",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .query_one(
+            "SELECT to_regclass('b2_multipart_intents') IS NOT NULL",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
 }

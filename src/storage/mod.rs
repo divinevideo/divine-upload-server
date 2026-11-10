@@ -112,10 +112,14 @@ impl MediaStorage {
                 // New-mode multipart/admission receipts use the existing GCS bucket.
                 return Ok(());
             }
-            b2.initialize_coordination(
-                database_url.ok_or_else(|| anyhow!("B2 coordination database required"))?,
-            )
-            .await?;
+            let url = database_url.ok_or_else(|| anyhow!("B2 coordination database required"))?;
+            if matches!(self.mode, WriteMode::B2Primary | WriteMode::Gcs) {
+                // A retained database serves old sessions only. Do not create a
+                // legacy multipart tracker for new GCS-backed admissions.
+                b2.attach_existing_coordination(url).await?;
+            } else {
+                b2.initialize_coordination(url).await?;
+            }
         }
         *self.database_url.lock().await = database_url.map(str::to_owned);
         Ok(())
@@ -563,6 +567,11 @@ impl MediaStorage {
     ) -> Result<WriteResult> {
         if self.mode == WriteMode::B2Primary {
             return primary::put_file(self, key, path, content_type, owner).await;
+        }
+        if self.mode != WriteMode::Gcs {
+            if let Some(url) = self.coordination_url().await {
+                self.b2()?.ensure_coordination(&url).await?;
+            }
         }
         let _guard = self.write_guard(key).await?;
         let (mut content_type, mut owner) =

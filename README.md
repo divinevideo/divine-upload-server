@@ -136,13 +136,22 @@ Completion checks the declared digest and promotes through the pinned B2-first
 policy, including after new admissions are switched back to GCS. New-mode JSON
 session manifests use generation preconditions; deleting a session retains a
 small tombstone so stale writers cannot resurrect it. Old GCS/B2/dual sessions
-retain their original policy and provider requirements.
+retain their original policy and provider requirements. Session JSON now records
+whether processing was admitted through the outbox, independently of later
+configuration. A pre-field native GCS session in a historical PostgreSQL store
+with no processing intent/receipt cannot prove that choice: completion stays
+unavailable before promotion until the original processing configuration is
+restored or the retained state is explicitly reconciled. This does not apply to
+the ordinary GCS-only deployment without a coordination database. Expiry cleanup
+retains the session if historical contract lookup or receipt removal fails.
 
 Per-key admission records at `__resumable/b2-primary-writes/v1/` bind the bytes,
 first metadata and provider buckets using GCS create-only/generation CAS.
 Provider issuance is recorded before effects; the actual immutable B2 receipt
 is recorded before verification, and verified primary identity before backup
-I/O. Multipart upload IDs are retained in the same records. Completed replays
+I/O. Multipart upload IDs are retained in the same records. New-mode multipart writes
+do not use the legacy PostgreSQL tracker, including when an old database is
+retained to drain historical sessions. Completed replays
 read exact recorded versions and verify bytes. An explicitly retried verified
 primary with a backup that was never issued can continue without rewriting B2.
 An admission whose provider slots are both still not-issued can be reacquired

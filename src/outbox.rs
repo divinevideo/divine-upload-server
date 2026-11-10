@@ -210,21 +210,50 @@ pub(crate) async fn resolve_admission(
         processing_outbox,
     })
 }
+#[derive(Debug, thiserror::Error)]
+#[error("Historical session processing policy unavailable; retain the original processing configuration")]
+pub(crate) struct HistoricalSessionUnavailable;
+
 pub(crate) async fn history_for_accepted_session(
     url: &str,
     id: &str,
     hash: &str,
     owner: &str,
     old_non_gcs: bool,
+    birth_policy: Option<bool>,
 ) -> Result<Option<ProcessingOutbox>> {
     let database = crate::coordination::connect(url).await?;
-    let accepted=match database.query_one("SELECT EXISTS(SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed) OR (($4 OR EXISTS(SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$3)) AND EXISTS(SELECT 1 FROM upload_sessions WHERE upload_id=$3 AND state->>'final_sha256'=$1 AND state->>'owner'=$2))",&[&hash,&owner,&id,&old_non_gcs]).await {
-        Ok(row)=>row.get::<_,bool>(0),Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)=>false,Err(_)=>bail!("Historical session contract lookup failed"),
-    };
-    Ok(accepted.then(|| ProcessingOutbox {
-        database: Arc::new(Mutex::new(database)),
-        consumer: None,
-    }))
+    let required = old_non_gcs || birth_policy == Some(true);
+    let tables = database.query_one("SELECT to_regclass('upload_sessions') IS NOT NULL, to_regclass('upload_processing_intents') IS NOT NULL, to_regclass('upload_processing_session_receipts') IS NOT NULL, to_regclass('upload_processing_outbox') IS NOT NULL", &[]).await?;
+    let session_table = tables.get::<_, bool>(0);
+    let processing_tables = (1..=3).filter(|i| tables.get::<_, bool>(*i)).count();
+    if !session_table || processing_tables != 3 {
+        return if required || processing_tables != 0 {
+            Err(HistoricalSessionUnavailable.into())
+        } else {
+            Ok(None)
+        };
+    }
+    let row = database.query_one(
+        "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE upload_id=$3 AND state->>'final_sha256'=$1 AND state->>'owner'=$2), EXISTS(SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed) OR EXISTS(SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$3)",
+        &[&hash, &owner, &id],
+    ).await.map_err(|_| anyhow!("Historical session contract lookup failed"))?;
+    let accepted_session = row.get::<_, bool>(0);
+    let accepted_work = row.get::<_, bool>(1);
+    if required && !accepted_session {
+        return Err(HistoricalSessionUnavailable.into());
+    }
+    // Before this field existed, a native PG session alone cannot distinguish
+    // legacy processing from outbox processing. Never guess away that contract.
+    if accepted_session && birth_policy.is_none() && !old_non_gcs && !accepted_work {
+        return Err(HistoricalSessionUnavailable.into());
+    }
+    Ok(
+        (accepted_work || (required && accepted_session)).then(|| ProcessingOutbox {
+            database: Arc::new(Mutex::new(database)),
+            consumer: None,
+        }),
+    )
 }
 
 impl ProcessingOutbox {

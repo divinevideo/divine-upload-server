@@ -59,6 +59,7 @@ async fn origin(
 }
 fn session() -> UploadSession {
     UploadSession {
+        processing_outbox_required: None,
         revision: 0,
         chunk_size: 1024,
         upload_id: "up_fixture".into(),

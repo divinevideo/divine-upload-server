@@ -197,6 +197,7 @@ async fn original_write_http_direct_is_prepared_then_503_before_provider_io() {
 
 fn session(id: &str, staged: bool) -> crate::resumable::UploadSession {
     crate::resumable::UploadSession {
+        processing_outbox_required: None,
         revision: 7,
         chunk_size: 12,
         upload_id: id.into(),

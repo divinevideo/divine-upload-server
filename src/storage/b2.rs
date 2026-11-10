@@ -86,6 +86,27 @@ impl B2Store {
         *self.tracker.lock().await = Some(client);
         Ok(())
     }
+    pub async fn attach_existing_coordination(&self, database_url: &str) -> Result<()> {
+        let client = crate::coordination::connect(database_url).await?;
+        let exists: bool = client
+            .query_one(
+                "SELECT to_regclass('b2_multipart_intents') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if exists {
+            *self.tracker.lock().await = Some(client);
+        }
+        Ok(())
+    }
+    pub async fn ensure_coordination(&self, database_url: &str) -> Result<()> {
+        let attached = self.tracker.lock().await.is_some();
+        if !attached {
+            self.initialize_coordination(database_url).await?;
+        }
+        Ok(())
+    }
     async fn track(&self, key: &str, upload_id: &str, remove: bool) -> Result<()> {
         let guard = self.tracker.lock().await;
         if let Some(client) = guard.as_ref() {
@@ -571,11 +592,13 @@ impl B2Store {
             a.multipart(&upload_id).await?;
         }
         let upload_query = format!("uploadId={}", encode(&upload_id));
-        if let Err(error) = self.track(key, &upload_id, false).await {
-            let _ = self
-                .request_query(Method::DELETE, key, &upload_query, Bytes::new(), None, None)
-                .await;
-            return Err(error);
+        if admission.is_none() {
+            if let Err(error) = self.track(key, &upload_id, false).await {
+                let _ = self
+                    .request_query(Method::DELETE, key, &upload_query, Bytes::new(), None, None)
+                    .await;
+                return Err(error);
+            }
         }
         let result = async {
             let mut file = tokio::fs::File::open(path).await?;
@@ -597,7 +620,9 @@ impl B2Store {
                 }
                 part.truncate(length);
                 total += length as u64;
-                self.track(key, &upload_id, false).await?;
+                if admission.is_none() {
+                    self.track(key, &upload_id, false).await?;
+                }
                 let query = format!("partNumber={number}&{upload_query}");
                 let response = self
                     .request_query(Method::PUT, key, &query, Bytes::from(part), None, None)
@@ -667,11 +692,14 @@ impl B2Store {
                 .request_query(Method::DELETE, key, &upload_query, Bytes::new(), None, None)
                 .await
             {
-                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+                if admission.is_none()
+                    && (response.status().is_success()
+                        || response.status() == StatusCode::NOT_FOUND)
+                {
                     let _ = self.track(key, &upload_id, true).await;
                 }
             }
-        } else {
+        } else if admission.is_none() {
             self.track(key, &upload_id, true).await?;
         }
         result
