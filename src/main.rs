@@ -425,11 +425,18 @@ async fn main() -> Result<()> {
     media_storage
         .initialize_coordination(database_url.as_deref())
         .await?;
-    let processing_outbox = match (
-        env::var("MEDIA_FINALIZED_URL").ok(),
-        env::var("MEDIA_FINALIZED_TOKEN").ok(),
-    ) {
-        (None, None) if config.media_write_provider == "gcs" || original_enabled => None,
+    let finalized_url = env::var("MEDIA_FINALIZED_URL").ok();
+    let finalized_token = env::var("MEDIA_FINALIZED_TOKEN").ok();
+    validate_processing_policy(mode, finalized_url.is_some(), finalized_token.is_some())?;
+    let processing_outbox = match (finalized_url, finalized_token) {
+        (None, None)
+            if matches!(
+                mode,
+                storage::WriteMode::Gcs | storage::WriteMode::B2Primary
+            ) || original_enabled =>
+        {
+            None
+        }
         (Some(endpoint), Some(token)) => Some(
             outbox::ProcessingOutbox::connect(
                 database_url.as_deref().ok_or_else(|| {
@@ -866,7 +873,7 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            if state.processing_outbox.is_none() {
+            if !response.processing_via_outbox {
                 spawn_nsfw_scan(
                     &state,
                     &response.sha256,
@@ -931,6 +938,7 @@ async fn process_upload(
         spooled_dimensions,
         storage: upload_storage,
         thumbnail_finalization,
+        processing_outbox,
     } = stream_to_gcs_with_hash(
         &state.media_storage,
         state.processing_outbox.as_ref(),
@@ -960,10 +968,7 @@ async fn process_upload(
         {
             Ok(thumbnail) => {
                 if let Some((reservation, originals)) = thumbnail_finalization {
-                    let outbox = state
-                        .processing_outbox
-                        .as_ref()
-                        .ok_or(outbox::ThumbnailPending)?;
+                    let outbox = processing_outbox.as_ref().ok_or(outbox::ThumbnailPending)?;
                     outbox
                         .record_thumbnail(
                             &sha256_hash,
@@ -1019,7 +1024,7 @@ async fn process_upload(
     };
 
     // Trigger HLS transcoding for videos (fire-and-forget)
-    if state.processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
+    if processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
@@ -1039,7 +1044,7 @@ async fn process_upload(
     }
 
     // Trigger transcript generation for transcribable media (audio/video)
-    if state.processing_outbox.is_none() && is_transcribable_type(&content_type) {
+    if processing_outbox.is_none() && is_transcribable_type(&content_type) {
         if let Some(ref transcriber_url) = state.config.transcriber_url {
             let transcriber_url = transcriber_url.clone();
             let hash = sha256_hash.clone();
@@ -1057,7 +1062,7 @@ async fn process_upload(
         }
     }
 
-    if state.processing_outbox.is_none() {
+    if processing_outbox.is_none() {
         spawn_nsfw_scan(&state, &sha256_hash, &content_type, newly_stored);
     }
 
@@ -1090,6 +1095,7 @@ struct StoredUpload {
     spooled_dimensions: Option<String>,
     storage: storage::MediaStorage,
     thumbnail_finalization: Option<(outbox::ThumbnailReservation, Vec<storage::ObjectRef>)>,
+    processing_outbox: Option<outbox::ProcessingOutbox>,
 }
 
 async fn stream_to_gcs_with_hash(
@@ -1126,14 +1132,20 @@ async fn stream_to_gcs_with_hash(
             .await?;
         return Err(original_write::Error::Unavailable.into());
     }
-    let (client, thumbnail_reservation) = if let Some(outbox) = outbox {
-        let intent = outbox
-            .begin_direct_upload(&sha256_hash, total_size, content_type, owner, client)
-            .await?;
-        (intent.storage, intent.thumbnail)
-    } else {
-        (client.clone(), None)
-    };
+    let resolved = outbox::resolve_admission(
+        client,
+        outbox,
+        &sha256_hash,
+        total_size,
+        content_type,
+        owner,
+        true,
+    )
+    .await?;
+    let client = resolved.storage;
+    let thumbnail_reservation = resolved.thumbnail;
+    let selected_outbox = resolved.processing_outbox;
+    let outbox = selected_outbox.as_ref();
     let written = client
         .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
         .await?;
@@ -1180,6 +1192,7 @@ async fn stream_to_gcs_with_hash(
         spooled_dimensions,
         storage: client,
         thumbnail_finalization,
+        processing_outbox: outbox.cloned(),
     })
 }
 
@@ -1312,6 +1325,19 @@ fn media_source_candidates(hash: &str) -> [String; 3] {
     ]
 }
 
+// This staged mode deliberately keeps the existing processing handoff, whose
+// consumers read the verified GCS backup. Intake-only outboxes would suppress it.
+fn validate_processing_policy(
+    mode: storage::WriteMode,
+    has_url: bool,
+    has_token: bool,
+) -> Result<()> {
+    if mode == storage::WriteMode::B2Primary && (has_url || has_token) {
+        return Err(anyhow!("b2_primary requires legacy processing: leave MEDIA_FINALIZED_URL and MEDIA_FINALIZED_TOKEN unset"));
+    }
+    Ok(())
+}
+
 fn recorded_write_mode(
     objects: &[storage::ObjectRef],
     fallback: storage::WriteMode,
@@ -1331,10 +1357,17 @@ fn recorded_write_mode(
 }
 
 async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::MediaStorage> {
-    let objects = match &state.processing_outbox {
-        Some(outbox) => outbox.source_objects(hash).await?,
-        None => Vec::new(),
+    if let Some(primary) = state.media_storage.accepted_primary(hash).await? {
+        return Ok(primary);
+    }
+    let history = match &state.processing_outbox {
+        Some(outbox) => outbox.source_history(hash).await?,
+        None => outbox::historical_source_history(&state.media_storage, hash).await?,
     };
+    let objects = history.objects;
+    if objects.is_empty() {
+        return state.media_storage.for_recorded_write(hash).await;
+    }
     for object in &objects {
         let valid = match object.provider {
             storage::StorageProvider::Gcs => object.bucket == state.media_storage.gcs_bucket(),
@@ -1346,9 +1379,11 @@ async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::Medi
             return Err(anyhow!("Recorded derivative storage mapping changed"));
         }
     }
-    state
-        .media_storage
-        .with_mode(recorded_write_mode(&objects, state.media_storage.mode))
+    state.media_storage.with_mode(if history.explicit_primary {
+        storage::WriteMode::B2Primary
+    } else {
+        recorded_write_mode(&objects, state.media_storage.mode)
+    })
 }
 
 async fn read_derivative_input(
@@ -1806,6 +1841,8 @@ mod tests {
             permits.push(permit);
         }
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+
             if uri.query().unwrap_or_default().contains("alt=media") { return "prior-jpeg".into_response(); }
             Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})).into_response()
         }));
@@ -1994,6 +2031,8 @@ mod tests {
         use axum::{http::Uri, response::IntoResponse, routing::get, Router};
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+
             if uri.query().unwrap_or_default().contains("alt=media") {
                 if uri.path().ends_with(".jpg") { return StatusCode::FORBIDDEN.into_response(); }
                 return "not-video".into_response();
@@ -2051,6 +2090,16 @@ mod tests {
             WriteMode::Dual
         );
         assert_eq!(
+            super::recorded_write_mode(
+                &[
+                    reference(StorageProvider::B2),
+                    reference(StorageProvider::Gcs)
+                ],
+                WriteMode::Gcs
+            ),
+            WriteMode::Dual
+        );
+        assert_eq!(
             super::recorded_write_mode(&[], WriteMode::Gcs),
             WriteMode::Gcs
         );
@@ -2063,6 +2112,8 @@ mod tests {
         assert!(super::gcs_compatibility(WriteMode::B2, Some("true")).unwrap());
         assert!(super::gcs_compatibility(WriteMode::Dual, None).unwrap());
         assert!(super::gcs_compatibility(WriteMode::Dual, Some("false")).is_err());
+        assert!(super::gcs_compatibility(WriteMode::B2Primary, None).unwrap());
+        assert!(super::gcs_compatibility(WriteMode::B2Primary, Some("false")).is_err());
         assert!(super::gcs_compatibility(WriteMode::B2, Some("invalid")).is_err());
     }
 
@@ -3396,27 +3447,55 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         }
     }
 
-    let trusted_owner =
-        migration_owner(request.owner.as_deref(), state.processing_outbox.is_some());
-    let owner = trusted_owner.unwrap_or("");
-    let storage = if let Some(outbox) = &state.processing_outbox {
-        outbox
-            .begin_or_resume_upload(
-                &sha256_hash,
-                total_size,
-                &content_type,
-                owner,
-                &state.media_storage,
-            )
-            .await?
+    finish_migrate_storage(
+        &state,
+        &request,
+        sha256_hash,
+        total_size,
+        content_type,
+        spool.path(),
+    )
+    .await
+}
+
+async fn finish_migrate_storage(
+    state: &AppState,
+    request: &MigrateRequest,
+    sha256_hash: String,
+    total_size: u64,
+    content_type: String,
+    path: &std::path::Path,
+) -> Result<MigrateResponse> {
+    let historical = if state.processing_outbox.is_none() {
+        outbox::historical_outbox(&state.media_storage, &sha256_hash, "").await?
     } else {
-        state.media_storage.clone()
+        None
     };
+    let processing_outbox = state.processing_outbox.as_ref().or(historical.as_ref());
+    let has_processing_history = state.media_storage.coordination_url().await.is_some();
+    let trusted_owner = migration_owner(
+        request.owner.as_deref(),
+        processing_outbox.is_some() || has_processing_history,
+    );
+    let owner = trusted_owner.unwrap_or("");
+    let resolved = outbox::resolve_admission(
+        &state.media_storage,
+        processing_outbox,
+        &sha256_hash,
+        total_size,
+        &content_type,
+        owner,
+        false,
+    )
+    .await?;
+    let storage = resolved.storage;
+    let selected_outbox = resolved.processing_outbox;
+    let processing_outbox = selected_outbox.as_ref();
     let written = storage
-        .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
+        .put_file(&sha256_hash, path, &content_type, trusted_owner)
         .await?;
 
-    if let Some(outbox) = &state.processing_outbox {
+    if let Some(outbox) = processing_outbox {
         outbox
             .enqueue_upload(
                 &sha256_hash,
@@ -3438,7 +3517,7 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         size: total_size,
         content_type,
         migrated: written.newly_stored,
-        source_url: request.source_url,
+        source_url: request.source_url.clone(),
     })
 }
 
@@ -3572,4 +3651,17 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&result[..32]);
     Ok(key)
+}
+
+#[cfg(test)]
+mod b2_primary_processing_tests {
+    #[test]
+    fn b2_primary_keeps_legacy_handoff_and_rejects_intake_only_suppression() {
+        use crate::storage::WriteMode;
+        assert!(super::validate_processing_policy(WriteMode::B2Primary, false, false).is_ok());
+        for (url, token) in [(true, false), (false, true), (true, true)] {
+            assert!(super::validate_processing_policy(WriteMode::B2Primary, url, token).is_err());
+        }
+        assert!(super::validate_processing_policy(WriteMode::Dual, true, true).is_ok());
+    }
 }

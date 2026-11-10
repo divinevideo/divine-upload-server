@@ -85,6 +85,8 @@ pub struct StreamingInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteUploadResponse {
+    #[serde(skip)]
+    pub(crate) processing_via_outbox: bool,
     pub sha256: String,
     pub size: u64,
     pub content_type: String,
@@ -116,6 +118,9 @@ pub struct UploadSessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadSession {
+    /// Server-recorded processing disposition at admission; absent in old manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_outbox_required: Option<bool>,
     #[serde(default)]
     pub revision: i64,
     #[serde(default)]
@@ -226,6 +231,18 @@ pub trait ResumableBackend: Clone + Send + Sync + 'static {
         _session: &UploadSession,
     ) -> Result<Vec<crate::storage::ObjectRef>> {
         Ok(Vec::new())
+    }
+    async fn historical_processing(
+        &self,
+        _session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        Ok(None)
+    }
+    async fn historical_cleanup(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        self.historical_processing(session).await
     }
     async fn begin_finalization(
         &self,
@@ -358,6 +375,7 @@ where
         let expires_at_epoch_secs = now_epoch_secs().saturating_add(self.session_ttl_secs);
 
         let session = UploadSession {
+            processing_outbox_required: Some(self.outbox.is_some()),
             revision: 0,
             chunk_size: self.chunk_size,
             upload_id: upload_id.clone(),
@@ -558,6 +576,19 @@ where
             return Err(ResumableError::Gone("Upload session expired".to_string()));
         }
 
+        let configured = self
+            .outbox
+            .as_ref()
+            .filter(|_| session.processing_outbox_required != Some(false));
+        let historical = if configured.is_none() {
+            self.backend
+                .historical_processing(&session)
+                .await
+                .map_err(internal_error)?
+        } else {
+            None
+        };
+        let outbox = configured.or(historical.as_ref());
         if session.next_offset != session.declared_size {
             return Err(ResumableError::Conflict(format!(
                 "Upload incomplete: {} of {} bytes committed",
@@ -568,7 +599,7 @@ where
         if session.finalized_object.is_some() {
             // A committed receipt answers the replay without asking storage for
             // the final objects again.
-            if let Some(outbox) = &self.outbox {
+            if let Some(outbox) = outbox {
                 if outbox
                     .has_session_receipt(
                         &session.upload_id,
@@ -579,15 +610,17 @@ where
                     .await
                     .map_err(internal_error)?
                 {
-                    return Ok(self.build_complete_upload_response(
+                    let mut response = self.build_complete_upload_response(
                         &session.final_sha256,
                         session.declared_size,
                         &session.content_type,
                         false,
-                    ));
+                    );
+                    response.processing_via_outbox = true;
+                    return Ok(response);
                 }
             }
-            return self.completed_response(&session, false).await;
+            return self.completed_response(&session, false, outbox).await;
         }
 
         crate::resources::check_size(session.declared_size)
@@ -613,7 +646,7 @@ where
             )));
         }
 
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = outbox {
             self.backend
                 .begin_finalization(&session, outbox)
                 .await
@@ -631,7 +664,8 @@ where
         self.store.save(&session).await.map_err(internal_error)?;
         let _ = self.backend.delete_object(&session.temp_object).await;
 
-        self.completed_response(&session, newly_stored).await
+        self.completed_response(&session, newly_stored, outbox)
+            .await
     }
 
     pub async fn abort_session(
@@ -660,8 +694,9 @@ where
         &self,
         session: &UploadSession,
         newly_stored: bool,
+        outbox: Option<&crate::outbox::ProcessingOutbox>,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
-        let response = self.build_complete_upload_response(
+        let mut response = self.build_complete_upload_response(
             &session.final_sha256,
             session.declared_size,
             &session.content_type,
@@ -669,7 +704,7 @@ where
         );
         // Only the processing outbox consumes the object references. Without one,
         // looking them up adds a failure after the bytes are already stored.
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = outbox {
             let objects = self
                 .backend
                 .final_objects(session)
@@ -686,6 +721,7 @@ where
                 .await
                 .map_err(internal_error)?;
         }
+        response.processing_via_outbox = outbox.is_some();
         Ok(response)
     }
 
@@ -719,6 +755,16 @@ where
     }
 
     async fn cleanup_expired_session(&self, session: &UploadSession) {
+        // Resolve before any cleanup. On failure keep the discovery record and
+        // its receipt together for a later pass under the original configuration.
+        let historical = if self.outbox.is_none() {
+            match self.backend.historical_cleanup(session).await {
+                Ok(outbox) => outbox,
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         if session.finalized_object.is_none()
             && (self.backend.cancel_session(session).await.is_err()
                 || self
@@ -730,7 +776,7 @@ where
             return;
         }
         // Before the session, so a failure leaves both for the background sweep.
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = self.outbox.as_ref().or(historical.as_ref()) {
             if outbox
                 .forget_session_receipt(&session.upload_id)
                 .await
@@ -762,6 +808,7 @@ where
         };
 
         CompleteUploadResponse {
+            processing_via_outbox: false,
             sha256: sha256.to_string(),
             size,
             content_type: content_type.to_string(),
@@ -813,22 +860,72 @@ impl GcsSessionStore {
 impl SessionStore for GcsSessionStore {
     async fn load(&self, upload_id: &str) -> Result<Option<UploadSession>> {
         let object = Self::session_object_key(upload_id);
-        match self
+        // Preserve the legacy manifest read contract. Only a new-mode session
+        // takes the additional metadata + pinned read used for generation CAS.
+        let initial = match self
             .client
             .download_object(
                 &GetObjectRequest {
                     bucket: self.bucket.clone(),
-                    object,
+                    object: object.clone(),
                     ..Default::default()
                 },
                 &DownloadRange::default(),
             )
             .await
         {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(error) if is_not_found_error(&error) => Ok(None),
-            Err(error) => Err(anyhow!("Failed to load session manifest: {}", error)),
+            Ok(bytes) => bytes,
+            Err(error) if is_not_found_error(&error) => return Ok(None),
+            Err(_) => return Err(anyhow!("Failed to load session manifest")),
+        };
+        let initial: serde_json::Value =
+            serde_json::from_slice(&initial).map_err(|_| anyhow!("Invalid session manifest"))?;
+        if initial.get("deleted").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(None);
         }
+        let initial: UploadSession =
+            serde_json::from_value(initial).map_err(|_| anyhow!("Invalid session manifest"))?;
+        if !primary_session(&initial.temp_object) {
+            return Ok(Some(initial));
+        }
+        let metadata = match self
+            .client
+            .get_object(&GetObjectRequest {
+                bucket: self.bucket.clone(),
+                object: object.clone(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) if is_not_found_error(&error) => return Ok(None),
+            Err(_) => return Err(anyhow!("Failed to inspect session manifest")),
+        };
+        if metadata.generation <= 0 {
+            return Err(anyhow!("Invalid session manifest generation"));
+        }
+        let bytes = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object,
+                    generation: Some(metadata.generation),
+                    ..Default::default()
+                },
+                &DownloadRange::default(),
+            )
+            .await
+            .map_err(|_| anyhow!("Failed to load pinned session manifest"))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("deleted").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(None);
+        }
+        let mut session: UploadSession = serde_json::from_value(value)?;
+        if primary_session(&session.temp_object) {
+            session.revision = metadata.generation;
+        }
+        Ok(Some(session))
     }
 
     async fn save(&self, session: &UploadSession) -> Result<()> {
@@ -843,6 +940,8 @@ impl SessionStore for GcsSessionStore {
             .upload_object(
                 &UploadObjectRequest {
                     bucket: self.bucket.clone(),
+                    if_generation_match: primary_session(&session.temp_object)
+                        .then_some(session.revision),
                     ..Default::default()
                 },
                 payload,
@@ -856,6 +955,28 @@ impl SessionStore for GcsSessionStore {
 
     async fn delete(&self, upload_id: &str) -> Result<()> {
         let object = Self::session_object_key(upload_id);
+        if let Some(session) = self.load(upload_id).await? {
+            if primary_session(&session.temp_object) {
+                let payload = serde_json::to_vec(&serde_json::json!({"deleted":true}))?;
+                let mut media = Media::new(object);
+                media.content_type = "application/json".into();
+                self.client
+                    .upload_object(
+                        &UploadObjectRequest {
+                            bucket: self.bucket.clone(),
+                            if_generation_match: Some(session.revision),
+                            ..Default::default()
+                        },
+                        payload,
+                        &UploadType::Simple(media),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("Session changed during deletion"))?;
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
         match self
             .client
             .delete_object(&DeleteObjectRequest {
@@ -891,34 +1012,17 @@ impl GcsResumableBackend {
     }
 }
 
-fn final_copy_metadata_object(
-    bucket: &str,
-    destination_key: &str,
-    content_type: &str,
-    owner: &str,
-) -> Object {
-    let mut metadata_map = HashMap::new();
-    metadata_map.insert("owner".to_string(), owner.to_string());
-
-    Object {
-        bucket: bucket.to_string(),
-        name: destination_key.to_string(),
-        content_type: Some(content_type.to_string()),
-        metadata: Some(metadata_map),
-        ..Default::default()
-    }
+fn primary_session(key: &str) -> bool {
+    key.starts_with("__resumable/b2_primary/")
 }
-
-#[async_trait]
-impl ResumableBackend for GcsResumableBackend {
-    async fn create_session(
+impl GcsResumableBackend {
+    async fn create_session_at(
         &self,
         upload_id: &str,
         owner: &str,
         content_type: &str,
-        _declared_size: u64,
+        temp_object: String,
     ) -> Result<BackendCreateSession> {
-        let temp_object = Self::temp_object_key(upload_id);
         let mut metadata_map = HashMap::new();
         metadata_map.insert("owner".to_string(), owner.to_string());
         metadata_map.insert("upload_id".to_string(), upload_id.to_string());
@@ -946,6 +1050,43 @@ impl ResumableBackend for GcsResumableBackend {
             session_url: uploader.url().to_string(),
             temp_object,
         })
+    }
+}
+
+fn final_copy_metadata_object(
+    bucket: &str,
+    destination_key: &str,
+    content_type: &str,
+    owner: &str,
+) -> Object {
+    let mut metadata_map = HashMap::new();
+    metadata_map.insert("owner".to_string(), owner.to_string());
+
+    Object {
+        bucket: bucket.to_string(),
+        name: destination_key.to_string(),
+        content_type: Some(content_type.to_string()),
+        metadata: Some(metadata_map),
+        ..Default::default()
+    }
+}
+
+#[async_trait]
+impl ResumableBackend for GcsResumableBackend {
+    async fn create_session(
+        &self,
+        upload_id: &str,
+        owner: &str,
+        content_type: &str,
+        _declared_size: u64,
+    ) -> Result<BackendCreateSession> {
+        self.create_session_at(
+            upload_id,
+            owner,
+            content_type,
+            Self::temp_object_key(upload_id),
+        )
+        .await
     }
 
     async fn upload_chunk(
@@ -1153,7 +1294,7 @@ fn is_video_content_type(content_type: &str) -> bool {
 pub struct SessionBusy;
 
 fn internal_error(error: anyhow::Error) -> ResumableError {
-    if error.is::<SessionBusy>() {
+    if error.is::<SessionBusy>() || error.is::<crate::outbox::HistoricalSessionUnavailable>() {
         ResumableError::Unavailable(error.to_string())
     } else if error.is::<crate::outbox::IntentConflict>() {
         ResumableError::Conflict(error.to_string())
@@ -2185,3 +2326,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "resumable_gcs_tests.rs"]
+mod gcs_manifest_tests;

@@ -54,12 +54,27 @@ enum UploadAdmission {
     Session,
     Resume,
     Direct,
+    PinnedDirect,
+    PinnedResume,
+}
+impl UploadAdmission {
+    fn is_direct(self) -> bool {
+        matches!(self, Self::Direct | Self::PinnedDirect)
+    }
+    fn pinned(self) -> bool {
+        matches!(self, Self::PinnedDirect | Self::PinnedResume)
+    }
+}
+pub(crate) struct ResolvedAdmission {
+    pub storage: MediaStorage,
+    pub thumbnail: Option<ThumbnailReservation>,
+    pub processing_outbox: Option<ProcessingOutbox>,
 }
 
 #[derive(Clone)]
 pub struct ProcessingOutbox {
     database: Arc<Mutex<Client>>,
-    consumer: ProcessingClient,
+    consumer: Option<ProcessingClient>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +96,196 @@ pub(crate) async fn initialize_schema(client: &Client) -> Result<()> {
         .map_err(|_| anyhow!("processing database schema initialization failed"))
 }
 
+/// Only reuse an already accepted pending intent. This creates neither a new
+/// database/schema nor intents for new B2-primary admissions. Dispatch remains
+/// the responsibility of the historical deployment's configured consumer.
+pub(crate) async fn historical_outbox(
+    storage: &MediaStorage,
+    hash: &str,
+    owner: &str,
+) -> Result<Option<ProcessingOutbox>> {
+    let Some(url) = storage.coordination_url().await else {
+        return Ok(None);
+    };
+    let database = crate::coordination::connect(&url).await?;
+    let existing=match database.query_opt("SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed",&[&hash,&owner]).await {
+        Ok(row)=>row.is_some(),
+        Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)=>false,
+        Err(_)=>bail!("Historical upload intent lookup failed"),
+    };
+    Ok(existing.then(|| ProcessingOutbox {
+        database: Arc::new(Mutex::new(database)),
+        consumer: None,
+    }))
+}
+
+pub(crate) struct SourceHistory {
+    pub objects: Vec<ObjectRef>,
+    // True only when one committed event itself names B2 then GCS. A union
+    // assembled from separate legacy events cannot establish this policy.
+    pub explicit_primary: bool,
+}
+impl SourceHistory {
+    fn empty() -> Self {
+        Self {
+            objects: Vec::new(),
+            explicit_primary: false,
+        }
+    }
+}
+
+/// Reading accepted source contracts does not require dispatch credentials or
+/// initialize a schema. Absence of a configured history database is the normal
+/// PG-free path; deployments with history must retain that existing binding.
+pub(crate) async fn historical_source_history(
+    storage: &MediaStorage,
+    hash: &str,
+) -> Result<SourceHistory> {
+    let Some(url) = storage.coordination_url().await else {
+        return Ok(SourceHistory::empty());
+    };
+    let database = crate::coordination::connect(&url).await?;
+    let present: bool = database
+        .query_one(
+            "SELECT to_regclass('upload_processing_outbox') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|_| anyhow!("Historical source contract lookup failed"))?
+        .get(0);
+    if !present {
+        return Ok(SourceHistory::empty());
+    }
+    source_history_from_client(&database, hash).await
+}
+
+/// Accepted GCS primary records precede existing PG contracts, which precede
+/// current new-admission defaults. Contradictory accepted policies fail closed.
+pub(crate) async fn resolve_admission(
+    storage: &MediaStorage,
+    global: Option<&ProcessingOutbox>,
+    hash: &str,
+    size: u64,
+    mime: &str,
+    owner: &str,
+    direct: bool,
+) -> Result<ResolvedAdmission> {
+    let primary = storage.accepted_primary(hash).await?;
+    let pinned = primary.is_some();
+    let storage = primary.unwrap_or_else(|| storage.clone());
+    let processing_outbox = match global {
+        Some(value) => Some(value.clone()),
+        None => historical_outbox(&storage, hash, owner).await?,
+    };
+    let (storage, thumbnail) = if let Some(outbox) = &processing_outbox {
+        let admission = match (direct, pinned) {
+            (true, true) => UploadAdmission::PinnedDirect,
+            (false, true) => UploadAdmission::PinnedResume,
+            (true, false) => UploadAdmission::Direct,
+            (false, false) => UploadAdmission::Resume,
+        };
+        let intent = if pinned {
+            outbox
+                .reserve_upload(hash, size, mime, owner, &storage, admission)
+                .await?
+        } else if direct {
+            outbox
+                .begin_direct_upload(hash, size, mime, owner, &storage)
+                .await?
+        } else {
+            DirectUploadIntent {
+                storage: outbox
+                    .begin_or_resume_upload(hash, size, mime, owner, &storage)
+                    .await?,
+                thumbnail: None,
+            }
+        };
+        (intent.storage, intent.thumbnail)
+    } else {
+        (storage, None)
+    };
+    Ok(ResolvedAdmission {
+        storage,
+        thumbnail,
+        processing_outbox,
+    })
+}
+#[derive(Debug, thiserror::Error)]
+#[error("Historical session processing policy unavailable; retain the original processing configuration")]
+pub(crate) struct HistoricalSessionUnavailable;
+
+pub(crate) async fn history_for_accepted_session(
+    url: &str,
+    id: &str,
+    hash: &str,
+    owner: &str,
+    old_non_gcs: bool,
+    birth_policy: Option<bool>,
+) -> Result<Option<ProcessingOutbox>> {
+    let database = crate::coordination::connect(url).await?;
+    let required = birth_policy == Some(true) || (old_non_gcs && birth_policy.is_none());
+    let tables = database.query_one("SELECT to_regclass('upload_sessions') IS NOT NULL, to_regclass('upload_processing_intents') IS NOT NULL, to_regclass('upload_processing_session_receipts') IS NOT NULL, to_regclass('upload_processing_outbox') IS NOT NULL", &[]).await?;
+    let session_table = tables.get::<_, bool>(0);
+    let processing_tables = (1..=3).filter(|i| tables.get::<_, bool>(*i)).count();
+    if !session_table || processing_tables != 3 {
+        return if required || processing_tables != 0 {
+            Err(HistoricalSessionUnavailable.into())
+        } else {
+            Ok(None)
+        };
+    }
+    let row = database.query_one(
+        "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE upload_id=$3 AND state->>'final_sha256'=$1 AND state->>'owner'=$2), EXISTS(SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed) OR EXISTS(SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$3)",
+        &[&hash, &owner, &id],
+    ).await.map_err(|_| anyhow!("Historical session contract lookup failed"))?;
+    let accepted_session = row.get::<_, bool>(0);
+    let accepted_work = row.get::<_, bool>(1);
+    if required && !accepted_session {
+        return Err(HistoricalSessionUnavailable.into());
+    }
+    // Before this field existed, a native PG session alone cannot distinguish
+    // legacy processing from outbox processing. Never guess away that contract.
+    if accepted_session && birth_policy.is_none() && !old_non_gcs && !accepted_work {
+        return Err(HistoricalSessionUnavailable.into());
+    }
+    Ok(
+        (accepted_work || (required && accepted_session)).then(|| ProcessingOutbox {
+            database: Arc::new(Mutex::new(database)),
+            consumer: None,
+        }),
+    )
+}
+
+pub(crate) async fn history_for_session_cleanup(
+    url: &str,
+    id: &str,
+    declared_processing: bool,
+) -> Result<Option<ProcessingOutbox>> {
+    let database = crate::coordination::connect(url).await?;
+    let tables = database.query_one("SELECT to_regclass('upload_processing_intents') IS NOT NULL, to_regclass('upload_processing_session_receipts') IS NOT NULL, to_regclass('upload_processing_outbox') IS NOT NULL", &[]).await
+        .map_err(|_| anyhow!("Historical cleanup schema lookup failed"))?;
+    let present = (0..3).filter(|i| tables.get::<_, bool>(*i)).count();
+    if present != 3 {
+        return if present == 0 && !declared_processing {
+            Ok(None)
+        } else {
+            Err(HistoricalSessionUnavailable.into())
+        };
+    }
+    let has_receipt = database
+        .query_opt(
+            "SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$1",
+            &[&id],
+        )
+        .await
+        .map_err(|_| anyhow!("Historical session cleanup lookup failed"))?
+        .is_some();
+    Ok(has_receipt.then(|| ProcessingOutbox {
+        database: Arc::new(Mutex::new(database)),
+        consumer: None,
+    }))
+}
+
 impl ProcessingOutbox {
     pub async fn connect(database_url: &str, endpoint: &str, bearer_token: &str) -> Result<Self> {
         let consumer = ProcessingClient::new(endpoint, bearer_token)?;
@@ -88,7 +293,7 @@ impl ProcessingOutbox {
         initialize_schema(&client).await?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
-            consumer,
+            consumer: Some(consumer),
         })
     }
 
@@ -177,10 +382,23 @@ impl ProcessingOutbox {
             .map_err(|_| anyhow!("upload intent transaction failed"))?;
         tx.execute("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO NOTHING", &[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
         let previous = tx.query_one("SELECT completed,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 FOR UPDATE", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
+        if self.consumer.is_none()
+            && previous.get::<_, bool>(0)
+            && !matches!(admission, UploadAdmission::Session)
+        {
+            // The historical lookup raced completion. Do not turn this adapter
+            // into authority to create/reset a new admission on a stale lookup.
+            // A separately accepted session can attach its own receipt to a
+            // completed historical event; its pinned Session contract is retained.
+            return Err(IntentConflict.into());
+        }
         let changed = previous.get::<_, String>(1) != mode
             || previous.get::<_, String>(2) != gcs_bucket
             || previous.get::<_, Option<String>>(3).as_deref() != b2_bucket;
-        if previous.get::<_, bool>(0) && (changed || matches!(admission, UploadAdmission::Direct)) {
+        if admission.pinned() && !previous.get::<_, bool>(0) && changed {
+            return Err(IntentConflict.into());
+        }
+        if previous.get::<_, bool>(0) && (changed || admission.is_direct()) {
             tx.execute("UPDATE upload_processing_intents SET write_mode=$3,gcs_bucket=$4,b2_bucket=$5,completed=false,sync_thumbnail_generation=NULL,sync_thumbnail_required=false,sync_thumbnail_receipt=NULL WHERE sha256=$1 AND owner=$2", &[&hash,&owner,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent readmission failed"))?;
         }
         let row = tx.query_one("SELECT size,content_type,write_mode,gcs_bucket,b2_bucket,sync_thumbnail_required,sync_thumbnail_generation FROM upload_processing_intents WHERE sha256=$1 AND owner=$2", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
@@ -195,8 +413,8 @@ impl ProcessingOutbox {
             return Err(IntentConflict.into());
         }
         let required = row.get::<_, bool>(5)
-            || (matches!(admission, UploadAdmission::Direct)
-                && recorded_mode == WriteMode::Dual
+            || (admission.is_direct()
+                && recorded_mode.requires_both()
                 && size > 0
                 && size <= crate::thumbnail::MAX_SYNC_VIDEO_BYTES as i64
                 && crate::thumbnail::is_video_type(&row.get::<_, String>(1)));
@@ -484,10 +702,87 @@ impl ProcessingOutbox {
                 continue;
             }
             let pinned = storage.with_mode(mode)?;
+            let primary = match pinned.accepted_primary(&intent.sha256).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if mode == WriteMode::B2Primary || primary.is_some() {
+                let Some(primary) = primary else {
+                    continue;
+                };
+                let Ok(receipts) = primary.primary_receipts(&intent.sha256, intent.size).await
+                else {
+                    continue;
+                };
+                if intent.size.saturating_mul(receipts.len() as u64) > budget {
+                    continue;
+                }
+                let mut present = true;
+                for reference in &receipts {
+                    if !matches!(primary.stat_ref(reference).await,Ok(Some(object)) if object.size==intent.size)
+                    {
+                        present = false;
+                        break;
+                    }
+                }
+                if !present {
+                    continue;
+                }
+                let mut verified = true;
+                for reference in &receipts {
+                    budget = budget.saturating_sub(intent.size);
+                    if primary
+                        .verify_ref_identity(reference, &intent.sha256, intent.size)
+                        .await
+                        .is_err()
+                    {
+                        verified = false;
+                        break;
+                    }
+                }
+                if !verified {
+                    continue;
+                }
+                // Preserve an older intent's ordering using settled exact copies;
+                // no latest HEAD can create authority around an unknown effect.
+                let expected =
+                    required_destinations(mode, &intent.gcs_bucket, intent.b2_bucket.as_deref())?;
+                let objects: Option<Vec<_>> = expected
+                    .into_iter()
+                    .map(|(provider, bucket)| {
+                        receipts
+                            .iter()
+                            .find(|object| object.provider == provider && object.bucket == bucket)
+                            .cloned()
+                    })
+                    .collect();
+                let Some(objects) = objects else {
+                    continue;
+                };
+                let result = self
+                    .enqueue_upload(
+                        &intent.sha256,
+                        intent.size,
+                        &intent.content_type,
+                        &intent.owner,
+                        objects,
+                    )
+                    .await;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<ThumbnailPending>())
+                {
+                    continue;
+                }
+                result?;
+                recovered += 1;
+                continue;
+            }
             let modes = match mode {
                 WriteMode::Gcs => vec![WriteMode::Gcs],
                 WriteMode::B2 => vec![WriteMode::B2],
                 WriteMode::Dual => vec![WriteMode::Gcs, WriteMode::B2],
+                WriteMode::B2Primary => continue,
             };
             // Discover all required copies before reading any bodies. A partial
             // dual write can remain pending indefinitely; repeatedly hashing its
@@ -567,28 +862,17 @@ impl ProcessingOutbox {
     /// to GCS) must not drop a destination this media already requires.
     pub async fn source_objects(&self, hash: &str) -> Result<Vec<ObjectRef>> {
         let database = self.database.lock().await;
-        let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
-            return Ok(Vec::new());
-        };
-        let mut objects = event_objects(row.get(0))?;
-        for provider in [StorageProvider::Gcs, StorageProvider::B2] {
-            if objects.iter().any(|object| object.provider == provider) {
-                continue;
-            }
-            let recorded = serde_json::json!({ "provider": provider });
-            let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 AND (payload->'source' @> $2 OR payload->'replicas' @> jsonb_build_array($2)) ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash, &recorded]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
-            if let Some(row) = row {
-                objects.extend(
-                    event_objects(row.get(0))?
-                        .into_iter()
-                        .filter(|object| object.provider == provider),
-                );
-            }
-        }
-        Ok(objects)
+        source_objects_from_client(&database, hash).await
+    }
+    pub(crate) async fn source_history(&self, hash: &str) -> Result<SourceHistory> {
+        let database = self.database.lock().await;
+        source_history_from_client(&database, hash).await
     }
 
     pub async fn dispatch_once(&self, limit: u32) -> Result<u64> {
+        let consumer = self.consumer.as_ref().ok_or_else(|| {
+            anyhow!("Historical upload receipts require their existing configured dispatcher")
+        })?;
         let mut delivered = 0;
         for _ in 0..limit.min(100) {
             let token = format!("{:032x}", rand::random::<u128>());
@@ -602,7 +886,7 @@ impl ProcessingOutbox {
             let attempts: i32 = row.get(2);
             let event = serde_json::from_value::<MediaFinalizedV1>(payload);
             let success = match event {
-                Ok(event) => self.consumer.deliver(&event).await.is_ok(),
+                Ok(event) => consumer.deliver(&event).await.is_ok(),
                 Err(_) => false,
             };
             let client = self.database.lock().await;
@@ -620,6 +904,47 @@ impl ProcessingOutbox {
 }
 
 /// A stored event's verified copies, its authoritative source first.
+/// Accepted finalization history, with the newest event's source first.
+/// Missing providers may be appended from older events. This is not current
+/// provider selection, policy approval, or a storage/erasure fence.
+pub(crate) async fn source_objects_from_client(
+    database: &Client,
+    hash: &str,
+) -> Result<Vec<ObjectRef>> {
+    Ok(source_history_from_client(database, hash).await?.objects)
+}
+
+async fn source_history_from_client(database: &Client, hash: &str) -> Result<SourceHistory> {
+    let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
+            return Ok(SourceHistory::empty());
+        };
+    let mut objects = event_objects(row.get(0))?;
+    let explicit_primary = objects
+        .first()
+        .is_some_and(|object| object.provider == StorageProvider::B2)
+        && objects
+            .iter()
+            .any(|object| object.provider == StorageProvider::Gcs);
+    for provider in [StorageProvider::Gcs, StorageProvider::B2] {
+        if objects.iter().any(|object| object.provider == provider) {
+            continue;
+        }
+        let recorded = serde_json::json!({ "provider": provider });
+        let row = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 AND (payload->'source' @> $2 OR payload->'replicas' @> jsonb_build_array($2)) ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash, &recorded]).await.map_err(|_| anyhow!("Processing source lookup failed"))?;
+        if let Some(row) = row {
+            objects.extend(
+                event_objects(row.get(0))?
+                    .into_iter()
+                    .filter(|object| object.provider == provider),
+            );
+        }
+    }
+    Ok(SourceHistory {
+        objects,
+        explicit_primary,
+    })
+}
+
 fn event_objects(payload: serde_json::Value) -> Result<Vec<ObjectRef>> {
     let event: MediaFinalizedV1 = serde_json::from_value(payload)
         .map_err(|_| anyhow!("Stored processing source is invalid"))?;
@@ -658,6 +983,10 @@ pub(crate) fn required_destinations<'a>(
         WriteMode::Dual => vec![
             (StorageProvider::Gcs, gcs_bucket),
             (StorageProvider::B2, b2()?),
+        ],
+        WriteMode::B2Primary => vec![
+            (StorageProvider::B2, b2()?),
+            (StorageProvider::Gcs, gcs_bucket),
         ],
     })
 }
@@ -937,6 +1266,8 @@ pub(crate) mod tests {
         let app = Router::new().route("/*path", any(move |method: Method, uri: Uri| {
             let mut hash = fixture_hash.clone(); let mut bytes = fixture_bytes.clone(); let availability=availability.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (axum::http::StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 let thumbnail=uri.path().ends_with(".jpg");
                 if thumbnail { hash.push_str(".jpg"); bytes=bytes::Bytes::from_static(b"existing-synthetic-jpeg"); }
                 if method != Method::GET && method != Method::HEAD { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
@@ -1529,6 +1860,8 @@ pub(crate) mod tests {
             let hash = fixture_hash.clone();
             let seen = seen.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (axum::http::StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 assert!(method == Method::GET || method == Method::HEAD,
                     "already stored originals must be verified without overwriting");
                 if uri.path().starts_with("/storage/") {
@@ -1769,7 +2102,7 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new_for_test(&endpoint, "fixture-token").unwrap(),
+            consumer: Some(ProcessingClient::new_for_test(&endpoint, "fixture-token").unwrap()),
         };
         let storage = MediaStorage::new(
             WriteMode::Gcs,
@@ -1940,8 +2273,10 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
-                .unwrap(),
+            consumer: Some(
+                ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
+                    .unwrap(),
+            ),
         };
         let owner = "b".repeat(64);
         outbox
@@ -2054,6 +2389,8 @@ pub(crate) mod tests {
         let app=Router::new().route("/*path",any(move |State(f):State<Arc<Fixture>>,method:Method,uri:Uri| {
             let body=body.clone();let hash=fixture_hash.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 if method!=Method::HEAD && method!=Method::GET {f.writes.fetch_add(1,Ordering::SeqCst);return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
                 if uri.path().starts_with("/storage/") {
                     if uri.query().unwrap_or_default().contains("alt=media"){f.reads.fetch_add(1,Ordering::SeqCst);return body.into_response();}
@@ -2091,8 +2428,10 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
-                .unwrap(),
+            consumer: Some(
+                ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
+                    .unwrap(),
+            ),
         };
         let owner = "b".repeat(64);
         outbox

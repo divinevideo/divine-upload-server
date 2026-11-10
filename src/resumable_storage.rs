@@ -33,7 +33,7 @@ impl ResumableRuntime {
             }
             None => None,
         };
-        if storage.mode != WriteMode::Gcs && database.is_none() {
+        if matches!(storage.mode, WriteMode::B2 | WriteMode::Dual) && database.is_none() {
             bail!("COORDINATION_DATABASE_URL is required for B2 resumable uploads");
         }
         Ok(Self {
@@ -41,6 +41,7 @@ impl ResumableRuntime {
                 storage,
                 legacy: backend_gcs,
                 database: database.clone(),
+                database_url: database_url.map(str::to_owned),
             },
             store: ProviderSessionStore {
                 database,
@@ -75,6 +76,11 @@ impl ResumableRuntime {
                 if session.expires_at_epoch_secs > now_epoch_secs() {
                     return Ok(false);
                 }
+                let historical = if outbox.is_none() {
+                    self.backend.historical_cleanup(&session).await?
+                } else {
+                    None
+                };
                 if session.session_url == "staged-v1" {
                     self.backend.delete_object(&session.temp_object).await?;
                 } else if session.finalized_object.is_none() {
@@ -83,7 +89,7 @@ impl ResumableRuntime {
                 }
                 // Before the session, so a failure leaves it for the next pass
                 // rather than orphaning a receipt no sweep will find again.
-                if let Some(outbox) = outbox {
+                if let Some(outbox) = outbox.or(historical.as_ref()) {
                     outbox.forget_session_receipt(&id).await?;
                 }
                 self.store.delete(&id).await?;
@@ -126,6 +132,7 @@ impl ResumableRuntime {
                 .unwrap(),
                 legacy: Some(GcsResumableBackend::new(client.clone(), "test-bucket")),
                 database: None,
+                database_url: None,
             },
             store: ProviderSessionStore {
                 database: None,
@@ -195,6 +202,14 @@ impl SessionStore for ProviderSessionStore {
         }
     }
     async fn save(&self, session: &UploadSession) -> Result<()> {
+        if primary_session(&session.temp_object) {
+            return self
+                .legacy
+                .as_ref()
+                .ok_or_else(|| anyhow!("GCS session storage unavailable"))?
+                .save(session)
+                .await;
+        }
         if let Some(db) = &self.database {
             let next = session
                 .revision
@@ -220,8 +235,12 @@ impl SessionStore for ProviderSessionStore {
     }
     async fn delete(&self, id: &str) -> Result<()> {
         if let Some(db) = &self.database {
-            db.execute("WITH removed AS (DELETE FROM upload_sessions WHERE upload_id=$1 RETURNING upload_id) INSERT INTO upload_session_tombstones(upload_id) VALUES($1) ON CONFLICT(upload_id) DO NOTHING",&[&id]).await.map_err(|_|anyhow!("Session cleanup failed"))?;
-            return Ok(());
+            // Existing PostgreSQL sessions never fall through to the GCS path.
+            let known=db.query_opt("SELECT upload_id FROM upload_sessions WHERE upload_id=$1 UNION ALL SELECT upload_id FROM upload_session_tombstones WHERE upload_id=$1 LIMIT 1",&[&id]).await.map_err(|_|anyhow!("Session deletion lookup failed"))?.is_some();
+            if known {
+                db.execute("WITH removed AS (DELETE FROM upload_sessions WHERE upload_id=$1 RETURNING upload_id) INSERT INTO upload_session_tombstones(upload_id) VALUES($1) ON CONFLICT(upload_id) DO NOTHING",&[&id]).await.map_err(|_|anyhow!("Session cleanup failed"))?;
+                return Ok(());
+            }
         }
         if let Some(store) = &self.legacy {
             store.delete(id).await?;
@@ -234,10 +253,20 @@ pub struct MediaResumableBackend {
     storage: MediaStorage,
     legacy: Option<GcsResumableBackend>,
     database: Option<Arc<tokio_postgres::Client>>,
+    database_url: Option<String>,
 }
 impl MediaResumableBackend {
     pub(crate) fn finalization_storage(&self, session: &UploadSession) -> Result<MediaStorage> {
-        if session.session_url == "staged-v1" {
+        if primary_session(&session.temp_object) {
+            let parts: Vec<_> = session.temp_object.split('/').collect();
+            if parts.len() != 6
+                || parts[2] != hex::encode(self.storage.gcs_bucket())
+                || parts[3] != hex::encode(self.storage.b2_bucket().unwrap_or(""))
+            {
+                bail!("Upload session bucket mapping changed");
+            }
+            self.storage.with_mode(WriteMode::B2Primary)
+        } else if session.session_url == "staged-v1" {
             self.staged_store(&session.temp_object)
         } else {
             self.storage.with_mode(WriteMode::Gcs)
@@ -292,6 +321,47 @@ impl MediaResumableBackend {
 
 #[async_trait]
 impl ResumableBackend for MediaResumableBackend {
+    async fn historical_cleanup(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        match self.database_url.as_deref() {
+            Some(url) => {
+                crate::outbox::history_for_session_cleanup(
+                    url,
+                    &session.upload_id,
+                    session.processing_outbox_required == Some(true),
+                )
+                .await
+            }
+            None if session.processing_outbox_required == Some(true) => {
+                Err(crate::outbox::HistoricalSessionUnavailable.into())
+            }
+            None => Ok(None),
+        }
+    }
+    async fn historical_processing(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        if let Some(url) = self.database_url.as_deref() {
+            let mode = self.finalization_storage(session)?.mode;
+            return crate::outbox::history_for_accepted_session(
+                url,
+                &session.upload_id,
+                &session.final_sha256,
+                &session.owner,
+                matches!(mode, WriteMode::B2 | WriteMode::Dual),
+                session.processing_outbox_required,
+            )
+            .await;
+        }
+
+        if session.processing_outbox_required == Some(true) {
+            return Err(crate::outbox::HistoricalSessionUnavailable.into());
+        }
+        Ok(None)
+    }
     async fn is_committed_retry(
         &self,
         session: &UploadSession,
@@ -313,11 +383,7 @@ impl ResumableBackend for MediaResumableBackend {
         session: &UploadSession,
         outbox: &crate::outbox::ProcessingOutbox,
     ) -> Result<()> {
-        let store = if session.session_url == "staged-v1" {
-            self.staged_store(&session.temp_object)?
-        } else {
-            self.storage.with_mode(WriteMode::Gcs)?
-        };
+        let store = self.finalization_storage(session)?;
         outbox
             .begin_upload(
                 &session.final_sha256,
@@ -329,6 +395,39 @@ impl ResumableBackend for MediaResumableBackend {
             .await
     }
     async fn final_objects(&self, session: &UploadSession) -> Result<Vec<ObjectRef>> {
+        if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+            let refs = primary
+                .primary_receipts(&session.final_sha256, session.declared_size)
+                .await?;
+            let mode = self.finalization_storage(session)?.mode;
+            let providers = match mode {
+                WriteMode::Gcs => vec![crate::storage::StorageProvider::Gcs],
+                WriteMode::B2 => vec![crate::storage::StorageProvider::B2],
+                WriteMode::Dual => vec![
+                    crate::storage::StorageProvider::Gcs,
+                    crate::storage::StorageProvider::B2,
+                ],
+                WriteMode::B2Primary => vec![
+                    crate::storage::StorageProvider::B2,
+                    crate::storage::StorageProvider::Gcs,
+                ],
+            };
+            return providers
+                .into_iter()
+                .map(|provider| {
+                    refs.iter()
+                        .find(|object| object.provider == provider)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Recorded session copy missing"))
+                })
+                .collect();
+        }
+        if primary_session(&session.temp_object) {
+            return self
+                .finalization_storage(session)?
+                .primary_receipts(&session.final_sha256, session.declared_size)
+                .await;
+        }
         if session.session_url == "staged-v1" {
             let row = self
                 .database()?
@@ -352,6 +451,55 @@ impl ResumableBackend for MediaResumableBackend {
         }
     }
     async fn finalize(&self, session: &UploadSession) -> Result<bool> {
+        if !primary_session(&session.temp_object) {
+            if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+                // A historical session may reuse settled, exact copies; it must
+                // not bypass a partial primary admission with a legacy write.
+                for object in primary
+                    .primary_receipts(&session.final_sha256, session.declared_size)
+                    .await?
+                {
+                    primary
+                        .verify_ref_identity(&object, &session.final_sha256, session.declared_size)
+                        .await?;
+                }
+                return Ok(false);
+            }
+        }
+        if primary_session(&session.temp_object) {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new()?;
+            let mut stream = self.legacy()?.stream_object(&session.temp_object).await?;
+            let mut size = 0u64;
+            let mut hash = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow!("Upload size overflow"))?;
+                crate::resources::check_size(size)?;
+                if size > session.declared_size {
+                    bail!("Upload staging size changed");
+                }
+                hash.update(&chunk);
+                file.write_all(&chunk)?;
+            }
+            if size != session.declared_size || hex::encode(hash.finalize()) != session.final_sha256
+            {
+                bail!("Upload staging integrity changed");
+            }
+            file.flush()?;
+            let result = self
+                .finalization_storage(session)?
+                .put_file(
+                    &session.final_sha256,
+                    file.path(),
+                    &session.content_type,
+                    Some(&session.owner),
+                )
+                .await?;
+            return Ok(result.newly_stored);
+        }
         if session.session_url != "staged-v1" {
             let exists = self.legacy()?.object_exists(&session.final_sha256).await?;
             if !exists {
@@ -391,6 +539,15 @@ impl ResumableBackend for MediaResumableBackend {
         if self.storage.mode == WriteMode::Gcs {
             return self.legacy()?.create_session(id, owner, mime, size).await;
         }
+        if self.storage.mode == WriteMode::B2Primary {
+            let key = format!(
+                "__resumable/b2_primary/{}/{}/{}/blob",
+                hex::encode(self.storage.gcs_bucket()),
+                hex::encode(self.storage.b2_bucket().unwrap_or("")),
+                id
+            );
+            return self.legacy()?.create_session_at(id, owner, mime, key).await;
+        }
         if size > i64::MAX as u64 {
             bail!("Upload exceeds supported offset range");
         }
@@ -398,6 +555,7 @@ impl ResumableBackend for MediaResumableBackend {
             WriteMode::Gcs => "gcs",
             WriteMode::B2 => "b2",
             WriteMode::Dual => "dual",
+            WriteMode::B2Primary => "b2_primary",
         };
         let key = format!(
             "__resumable/staged/{}/{}/{}/{}",
@@ -560,6 +718,7 @@ mod tests {
     }
     fn session() -> UploadSession {
         UploadSession {
+            processing_outbox_required: Some(false),
             revision: 0,
             chunk_size: 1024 * 1024,
             upload_id: format!("test_{}", random_hex(12)),
@@ -753,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn uncertain_cleanup_does_not_block_other_expired_sessions_or_later_pages() {
         let _sweep_guard = SWEEP_TEST_LOCK.lock().await;
-        let Ok(url) = std::env::var("TEST_COORDINATION_DATABASE_URL") else {
+        let Some(url) = crate::outbox::tests::isolated_database_url().await else {
             return;
         };
         let storage = MediaStorage::new(
@@ -855,9 +1014,14 @@ mod tests {
         let mut value = serde_json::to_value(session()).unwrap();
         value.as_object_mut().unwrap().remove("revision");
         value.as_object_mut().unwrap().remove("chunk_size");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("processing_outbox_required");
         let decoded: UploadSession = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.revision, 0);
         assert_eq!(decoded.chunk_size, 0);
+        assert_eq!(decoded.processing_outbox_required, None);
     }
 }
 
@@ -888,6 +1052,9 @@ mod integration_tests {
         headers: HeaderMap,
         body: BodyBytes,
     ) -> axum::response::Response {
+        if uri.path().contains("b2-primary-writes") {
+            return (StatusCode::NOT_FOUND,axum::Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();
+        }
         let key = uri.path().to_string();
         if method == Method::PUT {
             objects.lock().unwrap().insert(
@@ -936,7 +1103,7 @@ mod integration_tests {
             eprintln!("Skipping PostgreSQL integration: TEST_COORDINATION_DATABASE_URL unset");
             return;
         }
-        let database_url = std::env::var("TEST_COORDINATION_DATABASE_URL").unwrap();
+        let database_url = crate::outbox::tests::isolated_database_url().await.unwrap();
         let objects: Objects = Arc::new(Mutex::new(HashMap::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -957,7 +1124,7 @@ mod integration_tests {
             "secret".into(),
         )
         .unwrap()
-        .with_endpoint(endpoint);
+        .with_endpoint(endpoint.clone());
         let storage = MediaStorage::new(
             WriteMode::B2,
             None,
@@ -977,11 +1144,12 @@ mod integration_tests {
             1024 * 1024,
             86400,
         );
+        let owner = "e".repeat(64);
         let bytes = Bytes::from(vec![42; 1024 * 1024 + 8]);
         let hash = hex::encode(Sha256::digest(&bytes));
         let init = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1003,7 +1171,13 @@ mod integration_tests {
             .await
             .unwrap();
         drop(manager);
-        let gcs = GcsClient::new(google_cloud_storage::client::ClientConfig::default().anonymous());
+        let gcs = GcsClient::new(
+            google_cloud_storage::client::ClientConfig {
+                storage_endpoint: endpoint.clone(),
+                ..Default::default()
+            }
+            .anonymous(),
+        );
         let switched = MediaStorage::new(
             WriteMode::Gcs,
             Some(gcs.clone()),
@@ -1061,7 +1235,7 @@ mod integration_tests {
             .await
             .unwrap();
         let complete = manager
-            .complete_session(&init.upload_id, "owner")
+            .complete_session(&init.upload_id, &owner)
             .await
             .unwrap();
         assert!(complete.newly_stored);
@@ -1081,7 +1255,7 @@ mod integration_tests {
         );
         assert!(
             !manager
-                .complete_session(&init.upload_id, "owner")
+                .complete_session(&init.upload_id, &owner)
                 .await
                 .unwrap()
                 .newly_stored
@@ -1124,7 +1298,7 @@ mod integration_tests {
         );
         let aborted = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1161,7 +1335,7 @@ mod integration_tests {
             .all(|key| !key.contains(&aborted.upload_id)));
         let expired = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1274,7 +1448,7 @@ mod integration_tests {
         assert_eq!(event_count, 0, "rejected bytes must not enqueue processing");
         let uncertain = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: "f".repeat(64),
                     size: 8,

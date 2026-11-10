@@ -7,7 +7,10 @@ rejects redirects and never forwards its token to another endpoint.
 
 This is a new companion integration contract. The existing Blossom transcoder,
 transcriber, and GCS notification consumers must not be assumed to implement it.
-Deploy a compatible consumer before enabling a B2 upload mode.
+Deploy a compatible consumer before enabling the outbox-based `b2` or `dual`
+upload modes. The separate `b2_primary` staged policy deliberately leaves this
+outbox disabled and retains existing processing against its verified GCS backup;
+it must not be enabled by pointing this contract at an ACK-only consumer.
 
 ## Request
 
@@ -72,7 +75,9 @@ and required destinations before storage I/O, independently of the current
 new-upload mode. Required adapters/buckets must still be configured. Resumable
 sessions instead require the intent to match their already recorded policy.
 The finalization transaction checks the exact destination set and ordering
-against the locked intent: GCS only, B2 only, or GCS then B2 for dual. Missing,
+against the locked intent: GCS only, B2 only, GCS then B2 for historical dual,
+or B2 then GCS for an explicitly recorded B2-primary policy. Supporting that
+ordered receipt shape does not enable outbox dispatch in `b2_primary` mode. Missing,
 extra, duplicate, reordered or wrong-bucket references cannot complete the intent.
 Resumable completion records a per-session receipt atomically with the outbox
 event and intent completion. A repeated session uses that receipt without

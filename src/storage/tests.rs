@@ -2,6 +2,28 @@ use super::*;
 use std::future::IntoFuture;
 
 #[test]
+fn b2_primary_policy_is_explicit_and_keeps_legacy_order() {
+    let mode: WriteMode = "b2_primary".parse().expect("new B2-authoritative policy");
+    assert_ne!(mode, WriteMode::Dual);
+    assert_eq!(serde_json::to_value(mode).unwrap(), "b2_primary");
+    assert_eq!(
+        crate::outbox::required_destinations(mode, "gcs-backup", Some("b2-authority")).unwrap(),
+        vec![
+            (StorageProvider::B2, "b2-authority"),
+            (StorageProvider::Gcs, "gcs-backup")
+        ]
+    );
+    assert_eq!(
+        crate::outbox::required_destinations(WriteMode::Dual, "gcs-backup", Some("b2-authority"))
+            .unwrap(),
+        vec![
+            (StorageProvider::Gcs, "gcs-backup"),
+            (StorageProvider::B2, "b2-authority")
+        ]
+    );
+}
+
+#[test]
 fn mode_is_explicit_and_rejects_typos() {
     assert_eq!("dual".parse::<WriteMode>().unwrap(), WriteMode::Dual);
     assert_eq!("b2".parse::<WriteMode>().unwrap(), WriteMode::B2);

@@ -197,6 +197,7 @@ async fn original_write_http_direct_is_prepared_then_503_before_provider_io() {
 
 fn session(id: &str, staged: bool) -> crate::resumable::UploadSession {
     crate::resumable::UploadSession {
+        processing_outbox_required: None,
         revision: 7,
         chunk_size: 12,
         upload_id: id.into(),
@@ -615,6 +616,7 @@ async fn original_write_records_each_mode_without_outbox_dispatch_or_provider_io
         crate::storage::WriteMode::Gcs,
         crate::storage::WriteMode::B2,
         crate::storage::WriteMode::Dual,
+        crate::storage::WriteMode::B2Primary,
     ] {
         let Some((one, _)) = database_tests::stores().await else {
             return;
@@ -648,14 +650,7 @@ async fn original_write_records_each_mode_without_outbox_dispatch_or_provider_io
             .await
             .unwrap();
         let count:i64=one.database.lock().await.query_one("SELECT count(*) FROM upload_write_operations WHERE attempt_id=$1 AND state='prepared'",&[&result.attempt_id]).await.unwrap().get(0);
-        assert_eq!(
-            count,
-            if mode == crate::storage::WriteMode::Dual {
-                4
-            } else {
-                2
-            }
-        );
+        assert_eq!(count, if mode.requires_both() { 4 } else { 2 });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
