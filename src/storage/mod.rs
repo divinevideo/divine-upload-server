@@ -189,16 +189,44 @@ impl MediaStorage {
             .as_ref()
             .ok_or_else(|| anyhow!("B2 storage unavailable"))
     }
+    pub(crate) async fn stat_ref(&self, reference: &ObjectRef) -> Result<Option<StoredObject>> {
+        match reference.provider {
+            StorageProvider::B2 => self.b2()?.stat_reference(reference).await,
+            StorageProvider::Gcs => {
+                if reference.bucket != self.gcs_bucket {
+                    bail!("GCS bucket mismatch");
+                }
+                let generation = reference
+                    .version
+                    .as_ref()
+                    .and_then(|version| version.parse::<i64>().ok())
+                    .filter(|generation| *generation > 0)
+                    .ok_or_else(|| anyhow!("Exact GCS generation required"))?;
+                self.gcs_stat_at(&reference.key, Some(generation)).await
+            }
+        }
+    }
     async fn gcs_stat(&self, key: &str) -> Result<Option<StoredObject>> {
+        self.gcs_stat_at(key, None).await
+    }
+    async fn gcs_stat_at(
+        &self,
+        key: &str,
+        generation: Option<i64>,
+    ) -> Result<Option<StoredObject>> {
         match self
             .gcs()?
             .get_object(&GetObjectRequest {
                 bucket: self.gcs_bucket.clone(),
                 object: key.into(),
+                generation,
                 ..Default::default()
             })
             .await
         {
+            Ok(o) if generation.is_some_and(|expected| expected != o.generation) => {
+                Err(anyhow!("GCS response generation mismatch"))
+            }
             Ok(o) => Ok(Some(StoredObject {
                 reference: ObjectRef {
                     provider: StorageProvider::Gcs,

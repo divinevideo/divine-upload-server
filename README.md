@@ -158,6 +158,13 @@ otherwise an existing PostgreSQL contract retains its accepted policy; otherwise
 the current mode selects new admission. Contradictory accepted records fail
 without rewriting either policy. This precedence also applies when an existing
 outbox is configured during GCS rollback.
+Completed historical source contracts are read independently of dispatcher
+availability for on-demand thumbnails. Background recovery governed by a primary
+record requires its settled exact receipts, checks both pinned copies exist,
+and verifies their bytes; it never adopts current HEAD versions around unknown
+effects or repeatedly downloads a surviving copy when its recorded backup is
+missing.
+
 Historical resumable sessions retain their original provider ordering. If a
 primary admission already owns the same key, a historical session can only reuse
 both settled copies after checking their exact versions and full byte identity;

@@ -1369,8 +1369,11 @@ async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::Medi
     }
     let objects = match &state.processing_outbox {
         Some(outbox) => outbox.source_objects(hash).await?,
-        None => return state.media_storage.for_recorded_write(hash).await,
+        None => outbox::historical_source_objects(&state.media_storage, hash).await?,
     };
+    if objects.is_empty() {
+        return state.media_storage.for_recorded_write(hash).await;
+    }
     for object in &objects {
         let valid = match object.provider {
             storage::StorageProvider::Gcs => object.bucket == state.media_storage.gcs_bucket(),

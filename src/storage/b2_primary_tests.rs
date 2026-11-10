@@ -24,6 +24,10 @@ struct Objects {
     resume_key: Option<String>,
     fail_backup_admission_once: bool,
     lose_admission_ack_once: bool,
+    lose_gcs_put_ack: bool,
+    lose_b2_put_ack: bool,
+    latest_b2_version: Option<String>,
+    read_versions: Vec<String>,
     corrupt_b2: bool,
     b2: Option<Copy>,
     gcs: Option<Copy>,
@@ -235,6 +239,9 @@ async fn origin(
             let copy = multipart(body);
             f.writes.push("gcs");
             f.gcs = Some(copy);
+            if f.lose_gcs_put_ack {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             return Json(metadata(f.gcs.as_ref().unwrap())).into_response();
         }
         let Some(copy) = f.gcs.as_ref() else {
@@ -297,9 +304,12 @@ async fn origin(
             mime: headers["content-type"].to_str().unwrap().into(),
         });
         f.writes.push("b2");
+        if f.lose_b2_put_ack {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return ([("x-amz-version-id", "b2-version-1")], "").into_response();
     }
-    let Some(copy) = f.b2.as_ref() else {
+    let Some(copy) = f.b2.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if method == Method::HEAD {
@@ -307,6 +317,8 @@ async fn origin(
             "null"
         } else if f.wrong_pinned_b2_head && !query.is_empty() {
             "foreign-version"
+        } else if query.is_empty() {
+            f.latest_b2_version.as_deref().unwrap_or("b2-version-1")
         } else {
             "b2-version-1"
         };
@@ -325,12 +337,18 @@ async fn origin(
         }
         return response;
     }
-    assert!(
-        query.contains("versionId=b2-version-1"),
-        "primary byte read must be version-pinned"
-    );
+    let version = if query.contains("versionId=b2-version-2") {
+        "b2-version-2"
+    } else {
+        assert!(
+            query.contains("versionId=b2-version-1"),
+            "byte read must be version-pinned"
+        );
+        "b2-version-1"
+    };
+    f.read_versions.push(version.into());
     (
-        [("x-amz-version-id", "b2-version-1")],
+        [("x-amz-version-id", version)],
         if f.corrupt_b2 {
             Bytes::from_static(b"corrupt")
         } else {
@@ -2244,4 +2262,276 @@ async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_
             assert_eq!(event["source"]["version"], "1");
         }
     }
+}
+
+#[tokio::test]
+async fn b2_primary_fourth_review_pg_only_thumbnail_history_matrix() {
+    let mut scenarios = 0;
+    for accepted in [WriteMode::Gcs, WriteMode::B2, WriteMode::Dual] {
+        for current in [WriteMode::Gcs, WriteMode::B2Primary] {
+            for global in [false, true] {
+                for binding in [false, true] {
+                    scenarios += 1;
+                    let f = Fixture::new().await;
+                    let configured = MediaStorage::new(
+                        current,
+                        f.storage.gcs.clone(),
+                        "fixture-gcs".into(),
+                        binding.then(|| f.storage.b2.clone().unwrap()),
+                    );
+                    if current == WriteMode::B2Primary && !binding {
+                        assert!(configured.is_err());
+                        continue;
+                    }
+                    let configured = configured.unwrap();
+                    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                        return;
+                    };
+                    let outbox = crate::outbox::ProcessingOutbox::connect(
+                        &url,
+                        "https://processor.invalid/finalized",
+                        "fixture-token",
+                    )
+                    .await
+                    .unwrap();
+                    let owner = "e".repeat(64);
+                    let hash = hex::encode(Sha256::digest(b"original"));
+                    let old = f.storage.with_mode(accepted).unwrap();
+                    outbox
+                        .begin_upload(&hash, 8, "application/octet-stream", &owner, &old)
+                        .await
+                        .unwrap();
+                    let result = old
+                        .put(
+                            &hash,
+                            Bytes::from_static(b"original"),
+                            "application/octet-stream",
+                            Some(&owner),
+                        )
+                        .await
+                        .unwrap();
+                    outbox
+                        .enqueue_upload(
+                            &hash,
+                            8,
+                            "application/octet-stream",
+                            &owner,
+                            result.objects,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(f.objects.lock().unwrap().records.is_empty());
+                    *configured.database_url.lock().await = Some(url);
+                    let mut state = crate::tests::test_state(None, 1);
+                    let mutable = Arc::get_mut(&mut state).unwrap();
+                    mutable.media_storage = configured;
+                    mutable.processing_outbox = global.then_some(outbox);
+                    let before = f.objects.lock().unwrap().writes.clone();
+                    let selected = crate::thumbnail_storage(&state, &hash).await;
+                    if binding || accepted == WriteMode::Gcs {
+                        assert_eq!(
+                            selected.unwrap().mode,
+                            accepted,
+                            "PG-only accepted policy must survive {current:?}/{global}/{binding}"
+                        );
+                    } else {
+                        assert!(selected.is_err());
+                    }
+                    assert_eq!(f.objects.lock().unwrap().writes, before);
+                }
+            }
+        }
+    }
+    assert_eq!(scenarios, 24);
+}
+
+#[tokio::test]
+async fn b2_primary_fourth_review_recovery_never_adopts_unsettled_effects() {
+    for intent_mode in [
+        WriteMode::B2Primary,
+        WriteMode::Gcs,
+        WriteMode::Dual,
+        WriteMode::B2,
+    ] {
+        for lost in ["gcs_ack", "b2_ack", "gcs_verified"] {
+            let Some((outbox, db)) = database().await else {
+                return;
+            };
+            let f = Fixture::new().await;
+            let owner = "e".repeat(64);
+            let hash = hex::encode(Sha256::digest(b"original"));
+            outbox
+                .begin_upload(
+                    &hash,
+                    8,
+                    "application/octet-stream",
+                    &owner,
+                    &f.storage.with_mode(intent_mode).unwrap(),
+                )
+                .await
+                .unwrap();
+            {
+                let mut objects = f.objects.lock().unwrap();
+                if lost == "b2_ack" {
+                    objects.gcs = Some(Copy {
+                        bytes: Bytes::from_static(b"original"),
+                        owner: Some(owner.clone()),
+                        mime: "application/octet-stream".into(),
+                    });
+                    objects.lose_b2_put_ack = true;
+                }
+                if lost == "gcs_ack" {
+                    objects.lose_gcs_put_ack = true;
+                }
+                if lost == "gcs_verified" {
+                    objects.corrupt_gcs = true;
+                }
+            }
+            assert!(f
+                .storage
+                .put(
+                    &hash,
+                    Bytes::from_static(b"original"),
+                    "application/octet-stream",
+                    Some(&owner)
+                )
+                .await
+                .is_err());
+            {
+                let mut objects = f.objects.lock().unwrap();
+                objects.corrupt_gcs = false;
+                objects.read_versions.clear();
+                assert!(objects.b2.is_some() && objects.gcs.is_some());
+            }
+            assert_eq!(
+                outbox
+                    .recover_intents(&f.storage.with_mode(WriteMode::Gcs).unwrap(), 1, 64)
+                    .await
+                    .unwrap(),
+                0,
+                "{intent_mode:?}/{lost} must remain pending despite matching current bytes"
+            );
+            assert_eq!(
+                db.query_one("SELECT count(*) FROM upload_processing_outbox", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                0
+            );
+            assert!(!db
+                .query_one("SELECT completed FROM upload_processing_intents", &[])
+                .await
+                .unwrap()
+                .get::<_, bool>(0));
+            assert!(
+                f.objects.lock().unwrap().read_versions.is_empty(),
+                "unknown admission cannot trigger media adoption reads"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b2_primary_fourth_review_recovery_uses_only_recorded_versions() {
+    for intent_mode in [
+        WriteMode::B2Primary,
+        WriteMode::Gcs,
+        WriteMode::Dual,
+        WriteMode::B2,
+    ] {
+        let Some((outbox, db)) = database().await else {
+            return;
+        };
+        let f = Fixture::new().await;
+        let owner = "e".repeat(64);
+        let hash = hex::encode(Sha256::digest(b"original"));
+        outbox
+            .begin_upload(
+                &hash,
+                8,
+                "application/octet-stream",
+                &owner,
+                &f.storage.with_mode(intent_mode).unwrap(),
+            )
+            .await
+            .unwrap();
+        let written = f
+            .storage
+            .put(
+                &hash,
+                Bytes::from_static(b"original"),
+                "application/octet-stream",
+                Some(&owner),
+            )
+            .await
+            .unwrap();
+        {
+            let mut objects = f.objects.lock().unwrap();
+            objects.latest_b2_version = Some("b2-version-2".into());
+            objects.read_versions.clear();
+        }
+        assert_eq!(
+            outbox
+                .recover_intents(&f.storage.with_mode(WriteMode::Gcs).unwrap(), 1, 64)
+                .await
+                .unwrap(),
+            1
+        );
+        let event: serde_json::Value = db
+            .query_one("SELECT payload FROM upload_processing_outbox", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let source = if matches!(intent_mode, WriteMode::Gcs | WriteMode::Dual) {
+            &written.objects[1]
+        } else {
+            &written.objects[0]
+        };
+        assert_eq!(event["source"], serde_json::to_value(source).unwrap());
+        assert_eq!(
+            f.objects.lock().unwrap().read_versions,
+            ["b2-version-1"],
+            "latest v2 is not the admitted receipt"
+        );
+        assert_eq!(
+            db.query_one("SELECT write_mode FROM upload_processing_intents", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            serde_json::to_value(intent_mode).unwrap().as_str().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn b2_primary_fourth_review_missing_recorded_backup_does_not_redownload_primary() {
+    let Some((outbox, _)) = database().await else {
+        return;
+    };
+    let f = Fixture::new().await;
+    let owner = "e".repeat(64);
+    let hash = hex::encode(Sha256::digest(b"original"));
+    outbox
+        .begin_upload(&hash, 8, "application/octet-stream", &owner, &f.storage)
+        .await
+        .unwrap();
+    f.storage
+        .put(
+            &hash,
+            Bytes::from_static(b"original"),
+            "application/octet-stream",
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+    {
+        let mut objects = f.objects.lock().unwrap();
+        objects.gcs = None;
+        objects.read_versions.clear();
+    }
+    assert_eq!(outbox.recover_intents(&f.storage, 1, 64).await.unwrap(), 0);
+    assert!(
+        f.objects.lock().unwrap().read_versions.is_empty(),
+        "missing backup must be detected before downloading the surviving original"
+    );
 }

@@ -119,6 +119,31 @@ pub(crate) async fn historical_outbox(
     }))
 }
 
+/// Reading accepted source contracts does not require dispatch credentials or
+/// initialize a schema. Absence of a configured history database is the normal
+/// PG-free path; deployments with history must retain that existing binding.
+pub(crate) async fn historical_source_objects(
+    storage: &MediaStorage,
+    hash: &str,
+) -> Result<Vec<ObjectRef>> {
+    let Some(url) = storage.coordination_url().await else {
+        return Ok(Vec::new());
+    };
+    let database = crate::coordination::connect(&url).await?;
+    let present: bool = database
+        .query_one(
+            "SELECT to_regclass('upload_processing_outbox') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|_| anyhow!("Historical source contract lookup failed"))?
+        .get(0);
+    if !present {
+        return Ok(Vec::new());
+    }
+    source_objects_from_client(&database, hash).await
+}
+
 /// Accepted GCS primary records precede existing PG contracts, which precede
 /// current new-admission defaults. Contradictory accepted policies fail closed.
 pub(crate) async fn resolve_admission(
@@ -603,11 +628,87 @@ impl ProcessingOutbox {
                 continue;
             }
             let pinned = storage.with_mode(mode)?;
+            let primary = match pinned.accepted_primary(&intent.sha256).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if mode == WriteMode::B2Primary || primary.is_some() {
+                let Some(primary) = primary else {
+                    continue;
+                };
+                let Ok(receipts) = primary.primary_receipts(&intent.sha256, intent.size).await
+                else {
+                    continue;
+                };
+                if intent.size.saturating_mul(receipts.len() as u64) > budget {
+                    continue;
+                }
+                let mut present = true;
+                for reference in &receipts {
+                    if !matches!(primary.stat_ref(reference).await,Ok(Some(object)) if object.size==intent.size)
+                    {
+                        present = false;
+                        break;
+                    }
+                }
+                if !present {
+                    continue;
+                }
+                let mut verified = true;
+                for reference in &receipts {
+                    budget = budget.saturating_sub(intent.size);
+                    if primary
+                        .verify_ref_identity(reference, &intent.sha256, intent.size)
+                        .await
+                        .is_err()
+                    {
+                        verified = false;
+                        break;
+                    }
+                }
+                if !verified {
+                    continue;
+                }
+                // Preserve an older intent's ordering using settled exact copies;
+                // no latest HEAD can create authority around an unknown effect.
+                let expected =
+                    required_destinations(mode, &intent.gcs_bucket, intent.b2_bucket.as_deref())?;
+                let objects: Option<Vec<_>> = expected
+                    .into_iter()
+                    .map(|(provider, bucket)| {
+                        receipts
+                            .iter()
+                            .find(|object| object.provider == provider && object.bucket == bucket)
+                            .cloned()
+                    })
+                    .collect();
+                let Some(objects) = objects else {
+                    continue;
+                };
+                let result = self
+                    .enqueue_upload(
+                        &intent.sha256,
+                        intent.size,
+                        &intent.content_type,
+                        &intent.owner,
+                        objects,
+                    )
+                    .await;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<ThumbnailPending>())
+                {
+                    continue;
+                }
+                result?;
+                recovered += 1;
+                continue;
+            }
             let modes = match mode {
                 WriteMode::Gcs => vec![WriteMode::Gcs],
                 WriteMode::B2 => vec![WriteMode::B2],
                 WriteMode::Dual => vec![WriteMode::Gcs, WriteMode::B2],
-                WriteMode::B2Primary => vec![WriteMode::B2, WriteMode::Gcs],
+                WriteMode::B2Primary => continue,
             };
             // Discover all required copies before reading any bodies. A partial
             // dual write can remain pending indefinitely; repeatedly hashing its
@@ -2197,6 +2298,8 @@ pub(crate) mod tests {
         let app=Router::new().route("/*path",any(move |State(f):State<Arc<Fixture>>,method:Method,uri:Uri| {
             let body=body.clone();let hash=fixture_hash.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 if method!=Method::HEAD && method!=Method::GET {f.writes.fetch_add(1,Ordering::SeqCst);return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
                 if uri.path().starts_with("/storage/") {
                     if uri.query().unwrap_or_default().contains("alt=media"){f.reads.fetch_add(1,Ordering::SeqCst);return body.into_response();}
