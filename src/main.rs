@@ -425,11 +425,18 @@ async fn main() -> Result<()> {
     media_storage
         .initialize_coordination(database_url.as_deref())
         .await?;
-    let processing_outbox = match (
-        env::var("MEDIA_FINALIZED_URL").ok(),
-        env::var("MEDIA_FINALIZED_TOKEN").ok(),
-    ) {
-        (None, None) if config.media_write_provider == "gcs" || original_enabled => None,
+    let finalized_url = env::var("MEDIA_FINALIZED_URL").ok();
+    let finalized_token = env::var("MEDIA_FINALIZED_TOKEN").ok();
+    validate_processing_policy(mode, finalized_url.is_some(), finalized_token.is_some())?;
+    let processing_outbox = match (finalized_url, finalized_token) {
+        (None, None)
+            if matches!(
+                mode,
+                storage::WriteMode::Gcs | storage::WriteMode::B2Primary
+            ) || original_enabled =>
+        {
+            None
+        }
         (Some(endpoint), Some(token)) => Some(
             outbox::ProcessingOutbox::connect(
                 database_url.as_deref().ok_or_else(|| {
@@ -1132,7 +1139,7 @@ async fn stream_to_gcs_with_hash(
             .await?;
         (intent.storage, intent.thumbnail)
     } else {
-        (client.clone(), None)
+        (client.for_recorded_write(&sha256_hash).await?, None)
     };
     let written = client
         .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
@@ -1312,6 +1319,19 @@ fn media_source_candidates(hash: &str) -> [String; 3] {
     ]
 }
 
+// This staged mode deliberately keeps the existing processing handoff, whose
+// consumers read the verified GCS backup. Intake-only outboxes would suppress it.
+fn validate_processing_policy(
+    mode: storage::WriteMode,
+    has_url: bool,
+    has_token: bool,
+) -> Result<()> {
+    if mode == storage::WriteMode::B2Primary && (has_url || has_token) {
+        return Err(anyhow!("b2_primary requires legacy processing: leave MEDIA_FINALIZED_URL and MEDIA_FINALIZED_TOKEN unset"));
+    }
+    Ok(())
+}
+
 fn recorded_write_mode(
     objects: &[storage::ObjectRef],
     fallback: storage::WriteMode,
@@ -1323,6 +1343,13 @@ fn recorded_write_mode(
         .iter()
         .any(|object| object.provider == storage::StorageProvider::B2);
     match (gcs, b2) {
+        (true, true)
+            if objects
+                .first()
+                .is_some_and(|o| o.provider == storage::StorageProvider::B2) =>
+        {
+            storage::WriteMode::B2Primary
+        }
         (true, true) => storage::WriteMode::Dual,
         (true, false) => storage::WriteMode::Gcs,
         (false, true) => storage::WriteMode::B2,
@@ -1333,7 +1360,7 @@ fn recorded_write_mode(
 async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::MediaStorage> {
     let objects = match &state.processing_outbox {
         Some(outbox) => outbox.source_objects(hash).await?,
-        None => Vec::new(),
+        None => return state.media_storage.for_recorded_write(hash).await,
     };
     for object in &objects {
         let valid = match object.provider {
@@ -2051,6 +2078,16 @@ mod tests {
             WriteMode::Dual
         );
         assert_eq!(
+            super::recorded_write_mode(
+                &[
+                    reference(StorageProvider::B2),
+                    reference(StorageProvider::Gcs)
+                ],
+                WriteMode::Gcs
+            ),
+            WriteMode::B2Primary
+        );
+        assert_eq!(
             super::recorded_write_mode(&[], WriteMode::Gcs),
             WriteMode::Gcs
         );
@@ -2063,6 +2100,8 @@ mod tests {
         assert!(super::gcs_compatibility(WriteMode::B2, Some("true")).unwrap());
         assert!(super::gcs_compatibility(WriteMode::Dual, None).unwrap());
         assert!(super::gcs_compatibility(WriteMode::Dual, Some("false")).is_err());
+        assert!(super::gcs_compatibility(WriteMode::B2Primary, None).unwrap());
+        assert!(super::gcs_compatibility(WriteMode::B2Primary, Some("false")).is_err());
         assert!(super::gcs_compatibility(WriteMode::B2, Some("invalid")).is_err());
     }
 
@@ -3410,7 +3449,7 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
             )
             .await?
     } else {
-        state.media_storage.clone()
+        state.media_storage.for_recorded_write(&sha256_hash).await?
     };
     let written = storage
         .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
@@ -3572,4 +3611,17 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&result[..32]);
     Ok(key)
+}
+
+#[cfg(test)]
+mod b2_primary_processing_tests {
+    #[test]
+    fn b2_primary_keeps_legacy_handoff_and_rejects_intake_only_suppression() {
+        use crate::storage::WriteMode;
+        assert!(super::validate_processing_policy(WriteMode::B2Primary, false, false).is_ok());
+        for (url, token) in [(true, false), (false, true), (true, true)] {
+            assert!(super::validate_processing_policy(WriteMode::B2Primary, url, token).is_err());
+        }
+        assert!(super::validate_processing_policy(WriteMode::Dual, true, true).is_ok());
+    }
 }

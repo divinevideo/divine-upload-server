@@ -33,7 +33,7 @@ impl ResumableRuntime {
             }
             None => None,
         };
-        if storage.mode != WriteMode::Gcs && database.is_none() {
+        if matches!(storage.mode, WriteMode::B2 | WriteMode::Dual) && database.is_none() {
             bail!("COORDINATION_DATABASE_URL is required for B2 resumable uploads");
         }
         Ok(Self {
@@ -195,6 +195,14 @@ impl SessionStore for ProviderSessionStore {
         }
     }
     async fn save(&self, session: &UploadSession) -> Result<()> {
+        if primary_session(&session.temp_object) {
+            return self
+                .legacy
+                .as_ref()
+                .ok_or_else(|| anyhow!("GCS session storage unavailable"))?
+                .save(session)
+                .await;
+        }
         if let Some(db) = &self.database {
             let next = session
                 .revision
@@ -220,8 +228,12 @@ impl SessionStore for ProviderSessionStore {
     }
     async fn delete(&self, id: &str) -> Result<()> {
         if let Some(db) = &self.database {
-            db.execute("WITH removed AS (DELETE FROM upload_sessions WHERE upload_id=$1 RETURNING upload_id) INSERT INTO upload_session_tombstones(upload_id) VALUES($1) ON CONFLICT(upload_id) DO NOTHING",&[&id]).await.map_err(|_|anyhow!("Session cleanup failed"))?;
-            return Ok(());
+            // Existing PostgreSQL sessions never fall through to the GCS path.
+            let known=db.query_opt("SELECT upload_id FROM upload_sessions WHERE upload_id=$1 UNION ALL SELECT upload_id FROM upload_session_tombstones WHERE upload_id=$1 LIMIT 1",&[&id]).await.map_err(|_|anyhow!("Session deletion lookup failed"))?.is_some();
+            if known {
+                db.execute("WITH removed AS (DELETE FROM upload_sessions WHERE upload_id=$1 RETURNING upload_id) INSERT INTO upload_session_tombstones(upload_id) VALUES($1) ON CONFLICT(upload_id) DO NOTHING",&[&id]).await.map_err(|_|anyhow!("Session cleanup failed"))?;
+                return Ok(());
+            }
         }
         if let Some(store) = &self.legacy {
             store.delete(id).await?;
@@ -237,7 +249,16 @@ pub struct MediaResumableBackend {
 }
 impl MediaResumableBackend {
     pub(crate) fn finalization_storage(&self, session: &UploadSession) -> Result<MediaStorage> {
-        if session.session_url == "staged-v1" {
+        if primary_session(&session.temp_object) {
+            let parts: Vec<_> = session.temp_object.split('/').collect();
+            if parts.len() != 6
+                || parts[2] != hex::encode(self.storage.gcs_bucket())
+                || parts[3] != hex::encode(self.storage.b2_bucket().unwrap_or(""))
+            {
+                bail!("Upload session bucket mapping changed");
+            }
+            self.storage.with_mode(WriteMode::B2Primary)
+        } else if session.session_url == "staged-v1" {
             self.staged_store(&session.temp_object)
         } else {
             self.storage.with_mode(WriteMode::Gcs)
@@ -313,11 +334,7 @@ impl ResumableBackend for MediaResumableBackend {
         session: &UploadSession,
         outbox: &crate::outbox::ProcessingOutbox,
     ) -> Result<()> {
-        let store = if session.session_url == "staged-v1" {
-            self.staged_store(&session.temp_object)?
-        } else {
-            self.storage.with_mode(WriteMode::Gcs)?
-        };
+        let store = self.finalization_storage(session)?;
         outbox
             .begin_upload(
                 &session.final_sha256,
@@ -352,6 +369,40 @@ impl ResumableBackend for MediaResumableBackend {
         }
     }
     async fn finalize(&self, session: &UploadSession) -> Result<bool> {
+        if primary_session(&session.temp_object) {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new()?;
+            let mut stream = self.legacy()?.stream_object(&session.temp_object).await?;
+            let mut size = 0u64;
+            let mut hash = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow!("Upload size overflow"))?;
+                crate::resources::check_size(size)?;
+                if size > session.declared_size {
+                    bail!("Upload staging size changed");
+                }
+                hash.update(&chunk);
+                file.write_all(&chunk)?;
+            }
+            if size != session.declared_size || hex::encode(hash.finalize()) != session.final_sha256
+            {
+                bail!("Upload staging integrity changed");
+            }
+            file.flush()?;
+            let result = self
+                .finalization_storage(session)?
+                .put_file(
+                    &session.final_sha256,
+                    file.path(),
+                    &session.content_type,
+                    Some(&session.owner),
+                )
+                .await?;
+            return Ok(result.newly_stored);
+        }
         if session.session_url != "staged-v1" {
             let exists = self.legacy()?.object_exists(&session.final_sha256).await?;
             if !exists {
@@ -391,6 +442,15 @@ impl ResumableBackend for MediaResumableBackend {
         if self.storage.mode == WriteMode::Gcs {
             return self.legacy()?.create_session(id, owner, mime, size).await;
         }
+        if self.storage.mode == WriteMode::B2Primary {
+            let key = format!(
+                "__resumable/b2_primary/{}/{}/{}/blob",
+                hex::encode(self.storage.gcs_bucket()),
+                hex::encode(self.storage.b2_bucket().unwrap_or("")),
+                id
+            );
+            return self.legacy()?.create_session_at(id, owner, mime, key).await;
+        }
         if size > i64::MAX as u64 {
             bail!("Upload exceeds supported offset range");
         }
@@ -398,6 +458,7 @@ impl ResumableBackend for MediaResumableBackend {
             WriteMode::Gcs => "gcs",
             WriteMode::B2 => "b2",
             WriteMode::Dual => "dual",
+            WriteMode::B2Primary => "b2_primary",
         };
         let key = format!(
             "__resumable/staged/{}/{}/{}/{}",

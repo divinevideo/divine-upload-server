@@ -92,7 +92,6 @@ All configuration comes from environment variables. The table below lists the co
 | `CDN_BASE_URL` | `https://media.divine.video` | Base URL for returned blob and thumbnail URLs. |
 | `UPLOAD_BASE_URL` | `https://upload.divine.video` | Base URL used to build opaque session `uploadUrl`s. |
 | `PORT` | `8080` | Listen port. |
-| `COORDINATION_DATABASE_CA_FILE` | — | Optional public PEM CA bundle for the coordination database; adds trust alongside OS roots while retaining chain and hostname verification. |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
@@ -109,14 +108,64 @@ On the chunk `PUT` path the server independently caps the collected body at 16 M
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 
-Coordination connections upgrade `sslmode=prefer` to required TLS. A configured
-CA file must contain valid PEM certificates within 1 MiB; unreadable, empty or
-malformed bundles fail closed. A configured CA file with `sslmode=disable` is
-rejected. Without a CA file, explicit plaintext remains available only to local
-development endpoints. Use a direct, session-safe PostgreSQL endpoint: the
-existing advisory locks are not compatible with transaction pooling. Public CA
-distribution, approved database references and credential bindings are separate
-deployment prerequisites; this option creates none of them.
+## B2 primary with synchronous GCS backup
+
+`MEDIA_WRITE_PROVIDER=b2_primary` selects a separate staged migration policy:
+B2 is authoritative and is written and fully verified first; the canonical GCS
+backup must then be stored and independently verified before upload success.
+Both immutable references are retained in B2, GCS order. Public hash URLs remain
+unchanged. `dual` retains its historical GCS-first policy.
+
+This mode uses the existing GCS bucket for small private admission records and
+resumable session state; it requires **no coordination database or new worker**.
+Keep `MEDIA_FINALIZED_URL` and `MEDIA_FINALIZED_TOKEN` unset: startup rejects
+those settings in this mode so an intake-only outbox cannot suppress the existing
+HLS, transcription and NSFW hooks. Those processors can continue reading the
+verified canonical GCS backup. Their existing best-effort/retry limitations are
+unchanged. Resumable completion retains its existing NSFW/Core publication and
+on-demand HLS behavior; it does not promise eager HLS or a thumbnail.
+
+Required configuration is the existing GCS bucket/credentials and
+`B2_MEDIA_BUCKET`, `B2_REGION`, `B2_ACCESS_KEY_ID`, `B2_SECRET_ACCESS_KEY`.
+GCS compatibility must remain enabled. `MEDIA_ORIGINAL_WRITE_ENABLED` remains off;
+its preparation-only API is not used as an upload prerequisite.
+
+New resumable sessions stage bytes in GCS under
+`__resumable/b2_primary/<hex GCS bucket>/<hex B2 bucket>/<upload_id>/blob`.
+Completion checks the declared digest and promotes through the pinned B2-first
+policy, including after new admissions are switched back to GCS. New-mode JSON
+session manifests use generation preconditions; deleting a session retains a
+small tombstone so stale writers cannot resurrect it. Old GCS/B2/dual sessions
+retain their original policy and provider requirements.
+
+Per-key admission records at `__resumable/b2-primary-writes/v1/` bind the bytes,
+first metadata and provider buckets using GCS create-only/generation CAS.
+Provider issuance is recorded before effects; the actual immutable B2 receipt
+is recorded before verification, and verified primary identity before backup
+I/O. Multipart upload IDs are retained in the same records. Completed replays
+read exact recorded versions and verify bytes. An explicitly retried verified
+primary with a backup that was never issued can continue without rewriting B2.
+An issued operation with missing/unverified receipt stays pending for explicit
+reconciliation; no TTL, latest-HEAD adoption, automatic repair or blind re-PUT
+clears it. These private records are retained, not automatically garbage-collected.
+
+To roll back new admissions, keep this image, GCS compatibility and the B2
+bucket/credential bindings, and set `MEDIA_WRITE_PROVIDER=gcs`. This GCS-plus-B2
+drain configuration does not require PostgreSQL. New hashes use GCS; recorded
+B2-primary direct/mirror retries and on-demand derivative policy still use their
+accepted record. Existing new-mode resumable sessions finish against their
+pinned buckets. Missing/changed required bindings fail instead of silently
+retargeting. Historical `b2`/`dual` PostgreSQL sessions still require their old
+database and processing settings; this path does not convert or migrate them.
+
+These controls serialize this uploader's new-mode writes; they do not add shared
+copy/erasure exclusion or publication approval. Existing Core pre/post-upload
+policy checks and delivery guards remain in force, with their existing race and
+lookup-error limitations. Ordinary upload paths do not currently join the shared
+B2 copy/erasure gate. Source checks do not prove provider-backed erasure, full
+artifact parity or an activated cutover. Operators must route normal Core uploads
+through this data plane and validate both copies and normal publication before
+claiming the upload switch is working; GCS retirement remains separate.
 
 ## B2 and dual-write transition
 

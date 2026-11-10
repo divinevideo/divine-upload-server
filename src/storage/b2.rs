@@ -234,13 +234,41 @@ impl B2Store {
             .map_err(|_| anyhow!("B2 transport failure; write outcome may require reconciliation"))
     }
     pub async fn stat(&self, key: &str) -> Result<Option<StoredObject>> {
+        self.stat_at(key, None).await
+    }
+    pub(super) async fn stat_reference(
+        &self,
+        reference: &ObjectRef,
+    ) -> Result<Option<StoredObject>> {
+        self.validate_ref(reference)?;
+        if reference.version.as_deref() == Some("null") {
+            bail!("Invalid B2 immutable version");
+        }
+        self.stat_at(&reference.key, reference.version.as_deref())
+            .await
+    }
+    async fn stat_at(
+        &self,
+        key: &str,
+        expected_version: Option<&str>,
+    ) -> Result<Option<StoredObject>> {
         let response = self
-            .request(Method::HEAD, key, None, Bytes::new(), None, None)
+            .request(
+                Method::HEAD,
+                key,
+                expected_version,
+                Bytes::new(),
+                None,
+                None,
+            )
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
         require_success(&response)?;
+        if expected_version.is_some() && response.status() != StatusCode::OK {
+            bail!("Invalid B2 metadata status");
+        }
         let header = |name: &str| {
             response
                 .headers()
@@ -249,8 +277,11 @@ impl B2Store {
                 .map(str::to_owned)
         };
         let version = header("x-amz-version-id")
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.is_empty() && v != "null")
             .ok_or_else(|| anyhow!("B2 response omitted immutable version"))?;
+        if expected_version.is_some_and(|expected| expected != version) {
+            bail!("B2 metadata version mismatch");
+        }
         let size = header("content-length")
             .ok_or_else(|| anyhow!("B2 response omitted content length"))?
             .parse()
@@ -300,9 +331,28 @@ impl B2Store {
         content_type: &str,
         owner: Option<&str>,
     ) -> Result<(ObjectRef, bool)> {
+        self.put_inner(key, bytes, content_type, owner, None).await
+    }
+    async fn put_inner(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        content_type: &str,
+        owner: Option<&str>,
+        admission: Option<&super::primary::Admission>,
+    ) -> Result<(ObjectRef, bool)> {
         if let Some(o) = self.stat(key).await? {
+            if let Some(a) = admission {
+                a.acknowledged(&o.reference).await?;
+            }
             self.verify(&o.reference, &bytes).await?;
+            if let Some(a) = admission {
+                a.verified(&o.reference).await?;
+            }
             return Ok((o.reference, false));
+        }
+        if let Some(a) = admission {
+            a.issued(StorageProvider::B2).await?;
         }
         let result = self
             .request(
@@ -320,13 +370,16 @@ impl B2Store {
                     .headers()
                     .get("x-amz-version-id")
                     .and_then(|v| v.to_str().ok())
-                    .filter(|v| !v.is_empty())
+                    .filter(|v| !v.is_empty() && *v != "null")
                     .ok_or_else(|| anyhow!("B2 write outcome unresolved: version missing"))?;
                 self.reference(key, version.into())
             }
             Ok(response) => {
                 require_success(&response)?;
                 unreachable!()
+            }
+            Err(_) if admission.is_some() => {
+                bail!("B2 write outcome unresolved; retain pending admission")
             }
             Err(_) => {
                 let existing = self
@@ -337,7 +390,13 @@ impl B2Store {
                 return Ok((existing.reference, false));
             }
         };
+        if let Some(a) = admission {
+            a.acknowledged(&reference).await?;
+        }
         self.verify(&reference, &bytes).await?;
+        if let Some(a) = admission {
+            a.verified(&reference).await?;
+        }
         Ok((reference, true))
     }
     pub(super) async fn verify(&self, reference: &ObjectRef, bytes: &Bytes) -> Result<()> {
@@ -387,6 +446,7 @@ impl B2Store {
         if reference.provider != StorageProvider::B2
             || reference.bucket != self.bucket
             || reference.version.as_deref().is_none_or(str::is_empty)
+            || reference.version.as_deref() == Some("null")
         {
             bail!("Invalid B2 object reference");
         }
@@ -442,25 +502,57 @@ impl B2Store {
         content_type: &str,
         owner: Option<&str>,
     ) -> Result<(ObjectRef, bool)> {
+        self.put_file_inner(key, path, content_type, owner, None)
+            .await
+    }
+    pub(super) async fn put_file_admitted(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+        owner: Option<&str>,
+        admission: &super::primary::Admission,
+    ) -> Result<(ObjectRef, bool)> {
+        self.put_file_inner(key, path, content_type, owner, Some(admission))
+            .await
+    }
+    async fn put_file_inner(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+        owner: Option<&str>,
+        admission: Option<&super::primary::Admission>,
+    ) -> Result<(ObjectRef, bool)> {
         use tokio::io::AsyncReadExt;
         let size = tokio::fs::metadata(path).await?.len();
         if let Some(existing) = self.stat(key).await? {
+            if let Some(a) = admission {
+                a.acknowledged(&existing.reference).await?;
+            }
             super::verify_stream(self.stream(&existing.reference).await?, path).await?;
+            if let Some(a) = admission {
+                a.verified(&existing.reference).await?;
+            }
             return Ok((existing.reference, false));
         }
         const PART: usize = 8 * 1024 * 1024;
         if size <= PART as u64 {
             return self
-                .put(
+                .put_inner(
                     key,
                     Bytes::from(tokio::fs::read(path).await?),
                     content_type,
                     owner,
+                    admission,
                 )
                 .await;
         }
         if size > 10000 * PART as u64 {
             bail!("B2 upload exceeds 10000-part limit");
+        }
+        if let Some(a) = admission {
+            a.issued(StorageProvider::B2).await?;
         }
         let response = self
             .request_query(
@@ -475,6 +567,9 @@ impl B2Store {
         require_success(&response)?;
         let xml = control_body(response).await?;
         let upload_id = xml_field(&xml, "UploadId")?;
+        if let Some(a) = admission {
+            a.multipart(&upload_id).await?;
+        }
         let upload_query = format!("uploadId={}", encode(&upload_id));
         if let Err(error) = self.track(key, &upload_id, false).await {
             let _ = self
@@ -539,8 +634,14 @@ impl B2Store {
                 .headers()
                 .get("x-amz-version-id")
                 .and_then(|v| v.to_str().ok())
-                .filter(|v| !v.is_empty())
+                .filter(|v| !v.is_empty() && *v != "null")
                 .map(str::to_owned);
+            let acknowledged = version
+                .as_ref()
+                .map(|version| self.reference(key, version.clone()));
+            if let (Some(a), Some(reference)) = (admission, acknowledged.as_ref()) {
+                a.acknowledged(reference).await?;
+            }
             let body = control_body(response).await?;
             // Some S3-compatible services return an XML Error in a 200 response.
             let document = roxmltree::Document::parse(&body)
@@ -553,6 +654,9 @@ impl B2Store {
                 version.ok_or_else(|| anyhow!("B2 completion omitted immutable version"))?,
             );
             super::verify_stream(self.stream(&reference).await?, path).await?;
+            if let Some(a) = admission {
+                a.verified(&reference).await?;
+            }
             Ok((reference, true))
         }
         .await;

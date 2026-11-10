@@ -196,7 +196,7 @@ impl ProcessingOutbox {
         }
         let required = row.get::<_, bool>(5)
             || (matches!(admission, UploadAdmission::Direct)
-                && recorded_mode == WriteMode::Dual
+                && recorded_mode.requires_both()
                 && size > 0
                 && size <= crate::thumbnail::MAX_SYNC_VIDEO_BYTES as i64
                 && crate::thumbnail::is_video_type(&row.get::<_, String>(1)));
@@ -488,6 +488,7 @@ impl ProcessingOutbox {
                 WriteMode::Gcs => vec![WriteMode::Gcs],
                 WriteMode::B2 => vec![WriteMode::B2],
                 WriteMode::Dual => vec![WriteMode::Gcs, WriteMode::B2],
+                WriteMode::B2Primary => vec![WriteMode::B2, WriteMode::Gcs],
             };
             // Discover all required copies before reading any bodies. A partial
             // dual write can remain pending indefinitely; repeatedly hashing its
@@ -668,6 +669,10 @@ pub(crate) fn required_destinations<'a>(
         WriteMode::Dual => vec![
             (StorageProvider::Gcs, gcs_bucket),
             (StorageProvider::B2, b2()?),
+        ],
+        WriteMode::B2Primary => vec![
+            (StorageProvider::B2, b2()?),
+            (StorageProvider::Gcs, gcs_bucket),
         ],
     })
 }

@@ -16,7 +16,11 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, str::FromStr};
 
 mod b2;
+mod primary;
 pub use b2::B2Store;
+
+#[cfg(test)]
+mod b2_primary_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +29,13 @@ pub enum WriteMode {
     Gcs,
     B2,
     Dual,
+    #[serde(rename = "b2_primary")]
+    B2Primary,
+}
+impl WriteMode {
+    pub(crate) fn requires_both(self) -> bool {
+        matches!(self, Self::Dual | Self::B2Primary)
+    }
 }
 impl FromStr for WriteMode {
     type Err = anyhow::Error;
@@ -33,7 +44,8 @@ impl FromStr for WriteMode {
             "gcs" => Ok(Self::Gcs),
             "b2" => Ok(Self::B2),
             "dual" => Ok(Self::Dual),
-            _ => bail!("MEDIA_WRITE_PROVIDER must be gcs, b2, or dual"),
+            "b2_primary" => Ok(Self::B2Primary),
+            _ => bail!("MEDIA_WRITE_PROVIDER must be gcs, b2, dual, or b2_primary"),
         }
     }
 }
@@ -79,12 +91,10 @@ impl MediaStorage {
         gcs_bucket: String,
         b2: Option<B2Store>,
     ) -> Result<Self> {
-        if matches!(mode, WriteMode::Gcs | WriteMode::Dual)
-            && (gcs.is_none() || gcs_bucket.is_empty())
-        {
+        if mode != WriteMode::B2 && (gcs.is_none() || gcs_bucket.is_empty()) {
             bail!("GCS storage configuration required");
         }
-        if matches!(mode, WriteMode::B2 | WriteMode::Dual) && b2.is_none() {
+        if mode != WriteMode::Gcs && b2.is_none() {
             bail!("B2 storage configuration required");
         }
         Ok(Self {
@@ -97,6 +107,11 @@ impl MediaStorage {
     }
     pub async fn initialize_coordination(&self, database_url: Option<&str>) -> Result<()> {
         if let Some(b2) = &self.b2 {
+            if matches!(self.mode, WriteMode::B2Primary | WriteMode::Gcs) && database_url.is_none()
+            {
+                // New-mode multipart/admission receipts use the existing GCS bucket.
+                return Ok(());
+            }
             b2.initialize_coordination(
                 database_url.ok_or_else(|| anyhow!("B2 coordination database required"))?,
             )
@@ -109,6 +124,16 @@ impl MediaStorage {
         match &self.b2 {
             Some(b2) => b2.sweep_stale_multipart(limit).await,
             None => Ok(0),
+        }
+    }
+    /// A GCS rollback stops new B2 admissions without retargeting a recorded
+    /// B2-primary direct retry or a derivative of an already accepted original.
+    /// Outbox callers keep using their own historical intent resolution.
+    pub(crate) async fn for_recorded_write(&self, key: &str) -> Result<Self> {
+        if self.mode == WriteMode::Gcs && self.b2.is_some() && primary::exists(self, key).await? {
+            self.with_mode(WriteMode::B2Primary)
+        } else {
+            Ok(self.clone())
         }
     }
     pub fn with_mode(&self, mode: WriteMode) -> Result<Self> {
@@ -184,7 +209,7 @@ impl MediaStorage {
     pub async fn stat(&self, key: &str) -> Result<Option<StoredObject>> {
         match self.mode {
             WriteMode::Gcs | WriteMode::Dual => self.gcs_stat(key).await,
-            WriteMode::B2 => self.b2()?.stat(key).await,
+            WriteMode::B2 | WriteMode::B2Primary => self.b2()?.stat(key).await,
         }
     }
     pub async fn read(&self, key: &str) -> Result<Bytes> {
@@ -203,18 +228,19 @@ impl MediaStorage {
     pub async fn read_verified(&self, key: &str) -> Result<Bytes> {
         use futures::StreamExt;
         let bytes = self.read(key).await?;
-        if self.mode != WriteMode::Dual {
+        if !self.mode.requires_both() {
             return Ok(bytes);
         }
-        let b2 = self
-            .b2()?
-            .stat(key)
-            .await?
-            .ok_or_else(|| anyhow!("B2 copy missing"))?;
-        if b2.size != bytes.len() as u64 {
+        let backup = if self.mode == WriteMode::B2Primary {
+            self.gcs_stat(key).await?
+        } else {
+            self.b2()?.stat(key).await?
+        }
+        .ok_or_else(|| anyhow!("Required backup copy missing"))?;
+        if backup.size != bytes.len() as u64 {
             bail!("Dual storage copies differ in size");
         }
-        let mut stream = self.stream_ref(&b2.reference).await?;
+        let mut stream = self.stream_ref(&backup.reference).await?;
         let mut length = 0usize;
         let mut hash = Sha256::new();
         while let Some(chunk) = stream.next().await {
@@ -241,6 +267,16 @@ impl MediaStorage {
         // In dual mode a retry repairing B2 preserves existing GCS metadata,
         // rather than assigning a deduplicated original to the retrying user.
         if self.mode == WriteMode::Dual {
+            if let Some(existing) = self.gcs_stat(key).await? {
+                return Ok((existing.content_type, existing.owner));
+            }
+        }
+        if self.mode == WriteMode::B2Primary {
+            if let Some(existing) = self.b2()?.stat(key).await? {
+                return Ok((existing.content_type, existing.owner));
+            }
+            // Bootstrap a missing primary without changing historical GCS
+            // provenance. This does not make GCS a read/source fallback.
             if let Some(existing) = self.gcs_stat(key).await? {
                 return Ok((existing.content_type, existing.owner));
             }
@@ -377,12 +413,19 @@ impl MediaStorage {
         content_type: &str,
         owner: Option<&str>,
     ) -> Result<WriteResult> {
+        if self.mode == WriteMode::B2Primary {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            return primary::put_file(self, key, file.path(), content_type, owner).await;
+        }
         let _guard = self.write_guard(key).await?;
         let (mut content_type, mut owner) =
             self.inherited_metadata(key, content_type, owner).await?;
         let mut objects = Vec::new();
         let mut newly_stored = false;
-        if matches!(self.mode, WriteMode::Gcs | WriteMode::Dual) {
+        if self.mode != WriteMode::B2 {
             let (r, new) = self
                 .put_gcs(key, bytes.clone(), &content_type, owner.as_deref())
                 .await?;
@@ -453,12 +496,15 @@ impl MediaStorage {
         content_type: &str,
         owner: Option<&str>,
     ) -> Result<WriteResult> {
+        if self.mode == WriteMode::B2Primary {
+            return primary::put_file(self, key, path, content_type, owner).await;
+        }
         let _guard = self.write_guard(key).await?;
         let (mut content_type, mut owner) =
             self.inherited_metadata(key, content_type, owner).await?;
         let mut objects = Vec::new();
         let mut newly_stored = false;
-        if matches!(self.mode, WriteMode::Gcs | WriteMode::Dual) {
+        if self.mode != WriteMode::B2 {
             if let Some(existing) = self.gcs_stat(key).await? {
                 verify_stream(self.stream_ref(&existing.reference).await?, path).await?;
                 objects.push(existing.reference);

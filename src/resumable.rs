@@ -813,22 +813,72 @@ impl GcsSessionStore {
 impl SessionStore for GcsSessionStore {
     async fn load(&self, upload_id: &str) -> Result<Option<UploadSession>> {
         let object = Self::session_object_key(upload_id);
-        match self
+        // Preserve the legacy manifest read contract. Only a new-mode session
+        // takes the additional metadata + pinned read used for generation CAS.
+        let initial = match self
             .client
             .download_object(
                 &GetObjectRequest {
                     bucket: self.bucket.clone(),
-                    object,
+                    object: object.clone(),
                     ..Default::default()
                 },
                 &DownloadRange::default(),
             )
             .await
         {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(error) if is_not_found_error(&error) => Ok(None),
-            Err(error) => Err(anyhow!("Failed to load session manifest: {}", error)),
+            Ok(bytes) => bytes,
+            Err(error) if is_not_found_error(&error) => return Ok(None),
+            Err(_) => return Err(anyhow!("Failed to load session manifest")),
+        };
+        let initial: serde_json::Value =
+            serde_json::from_slice(&initial).map_err(|_| anyhow!("Invalid session manifest"))?;
+        if initial.get("deleted").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(None);
         }
+        let initial: UploadSession =
+            serde_json::from_value(initial).map_err(|_| anyhow!("Invalid session manifest"))?;
+        if !primary_session(&initial.temp_object) {
+            return Ok(Some(initial));
+        }
+        let metadata = match self
+            .client
+            .get_object(&GetObjectRequest {
+                bucket: self.bucket.clone(),
+                object: object.clone(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) if is_not_found_error(&error) => return Ok(None),
+            Err(_) => return Err(anyhow!("Failed to inspect session manifest")),
+        };
+        if metadata.generation <= 0 {
+            return Err(anyhow!("Invalid session manifest generation"));
+        }
+        let bytes = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object,
+                    generation: Some(metadata.generation),
+                    ..Default::default()
+                },
+                &DownloadRange::default(),
+            )
+            .await
+            .map_err(|_| anyhow!("Failed to load pinned session manifest"))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("deleted").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(None);
+        }
+        let mut session: UploadSession = serde_json::from_value(value)?;
+        if primary_session(&session.temp_object) {
+            session.revision = metadata.generation;
+        }
+        Ok(Some(session))
     }
 
     async fn save(&self, session: &UploadSession) -> Result<()> {
@@ -843,6 +893,8 @@ impl SessionStore for GcsSessionStore {
             .upload_object(
                 &UploadObjectRequest {
                     bucket: self.bucket.clone(),
+                    if_generation_match: primary_session(&session.temp_object)
+                        .then_some(session.revision),
                     ..Default::default()
                 },
                 payload,
@@ -856,6 +908,28 @@ impl SessionStore for GcsSessionStore {
 
     async fn delete(&self, upload_id: &str) -> Result<()> {
         let object = Self::session_object_key(upload_id);
+        if let Some(session) = self.load(upload_id).await? {
+            if primary_session(&session.temp_object) {
+                let payload = serde_json::to_vec(&serde_json::json!({"deleted":true}))?;
+                let mut media = Media::new(object);
+                media.content_type = "application/json".into();
+                self.client
+                    .upload_object(
+                        &UploadObjectRequest {
+                            bucket: self.bucket.clone(),
+                            if_generation_match: Some(session.revision),
+                            ..Default::default()
+                        },
+                        payload,
+                        &UploadType::Simple(media),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("Session changed during deletion"))?;
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
         match self
             .client
             .delete_object(&DeleteObjectRequest {
@@ -891,34 +965,17 @@ impl GcsResumableBackend {
     }
 }
 
-fn final_copy_metadata_object(
-    bucket: &str,
-    destination_key: &str,
-    content_type: &str,
-    owner: &str,
-) -> Object {
-    let mut metadata_map = HashMap::new();
-    metadata_map.insert("owner".to_string(), owner.to_string());
-
-    Object {
-        bucket: bucket.to_string(),
-        name: destination_key.to_string(),
-        content_type: Some(content_type.to_string()),
-        metadata: Some(metadata_map),
-        ..Default::default()
-    }
+fn primary_session(key: &str) -> bool {
+    key.starts_with("__resumable/b2_primary/")
 }
-
-#[async_trait]
-impl ResumableBackend for GcsResumableBackend {
-    async fn create_session(
+impl GcsResumableBackend {
+    async fn create_session_at(
         &self,
         upload_id: &str,
         owner: &str,
         content_type: &str,
-        _declared_size: u64,
+        temp_object: String,
     ) -> Result<BackendCreateSession> {
-        let temp_object = Self::temp_object_key(upload_id);
         let mut metadata_map = HashMap::new();
         metadata_map.insert("owner".to_string(), owner.to_string());
         metadata_map.insert("upload_id".to_string(), upload_id.to_string());
@@ -946,6 +1003,43 @@ impl ResumableBackend for GcsResumableBackend {
             session_url: uploader.url().to_string(),
             temp_object,
         })
+    }
+}
+
+fn final_copy_metadata_object(
+    bucket: &str,
+    destination_key: &str,
+    content_type: &str,
+    owner: &str,
+) -> Object {
+    let mut metadata_map = HashMap::new();
+    metadata_map.insert("owner".to_string(), owner.to_string());
+
+    Object {
+        bucket: bucket.to_string(),
+        name: destination_key.to_string(),
+        content_type: Some(content_type.to_string()),
+        metadata: Some(metadata_map),
+        ..Default::default()
+    }
+}
+
+#[async_trait]
+impl ResumableBackend for GcsResumableBackend {
+    async fn create_session(
+        &self,
+        upload_id: &str,
+        owner: &str,
+        content_type: &str,
+        _declared_size: u64,
+    ) -> Result<BackendCreateSession> {
+        self.create_session_at(
+            upload_id,
+            owner,
+            content_type,
+            Self::temp_object_key(upload_id),
+        )
+        .await
     }
 
     async fn upload_chunk(
@@ -2185,3 +2279,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "resumable_gcs_tests.rs"]
+mod gcs_manifest_tests;
