@@ -119,15 +119,30 @@ pub(crate) async fn historical_outbox(
     }))
 }
 
+pub(crate) struct SourceHistory {
+    pub objects: Vec<ObjectRef>,
+    // True only when one committed event itself names B2 then GCS. A union
+    // assembled from separate legacy events cannot establish this policy.
+    pub explicit_primary: bool,
+}
+impl SourceHistory {
+    fn empty() -> Self {
+        Self {
+            objects: Vec::new(),
+            explicit_primary: false,
+        }
+    }
+}
+
 /// Reading accepted source contracts does not require dispatch credentials or
 /// initialize a schema. Absence of a configured history database is the normal
 /// PG-free path; deployments with history must retain that existing binding.
-pub(crate) async fn historical_source_objects(
+pub(crate) async fn historical_source_history(
     storage: &MediaStorage,
     hash: &str,
-) -> Result<Vec<ObjectRef>> {
+) -> Result<SourceHistory> {
     let Some(url) = storage.coordination_url().await else {
-        return Ok(Vec::new());
+        return Ok(SourceHistory::empty());
     };
     let database = crate::coordination::connect(&url).await?;
     let present: bool = database
@@ -139,9 +154,9 @@ pub(crate) async fn historical_source_objects(
         .map_err(|_| anyhow!("Historical source contract lookup failed"))?
         .get(0);
     if !present {
-        return Ok(Vec::new());
+        return Ok(SourceHistory::empty());
     }
-    source_objects_from_client(&database, hash).await
+    source_history_from_client(&database, hash).await
 }
 
 /// Accepted GCS primary records precede existing PG contracts, which precede
@@ -790,6 +805,10 @@ impl ProcessingOutbox {
         let database = self.database.lock().await;
         source_objects_from_client(&database, hash).await
     }
+    pub(crate) async fn source_history(&self, hash: &str) -> Result<SourceHistory> {
+        let database = self.database.lock().await;
+        source_history_from_client(&database, hash).await
+    }
 
     pub async fn dispatch_once(&self, limit: u32) -> Result<u64> {
         let consumer = self.consumer.as_ref().ok_or_else(|| {
@@ -833,10 +852,20 @@ pub(crate) async fn source_objects_from_client(
     database: &Client,
     hash: &str,
 ) -> Result<Vec<ObjectRef>> {
+    Ok(source_history_from_client(database, hash).await?.objects)
+}
+
+async fn source_history_from_client(database: &Client, hash: &str) -> Result<SourceHistory> {
     let Some(row) = database.query_opt("SELECT payload FROM upload_processing_outbox WHERE payload->>'sha256'=$1 ORDER BY finalized_at DESC,job_id DESC LIMIT 1", &[&hash]).await.map_err(|_| anyhow!("Processing source lookup failed"))? else {
-            return Ok(Vec::new());
+            return Ok(SourceHistory::empty());
         };
     let mut objects = event_objects(row.get(0))?;
+    let explicit_primary = objects
+        .first()
+        .is_some_and(|object| object.provider == StorageProvider::B2)
+        && objects
+            .iter()
+            .any(|object| object.provider == StorageProvider::Gcs);
     for provider in [StorageProvider::Gcs, StorageProvider::B2] {
         if objects.iter().any(|object| object.provider == provider) {
             continue;
@@ -851,7 +880,10 @@ pub(crate) async fn source_objects_from_client(
             );
         }
     }
-    Ok(objects)
+    Ok(SourceHistory {
+        objects,
+        explicit_primary,
+    })
 }
 
 fn event_objects(payload: serde_json::Value) -> Result<Vec<ObjectRef>> {

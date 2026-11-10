@@ -159,7 +159,9 @@ the current mode selects new admission. Contradictory accepted records fail
 without rewriting either policy. This precedence also applies when an existing
 outbox is configured during GCS rollback.
 Completed historical source contracts are read independently of dispatcher
-availability for on-demand thumbnails. Background recovery governed by a primary
+availability for on-demand thumbnails. Event provenance is retained: a B2-only
+event combined with an older GCS-only event keeps the historical dual ordering;
+it cannot masquerade as one explicit B2-primary finalization. Background recovery governed by a primary
 record requires its settled exact receipts, checks both pinned copies exist,
 and verifies their bytes; it never adopts current HEAD versions around unknown
 effects or repeatedly downloads a surviving copy when its recorded backup is

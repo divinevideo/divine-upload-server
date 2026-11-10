@@ -1349,13 +1349,6 @@ fn recorded_write_mode(
         .iter()
         .any(|object| object.provider == storage::StorageProvider::B2);
     match (gcs, b2) {
-        (true, true)
-            if objects
-                .first()
-                .is_some_and(|o| o.provider == storage::StorageProvider::B2) =>
-        {
-            storage::WriteMode::B2Primary
-        }
         (true, true) => storage::WriteMode::Dual,
         (true, false) => storage::WriteMode::Gcs,
         (false, true) => storage::WriteMode::B2,
@@ -1367,10 +1360,11 @@ async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::Medi
     if let Some(primary) = state.media_storage.accepted_primary(hash).await? {
         return Ok(primary);
     }
-    let objects = match &state.processing_outbox {
-        Some(outbox) => outbox.source_objects(hash).await?,
-        None => outbox::historical_source_objects(&state.media_storage, hash).await?,
+    let history = match &state.processing_outbox {
+        Some(outbox) => outbox.source_history(hash).await?,
+        None => outbox::historical_source_history(&state.media_storage, hash).await?,
     };
+    let objects = history.objects;
     if objects.is_empty() {
         return state.media_storage.for_recorded_write(hash).await;
     }
@@ -1385,9 +1379,11 @@ async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::Medi
             return Err(anyhow!("Recorded derivative storage mapping changed"));
         }
     }
-    state
-        .media_storage
-        .with_mode(recorded_write_mode(&objects, state.media_storage.mode))
+    state.media_storage.with_mode(if history.explicit_primary {
+        storage::WriteMode::B2Primary
+    } else {
+        recorded_write_mode(&objects, state.media_storage.mode)
+    })
 }
 
 async fn read_derivative_input(
@@ -2101,7 +2097,7 @@ mod tests {
                 ],
                 WriteMode::Gcs
             ),
-            WriteMode::B2Primary
+            WriteMode::Dual
         );
         assert_eq!(
             super::recorded_write_mode(&[], WriteMode::Gcs),

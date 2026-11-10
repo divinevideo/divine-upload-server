@@ -697,10 +697,12 @@ async fn b2_primary_finalization_pins_b2_source_then_required_gcs_replica() {
             .unwrap(),
         written.objects
     );
-    assert_eq!(
-        crate::recorded_write_mode(&written.objects, WriteMode::Gcs),
-        pending.mode
+    let history = outbox.source_history(&hash).await.unwrap();
+    assert!(
+        history.explicit_primary,
+        "the committed event retains its authoritative B2 plus GCS replica provenance"
     );
+    assert_eq!(history.objects, written.objects);
 }
 
 #[tokio::test]
@@ -2534,4 +2536,134 @@ async fn b2_primary_fourth_review_missing_recorded_backup_does_not_redownload_pr
         f.objects.lock().unwrap().read_versions.is_empty(),
         "missing backup must be detected before downloading the surviving original"
     );
+}
+
+#[tokio::test]
+async fn b2_primary_fifth_review_merged_legacy_history_is_not_an_explicit_primary_contract() {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let outbox = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let hash = hex::encode(Sha256::digest(b"original"));
+    let object = |provider, bucket: &str, version: &str| ObjectRef {
+        provider,
+        bucket: bucket.into(),
+        key: hash.clone(),
+        version: Some(version.into()),
+    };
+    for (owner, mode, refs) in [
+        (
+            1,
+            WriteMode::Dual,
+            vec![
+                object(StorageProvider::Gcs, "fixture-gcs", "1"),
+                object(StorageProvider::B2, "fixture-b2", "b2-v1"),
+            ],
+        ),
+        (
+            2,
+            WriteMode::Gcs,
+            vec![object(StorageProvider::Gcs, "fixture-gcs", "2")],
+        ),
+        (
+            3,
+            WriteMode::B2,
+            vec![object(StorageProvider::B2, "fixture-b2", "b2-v2")],
+        ),
+    ] {
+        let owner = format!("{owner:064x}");
+        outbox
+            .begin_upload(
+                &hash,
+                8,
+                "application/octet-stream",
+                &owner,
+                &f.storage.with_mode(mode).unwrap(),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_upload(&hash, 8, "application/octet-stream", &owner, refs)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        outbox.source_objects(&hash).await.unwrap()[0].provider,
+        StorageProvider::B2
+    );
+    assert!(f.objects.lock().unwrap().records.is_empty());
+    for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
+        for global in [false, true] {
+            let configured = f.storage.with_mode(mode).unwrap();
+            *configured.database_url.lock().await = Some(url.clone());
+            let mut state = crate::tests::test_state(None, 1);
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.media_storage = configured;
+            mutable.processing_outbox = global.then(|| outbox.clone());
+            assert_eq!(
+                crate::thumbnail_storage(&state, &hash).await.unwrap().mode,
+                WriteMode::Dual,
+                "merged legacy history must preserve GCS-first ordering under {mode:?}/{global}"
+            );
+        }
+    }
+    assert!(f.objects.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+async fn b2_primary_fifth_review_explicit_single_event_keeps_b2_authoritative_order() {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let outbox = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let hash = hex::encode(Sha256::digest(b"original"));
+    let owner = "e".repeat(64);
+    let refs = vec![
+        ObjectRef {
+            provider: StorageProvider::B2,
+            bucket: "fixture-b2".into(),
+            key: hash.clone(),
+            version: Some("b2-v1".into()),
+        },
+        ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        },
+    ];
+    outbox
+        .begin_upload(&hash, 8, "application/octet-stream", &owner, &f.storage)
+        .await
+        .unwrap();
+    outbox
+        .enqueue_upload(&hash, 8, "application/octet-stream", &owner, refs)
+        .await
+        .unwrap();
+    for global in [false, true] {
+        let configured = f.storage.with_mode(WriteMode::Gcs).unwrap();
+        *configured.database_url.lock().await = Some(url.clone());
+        let mut state = crate::tests::test_state(None, 1);
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.media_storage = configured;
+        mutable.processing_outbox = global.then(|| outbox.clone());
+        assert_eq!(
+            crate::thumbnail_storage(&state, &hash).await.unwrap().mode,
+            WriteMode::B2Primary
+        );
+    }
 }
