@@ -130,7 +130,7 @@ impl MediaStorage {
     /// B2-primary direct retry or a derivative of an already accepted original.
     /// Outbox callers keep using their own historical intent resolution.
     pub(crate) async fn for_recorded_write(&self, key: &str) -> Result<Self> {
-        if self.mode == WriteMode::Gcs && self.b2.is_some() && primary::exists(self, key).await? {
+        if self.mode == WriteMode::Gcs && primary::exists(self, key).await? {
             self.with_mode(WriteMode::B2Primary)
         } else {
             Ok(self.clone())
@@ -145,6 +145,12 @@ impl MediaStorage {
         )?;
         storage.database_url = self.database_url.clone();
         Ok(storage)
+    }
+    pub(crate) async fn coordination_url(&self) -> Option<String> {
+        self.database_url.lock().await.clone()
+    }
+    pub(crate) async fn primary_receipts(&self, key: &str, size: u64) -> Result<Vec<ObjectRef>> {
+        primary::receipts(self, key, size).await
     }
     async fn write_guard(&self, key: &str) -> Result<Option<CanonicalWriteGuard>> {
         let Some(database_url) = self.database_url.lock().await.clone() else {

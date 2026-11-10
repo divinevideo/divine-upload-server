@@ -95,6 +95,7 @@ impl Admission {
         sha256: String,
         mime: &str,
         owner: Option<&str>,
+        completed_only: bool,
     ) -> Result<Self> {
         let name = record_key(key);
         let client = storage.gcs()?.clone();
@@ -181,6 +182,9 @@ impl Admission {
             }
             (metadata.generation, old)
         } else {
+            if completed_only {
+                bail!("Primary session receipts missing");
+            }
             (0, record)
         };
         let admission = Self {
@@ -194,14 +198,20 @@ impl Admission {
         };
         {
             let mut state = admission.state.lock().await;
-            if state.generation == 0 {
+            if completed_only {
+                if !matches!(state.record.b2, Slot::Verified { .. })
+                    || !matches!(state.record.gcs, Slot::Verified { .. })
+                {
+                    bail!("Primary session receipts are not complete");
+                }
+            } else if state.generation == 0 {
                 let record = state.record.clone();
                 admission.persist(&mut state, record).await?;
             } else if matches!(state.record.b2, Slot::Verified { .. })
                 && matches!(state.record.gcs, Slot::Verified { .. })
             {
                 // Completed receipts are read-only replays, independently verified below.
-            } else if matches!(state.record.b2, Slot::Verified { .. })
+            } else if matches!(state.record.b2, Slot::NotIssued | Slot::Verified { .. })
                 && matches!(state.record.gcs, Slot::NotIssued)
             {
                 // Exactly one retry can acquire an unissued backup slot. An older
@@ -305,6 +315,33 @@ fn is_gcs_missing(error: &google_cloud_storage::http::Error) -> bool {
     matches!(error,google_cloud_storage::http::Error::Response(response) if response.code==404)
 }
 
+pub(super) async fn receipts(
+    storage: &MediaStorage,
+    key: &str,
+    size: u64,
+) -> Result<Vec<ObjectRef>> {
+    if !exists(storage, key).await? {
+        bail!("Primary session receipts missing");
+    }
+    let admission = Admission::open(
+        storage,
+        key,
+        size,
+        key.into(),
+        "application/octet-stream",
+        None,
+        true,
+    )
+    .await?;
+    let state = admission.state.lock().await;
+    match (&state.record.b2, &state.record.gcs) {
+        (Slot::Verified { object: primary }, Slot::Verified { object: backup }) => {
+            Ok(vec![primary.clone(), backup.clone()])
+        }
+        _ => bail!("Primary session receipts are not complete"),
+    }
+}
+
 pub(super) async fn put_file(
     storage: &MediaStorage,
     key: &str,
@@ -336,6 +373,7 @@ pub(super) async fn put_file(
         hex::encode(hash.finalize()),
         &mime,
         owner.as_deref(),
+        false,
     )
     .await?;
     let (mime, owner) = {

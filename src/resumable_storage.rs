@@ -41,6 +41,7 @@ impl ResumableRuntime {
                 storage,
                 legacy: backend_gcs,
                 database: database.clone(),
+                database_url: database_url.map(str::to_owned),
             },
             store: ProviderSessionStore {
                 database,
@@ -126,6 +127,7 @@ impl ResumableRuntime {
                 .unwrap(),
                 legacy: Some(GcsResumableBackend::new(client.clone(), "test-bucket")),
                 database: None,
+                database_url: None,
             },
             store: ProviderSessionStore {
                 database: None,
@@ -246,6 +248,7 @@ pub struct MediaResumableBackend {
     storage: MediaStorage,
     legacy: Option<GcsResumableBackend>,
     database: Option<Arc<tokio_postgres::Client>>,
+    database_url: Option<String>,
 }
 impl MediaResumableBackend {
     pub(crate) fn finalization_storage(&self, session: &UploadSession) -> Result<MediaStorage> {
@@ -313,6 +316,20 @@ impl MediaResumableBackend {
 
 #[async_trait]
 impl ResumableBackend for MediaResumableBackend {
+    async fn historical_processing(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        // Old staged B2/dual sessions were admitted under the historical outbox
+        // contract. A new primary admission mode cannot downgrade that contract.
+        if self.storage.mode == WriteMode::B2Primary && session.session_url == "staged-v1" {
+            let url = self.database_url.as_deref().ok_or_else(|| {
+                anyhow!("Historical upload session requires its existing database")
+            })?;
+            return crate::outbox::history_for_session(url).await.map(Some);
+        }
+        Ok(None)
+    }
     async fn is_committed_retry(
         &self,
         session: &UploadSession,
@@ -346,6 +363,12 @@ impl ResumableBackend for MediaResumableBackend {
             .await
     }
     async fn final_objects(&self, session: &UploadSession) -> Result<Vec<ObjectRef>> {
+        if primary_session(&session.temp_object) {
+            return self
+                .finalization_storage(session)?
+                .primary_receipts(&session.final_sha256, session.declared_size)
+                .await;
+        }
         if session.session_url == "staged-v1" {
             let row = self
                 .database()?

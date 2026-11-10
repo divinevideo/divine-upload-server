@@ -873,7 +873,7 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            if state.processing_outbox.is_none() {
+            if state.processing_outbox.is_none() && !response.processing_via_outbox {
                 spawn_nsfw_scan(
                     &state,
                     &response.sha256,
@@ -938,6 +938,7 @@ async fn process_upload(
         spooled_dimensions,
         storage: upload_storage,
         thumbnail_finalization,
+        processing_outbox,
     } = stream_to_gcs_with_hash(
         &state.media_storage,
         state.processing_outbox.as_ref(),
@@ -967,10 +968,7 @@ async fn process_upload(
         {
             Ok(thumbnail) => {
                 if let Some((reservation, originals)) = thumbnail_finalization {
-                    let outbox = state
-                        .processing_outbox
-                        .as_ref()
-                        .ok_or(outbox::ThumbnailPending)?;
+                    let outbox = processing_outbox.as_ref().ok_or(outbox::ThumbnailPending)?;
                     outbox
                         .record_thumbnail(
                             &sha256_hash,
@@ -1026,7 +1024,7 @@ async fn process_upload(
     };
 
     // Trigger HLS transcoding for videos (fire-and-forget)
-    if state.processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
+    if processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
@@ -1046,7 +1044,7 @@ async fn process_upload(
     }
 
     // Trigger transcript generation for transcribable media (audio/video)
-    if state.processing_outbox.is_none() && is_transcribable_type(&content_type) {
+    if processing_outbox.is_none() && is_transcribable_type(&content_type) {
         if let Some(ref transcriber_url) = state.config.transcriber_url {
             let transcriber_url = transcriber_url.clone();
             let hash = sha256_hash.clone();
@@ -1064,7 +1062,7 @@ async fn process_upload(
         }
     }
 
-    if state.processing_outbox.is_none() {
+    if processing_outbox.is_none() {
         spawn_nsfw_scan(&state, &sha256_hash, &content_type, newly_stored);
     }
 
@@ -1097,6 +1095,7 @@ struct StoredUpload {
     spooled_dimensions: Option<String>,
     storage: storage::MediaStorage,
     thumbnail_finalization: Option<(outbox::ThumbnailReservation, Vec<storage::ObjectRef>)>,
+    processing_outbox: Option<outbox::ProcessingOutbox>,
 }
 
 async fn stream_to_gcs_with_hash(
@@ -1133,6 +1132,12 @@ async fn stream_to_gcs_with_hash(
             .await?;
         return Err(original_write::Error::Unavailable.into());
     }
+    let historical = if outbox.is_none() {
+        outbox::historical_outbox(client, &sha256_hash, owner).await?
+    } else {
+        None
+    };
+    let outbox = outbox.or(historical.as_ref());
     let (client, thumbnail_reservation) = if let Some(outbox) = outbox {
         let intent = outbox
             .begin_direct_upload(&sha256_hash, total_size, content_type, owner, client)
@@ -1187,6 +1192,7 @@ async fn stream_to_gcs_with_hash(
         spooled_dimensions,
         storage: client,
         thumbnail_finalization,
+        processing_outbox: outbox.cloned(),
     })
 }
 
@@ -1833,6 +1839,8 @@ mod tests {
             permits.push(permit);
         }
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+
             if uri.query().unwrap_or_default().contains("alt=media") { return "prior-jpeg".into_response(); }
             Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})).into_response()
         }));
@@ -2021,6 +2029,8 @@ mod tests {
         use axum::{http::Uri, response::IntoResponse, routing::get, Router};
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+
             if uri.query().unwrap_or_default().contains("alt=media") {
                 if uri.path().ends_with(".jpg") { return StatusCode::FORBIDDEN.into_response(); }
                 return "not-video".into_response();
@@ -3435,10 +3445,34 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         }
     }
 
-    let trusted_owner =
-        migration_owner(request.owner.as_deref(), state.processing_outbox.is_some());
+    finish_migrate_storage(
+        &state,
+        &request,
+        sha256_hash,
+        total_size,
+        content_type,
+        spool.path(),
+    )
+    .await
+}
+
+async fn finish_migrate_storage(
+    state: &AppState,
+    request: &MigrateRequest,
+    sha256_hash: String,
+    total_size: u64,
+    content_type: String,
+    path: &std::path::Path,
+) -> Result<MigrateResponse> {
+    let historical = if state.processing_outbox.is_none() {
+        outbox::historical_outbox(&state.media_storage, &sha256_hash, "").await?
+    } else {
+        None
+    };
+    let processing_outbox = state.processing_outbox.as_ref().or(historical.as_ref());
+    let trusted_owner = migration_owner(request.owner.as_deref(), processing_outbox.is_some());
     let owner = trusted_owner.unwrap_or("");
-    let storage = if let Some(outbox) = &state.processing_outbox {
+    let storage = if let Some(outbox) = processing_outbox {
         outbox
             .begin_or_resume_upload(
                 &sha256_hash,
@@ -3452,10 +3486,10 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         state.media_storage.for_recorded_write(&sha256_hash).await?
     };
     let written = storage
-        .put_file(&sha256_hash, spool.path(), &content_type, trusted_owner)
+        .put_file(&sha256_hash, path, &content_type, trusted_owner)
         .await?;
 
-    if let Some(outbox) = &state.processing_outbox {
+    if let Some(outbox) = processing_outbox {
         outbox
             .enqueue_upload(
                 &sha256_hash,
@@ -3477,7 +3511,7 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         size: total_size,
         content_type,
         migrated: written.newly_stored,
-        source_url: request.source_url,
+        source_url: request.source_url.clone(),
     })
 }
 

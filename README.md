@@ -145,18 +145,31 @@ is recorded before verification, and verified primary identity before backup
 I/O. Multipart upload IDs are retained in the same records. Completed replays
 read exact recorded versions and verify bytes. An explicitly retried verified
 primary with a backup that was never issued can continue without rewriting B2.
+An admission whose provider slots are both still not-issued can be reacquired
+with generation CAS after a lost admission response or restart; the old actor
+cannot then issue an effect using its stale generation.
 An issued operation with missing/unverified receipt stays pending for explicit
 reconciliation; no TTL, latest-HEAD adoption, automatic repair or blind re-PUT
 clears it. These private records are retained, not automatically garbage-collected.
+
+If a database already holds historical pending upload intents, retaining its
+existing configuration preserves that state: direct/mirror retries resolve the
+old reservation, thumbnail barrier and ordered event receipt per request. New
+hashes do not create PostgreSQL intents or suppress legacy processing. Historical
+events still require their already configured consumer/deployment for delivery;
+this mode does not create a replacement dispatcher. A deployment with no such
+history needs no database. Do not discard an existing history database or its
+consumer while accepted work remains.
 
 To roll back new admissions, keep this image, GCS compatibility and the B2
 bucket/credential bindings, and set `MEDIA_WRITE_PROVIDER=gcs`. This GCS-plus-B2
 drain configuration does not require PostgreSQL. New hashes use GCS; recorded
 B2-primary direct/mirror retries and on-demand derivative policy still use their
 accepted record. Existing new-mode resumable sessions finish against their
-pinned buckets. Missing/changed required bindings fail instead of silently
-retargeting. Historical `b2`/`dual` PostgreSQL sessions still require their old
-database and processing settings; this path does not convert or migrate them.
+pinned buckets. Keep the same GCS bucket as the state anchor; moving that bucket
+is not a supported admission rollback. Within that retained state namespace,
+missing or changed B2 bindings fail instead of silently retargeting. Historical
+`b2`/`dual` PostgreSQL sessions still require their old database and processing settings; this path does not convert or migrate them.
 
 These controls serialize this uploader's new-mode writes; they do not add shared
 copy/erasure exclusion or publication approval. Existing Core pre/post-upload

@@ -85,6 +85,8 @@ pub struct StreamingInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteUploadResponse {
+    #[serde(skip)]
+    pub(crate) processing_via_outbox: bool,
     pub sha256: String,
     pub size: u64,
     pub content_type: String,
@@ -226,6 +228,12 @@ pub trait ResumableBackend: Clone + Send + Sync + 'static {
         _session: &UploadSession,
     ) -> Result<Vec<crate::storage::ObjectRef>> {
         Ok(Vec::new())
+    }
+    async fn historical_processing(
+        &self,
+        _session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        Ok(None)
     }
     async fn begin_finalization(
         &self,
@@ -558,6 +566,15 @@ where
             return Err(ResumableError::Gone("Upload session expired".to_string()));
         }
 
+        let historical = if self.outbox.is_none() {
+            self.backend
+                .historical_processing(&session)
+                .await
+                .map_err(internal_error)?
+        } else {
+            None
+        };
+        let outbox = self.outbox.as_ref().or(historical.as_ref());
         if session.next_offset != session.declared_size {
             return Err(ResumableError::Conflict(format!(
                 "Upload incomplete: {} of {} bytes committed",
@@ -568,7 +585,7 @@ where
         if session.finalized_object.is_some() {
             // A committed receipt answers the replay without asking storage for
             // the final objects again.
-            if let Some(outbox) = &self.outbox {
+            if let Some(outbox) = outbox {
                 if outbox
                     .has_session_receipt(
                         &session.upload_id,
@@ -579,15 +596,17 @@ where
                     .await
                     .map_err(internal_error)?
                 {
-                    return Ok(self.build_complete_upload_response(
+                    let mut response = self.build_complete_upload_response(
                         &session.final_sha256,
                         session.declared_size,
                         &session.content_type,
                         false,
-                    ));
+                    );
+                    response.processing_via_outbox = true;
+                    return Ok(response);
                 }
             }
-            return self.completed_response(&session, false).await;
+            return self.completed_response(&session, false, outbox).await;
         }
 
         crate::resources::check_size(session.declared_size)
@@ -613,7 +632,7 @@ where
             )));
         }
 
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = outbox {
             self.backend
                 .begin_finalization(&session, outbox)
                 .await
@@ -631,7 +650,8 @@ where
         self.store.save(&session).await.map_err(internal_error)?;
         let _ = self.backend.delete_object(&session.temp_object).await;
 
-        self.completed_response(&session, newly_stored).await
+        self.completed_response(&session, newly_stored, outbox)
+            .await
     }
 
     pub async fn abort_session(
@@ -660,8 +680,9 @@ where
         &self,
         session: &UploadSession,
         newly_stored: bool,
+        outbox: Option<&crate::outbox::ProcessingOutbox>,
     ) -> std::result::Result<CompleteUploadResponse, ResumableError> {
-        let response = self.build_complete_upload_response(
+        let mut response = self.build_complete_upload_response(
             &session.final_sha256,
             session.declared_size,
             &session.content_type,
@@ -669,7 +690,7 @@ where
         );
         // Only the processing outbox consumes the object references. Without one,
         // looking them up adds a failure after the bytes are already stored.
-        if let Some(outbox) = &self.outbox {
+        if let Some(outbox) = outbox {
             let objects = self
                 .backend
                 .final_objects(session)
@@ -686,6 +707,7 @@ where
                 .await
                 .map_err(internal_error)?;
         }
+        response.processing_via_outbox = outbox.is_some();
         Ok(response)
     }
 
@@ -762,6 +784,7 @@ where
         };
 
         CompleteUploadResponse {
+            processing_via_outbox: false,
             sha256: sha256.to_string(),
             size,
             content_type: content_type.to_string(),

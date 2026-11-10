@@ -59,7 +59,7 @@ enum UploadAdmission {
 #[derive(Clone)]
 pub struct ProcessingOutbox {
     database: Arc<Mutex<Client>>,
-    consumer: ProcessingClient,
+    consumer: Option<ProcessingClient>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +81,37 @@ pub(crate) async fn initialize_schema(client: &Client) -> Result<()> {
         .map_err(|_| anyhow!("processing database schema initialization failed"))
 }
 
+/// Only reuse an already accepted pending intent. This creates neither a new
+/// database/schema nor intents for new B2-primary admissions. Dispatch remains
+/// the responsibility of the historical deployment's configured consumer.
+pub(crate) async fn historical_outbox(
+    storage: &MediaStorage,
+    hash: &str,
+    owner: &str,
+) -> Result<Option<ProcessingOutbox>> {
+    let Some(url) = storage.coordination_url().await else {
+        return Ok(None);
+    };
+    let database = crate::coordination::connect(&url).await?;
+    let existing=match database.query_opt("SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed",&[&hash,&owner]).await {
+        Ok(row)=>row.is_some(),
+        Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)=>false,
+        Err(_)=>bail!("Historical upload intent lookup failed"),
+    };
+    Ok(existing.then(|| ProcessingOutbox {
+        database: Arc::new(Mutex::new(database)),
+        consumer: None,
+    }))
+}
+
+pub(crate) async fn history_for_session(url: &str) -> Result<ProcessingOutbox> {
+    let database = crate::coordination::connect(url).await?;
+    Ok(ProcessingOutbox {
+        database: Arc::new(Mutex::new(database)),
+        consumer: None,
+    })
+}
+
 impl ProcessingOutbox {
     pub async fn connect(database_url: &str, endpoint: &str, bearer_token: &str) -> Result<Self> {
         let consumer = ProcessingClient::new(endpoint, bearer_token)?;
@@ -88,7 +119,7 @@ impl ProcessingOutbox {
         initialize_schema(&client).await?;
         Ok(Self {
             database: Arc::new(Mutex::new(client)),
-            consumer,
+            consumer: Some(consumer),
         })
     }
 
@@ -177,6 +208,11 @@ impl ProcessingOutbox {
             .map_err(|_| anyhow!("upload intent transaction failed"))?;
         tx.execute("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO NOTHING", &[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
         let previous = tx.query_one("SELECT completed,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 FOR UPDATE", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
+        if self.consumer.is_none() && previous.get::<_, bool>(0) {
+            // The historical lookup raced completion. Do not turn this adapter
+            // into authority to create/reset a new admission on a stale lookup.
+            return Err(IntentConflict.into());
+        }
         let changed = previous.get::<_, String>(1) != mode
             || previous.get::<_, String>(2) != gcs_bucket
             || previous.get::<_, Option<String>>(3).as_deref() != b2_bucket;
@@ -572,6 +608,9 @@ impl ProcessingOutbox {
     }
 
     pub async fn dispatch_once(&self, limit: u32) -> Result<u64> {
+        let consumer = self.consumer.as_ref().ok_or_else(|| {
+            anyhow!("Historical upload receipts require their existing configured dispatcher")
+        })?;
         let mut delivered = 0;
         for _ in 0..limit.min(100) {
             let token = format!("{:032x}", rand::random::<u128>());
@@ -585,7 +624,7 @@ impl ProcessingOutbox {
             let attempts: i32 = row.get(2);
             let event = serde_json::from_value::<MediaFinalizedV1>(payload);
             let success = match event {
-                Ok(event) => self.consumer.deliver(&event).await.is_ok(),
+                Ok(event) => consumer.deliver(&event).await.is_ok(),
                 Err(_) => false,
             };
             let client = self.database.lock().await;
@@ -1784,7 +1823,7 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new_for_test(&endpoint, "fixture-token").unwrap(),
+            consumer: Some(ProcessingClient::new_for_test(&endpoint, "fixture-token").unwrap()),
         };
         let storage = MediaStorage::new(
             WriteMode::Gcs,
@@ -1955,8 +1994,10 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
-                .unwrap(),
+            consumer: Some(
+                ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
+                    .unwrap(),
+            ),
         };
         let owner = "b".repeat(64);
         outbox
@@ -2106,8 +2147,10 @@ pub(crate) mod tests {
         db.batch_execute(&schema()).await.unwrap();
         let outbox = ProcessingOutbox {
             database: Arc::new(Mutex::new(db)),
-            consumer: ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
-                .unwrap(),
+            consumer: Some(
+                ProcessingClient::new("https://processor.invalid/finalized", "fixture-token")
+                    .unwrap(),
+            ),
         };
         let owner = "b".repeat(64);
         outbox
