@@ -54,6 +54,21 @@ enum UploadAdmission {
     Session,
     Resume,
     Direct,
+    PinnedDirect,
+    PinnedResume,
+}
+impl UploadAdmission {
+    fn is_direct(self) -> bool {
+        matches!(self, Self::Direct | Self::PinnedDirect)
+    }
+    fn pinned(self) -> bool {
+        matches!(self, Self::PinnedDirect | Self::PinnedResume)
+    }
+}
+pub(crate) struct ResolvedAdmission {
+    pub storage: MediaStorage,
+    pub thumbnail: Option<ThumbnailReservation>,
+    pub processing_outbox: Option<ProcessingOutbox>,
 }
 
 #[derive(Clone)]
@@ -104,12 +119,72 @@ pub(crate) async fn historical_outbox(
     }))
 }
 
-pub(crate) async fn history_for_session(url: &str) -> Result<ProcessingOutbox> {
+/// Accepted GCS primary records precede existing PG contracts, which precede
+/// current new-admission defaults. Contradictory accepted policies fail closed.
+pub(crate) async fn resolve_admission(
+    storage: &MediaStorage,
+    global: Option<&ProcessingOutbox>,
+    hash: &str,
+    size: u64,
+    mime: &str,
+    owner: &str,
+    direct: bool,
+) -> Result<ResolvedAdmission> {
+    let primary = storage.accepted_primary(hash).await?;
+    let pinned = primary.is_some();
+    let storage = primary.unwrap_or_else(|| storage.clone());
+    let processing_outbox = match global {
+        Some(value) => Some(value.clone()),
+        None => historical_outbox(&storage, hash, owner).await?,
+    };
+    let (storage, thumbnail) = if let Some(outbox) = &processing_outbox {
+        let admission = match (direct, pinned) {
+            (true, true) => UploadAdmission::PinnedDirect,
+            (false, true) => UploadAdmission::PinnedResume,
+            (true, false) => UploadAdmission::Direct,
+            (false, false) => UploadAdmission::Resume,
+        };
+        let intent = if pinned {
+            outbox
+                .reserve_upload(hash, size, mime, owner, &storage, admission)
+                .await?
+        } else if direct {
+            outbox
+                .begin_direct_upload(hash, size, mime, owner, &storage)
+                .await?
+        } else {
+            DirectUploadIntent {
+                storage: outbox
+                    .begin_or_resume_upload(hash, size, mime, owner, &storage)
+                    .await?,
+                thumbnail: None,
+            }
+        };
+        (intent.storage, intent.thumbnail)
+    } else {
+        (storage, None)
+    };
+    Ok(ResolvedAdmission {
+        storage,
+        thumbnail,
+        processing_outbox,
+    })
+}
+pub(crate) async fn history_for_accepted_session(
+    url: &str,
+    id: &str,
+    hash: &str,
+    owner: &str,
+    old_non_gcs: bool,
+) -> Result<Option<ProcessingOutbox>> {
     let database = crate::coordination::connect(url).await?;
-    Ok(ProcessingOutbox {
+    let accepted=match database.query_one("SELECT EXISTS(SELECT 1 FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 AND NOT completed) OR (($4 OR EXISTS(SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$3)) AND EXISTS(SELECT 1 FROM upload_sessions WHERE upload_id=$3 AND state->>'final_sha256'=$1 AND state->>'owner'=$2))",&[&hash,&owner,&id,&old_non_gcs]).await {
+        Ok(row)=>row.get::<_,bool>(0),Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)=>false,Err(_)=>bail!("Historical session contract lookup failed"),
+    };
+    Ok(accepted.then(|| ProcessingOutbox {
         database: Arc::new(Mutex::new(database)),
         consumer: None,
-    })
+    }))
 }
 
 impl ProcessingOutbox {
@@ -208,15 +283,23 @@ impl ProcessingOutbox {
             .map_err(|_| anyhow!("upload intent transaction failed"))?;
         tx.execute("INSERT INTO upload_processing_intents(sha256,owner,size,content_type,write_mode,gcs_bucket,b2_bucket) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(sha256,owner) DO NOTHING", &[&hash,&owner,&size,&content_type,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent persistence failed"))?;
         let previous = tx.query_one("SELECT completed,write_mode,gcs_bucket,b2_bucket FROM upload_processing_intents WHERE sha256=$1 AND owner=$2 FOR UPDATE", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
-        if self.consumer.is_none() && previous.get::<_, bool>(0) {
+        if self.consumer.is_none()
+            && previous.get::<_, bool>(0)
+            && !matches!(admission, UploadAdmission::Session)
+        {
             // The historical lookup raced completion. Do not turn this adapter
             // into authority to create/reset a new admission on a stale lookup.
+            // A separately accepted session can attach its own receipt to a
+            // completed historical event; its pinned Session contract is retained.
             return Err(IntentConflict.into());
         }
         let changed = previous.get::<_, String>(1) != mode
             || previous.get::<_, String>(2) != gcs_bucket
             || previous.get::<_, Option<String>>(3).as_deref() != b2_bucket;
-        if previous.get::<_, bool>(0) && (changed || matches!(admission, UploadAdmission::Direct)) {
+        if admission.pinned() && !previous.get::<_, bool>(0) && changed {
+            return Err(IntentConflict.into());
+        }
+        if previous.get::<_, bool>(0) && (changed || admission.is_direct()) {
             tx.execute("UPDATE upload_processing_intents SET write_mode=$3,gcs_bucket=$4,b2_bucket=$5,completed=false,sync_thumbnail_generation=NULL,sync_thumbnail_required=false,sync_thumbnail_receipt=NULL WHERE sha256=$1 AND owner=$2", &[&hash,&owner,&mode,&gcs_bucket,&b2_bucket]).await.map_err(|_|anyhow!("upload intent readmission failed"))?;
         }
         let row = tx.query_one("SELECT size,content_type,write_mode,gcs_bucket,b2_bucket,sync_thumbnail_required,sync_thumbnail_generation FROM upload_processing_intents WHERE sha256=$1 AND owner=$2", &[&hash,&owner]).await.map_err(|_|anyhow!("upload intent lookup failed"))?;
@@ -231,7 +314,7 @@ impl ProcessingOutbox {
             return Err(IntentConflict.into());
         }
         let required = row.get::<_, bool>(5)
-            || (matches!(admission, UploadAdmission::Direct)
+            || (admission.is_direct()
                 && recorded_mode.requires_both()
                 && size > 0
                 && size <= crate::thumbnail::MAX_SYNC_VIDEO_BYTES as i64
@@ -991,6 +1074,8 @@ pub(crate) mod tests {
         let app = Router::new().route("/*path", any(move |method: Method, uri: Uri| {
             let mut hash = fixture_hash.clone(); let mut bytes = fixture_bytes.clone(); let availability=availability.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (axum::http::StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 let thumbnail=uri.path().ends_with(".jpg");
                 if thumbnail { hash.push_str(".jpg"); bytes=bytes::Bytes::from_static(b"existing-synthetic-jpeg"); }
                 if method != Method::GET && method != Method::HEAD { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
@@ -1583,6 +1668,8 @@ pub(crate) mod tests {
             let hash = fixture_hash.clone();
             let seen = seen.clone();
             async move {
+                if uri.path().contains("b2-primary-writes") {return (axum::http::StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();}
+
                 assert!(method == Method::GET || method == Method::HEAD,
                     "already stored originals must be verified without overwriting");
                 if uri.path().starts_with("/storage/") {

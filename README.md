@@ -152,6 +152,17 @@ An issued operation with missing/unverified receipt stays pending for explicit
 reconciliation; no TTL, latest-HEAD adoption, automatic repair or blind re-PUT
 clears it. These private records are retained, not automatically garbage-collected.
 
+Direct, mirror and on-demand policy selection checks accepted state before either
+legacy or outbox handling: a validated GCS primary record pins its provider set;
+otherwise an existing PostgreSQL contract retains its accepted policy; otherwise
+the current mode selects new admission. Contradictory accepted records fail
+without rewriting either policy. This precedence also applies when an existing
+outbox is configured during GCS rollback.
+Historical resumable sessions retain their original provider ordering. If a
+primary admission already owns the same key, a historical session can only reuse
+both settled copies after checking their exact versions and full byte identity;
+it cannot perform a legacy write around a partial primary admission.
+
 If a database already holds historical pending upload intents, retaining its
 existing configuration preserves that state: direct/mirror retries resolve the
 old reservation, thumbnail barrier and ordered event receipt per request. New

@@ -84,7 +84,12 @@ impl ResumableRuntime {
                 }
                 // Before the session, so a failure leaves it for the next pass
                 // rather than orphaning a receipt no sweep will find again.
-                if let Some(outbox) = outbox {
+                let historical = if outbox.is_none() {
+                    self.backend.historical_processing(&session).await?
+                } else {
+                    None
+                };
+                if let Some(outbox) = outbox.or(historical.as_ref()) {
                     outbox.forget_session_receipt(&id).await?;
                 }
                 self.store.delete(&id).await?;
@@ -320,14 +325,18 @@ impl ResumableBackend for MediaResumableBackend {
         &self,
         session: &UploadSession,
     ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
-        // Old staged B2/dual sessions were admitted under the historical outbox
-        // contract. A new primary admission mode cannot downgrade that contract.
-        if self.storage.mode == WriteMode::B2Primary && session.session_url == "staged-v1" {
-            let url = self.database_url.as_deref().ok_or_else(|| {
-                anyhow!("Historical upload session requires its existing database")
-            })?;
-            return crate::outbox::history_for_session(url).await.map(Some);
+        if let Some(url) = self.database_url.as_deref() {
+            let mode = self.finalization_storage(session)?.mode;
+            return crate::outbox::history_for_accepted_session(
+                url,
+                &session.upload_id,
+                &session.final_sha256,
+                &session.owner,
+                matches!(mode, WriteMode::B2 | WriteMode::Dual),
+            )
+            .await;
         }
+
         Ok(None)
     }
     async fn is_committed_retry(
@@ -363,6 +372,33 @@ impl ResumableBackend for MediaResumableBackend {
             .await
     }
     async fn final_objects(&self, session: &UploadSession) -> Result<Vec<ObjectRef>> {
+        if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+            let refs = primary
+                .primary_receipts(&session.final_sha256, session.declared_size)
+                .await?;
+            let mode = self.finalization_storage(session)?.mode;
+            let providers = match mode {
+                WriteMode::Gcs => vec![crate::storage::StorageProvider::Gcs],
+                WriteMode::B2 => vec![crate::storage::StorageProvider::B2],
+                WriteMode::Dual => vec![
+                    crate::storage::StorageProvider::Gcs,
+                    crate::storage::StorageProvider::B2,
+                ],
+                WriteMode::B2Primary => vec![
+                    crate::storage::StorageProvider::B2,
+                    crate::storage::StorageProvider::Gcs,
+                ],
+            };
+            return providers
+                .into_iter()
+                .map(|provider| {
+                    refs.iter()
+                        .find(|object| object.provider == provider)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Recorded session copy missing"))
+                })
+                .collect();
+        }
         if primary_session(&session.temp_object) {
             return self
                 .finalization_storage(session)?
@@ -392,6 +428,21 @@ impl ResumableBackend for MediaResumableBackend {
         }
     }
     async fn finalize(&self, session: &UploadSession) -> Result<bool> {
+        if !primary_session(&session.temp_object) {
+            if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+                // A historical session may reuse settled, exact copies; it must
+                // not bypass a partial primary admission with a legacy write.
+                for object in primary
+                    .primary_receipts(&session.final_sha256, session.declared_size)
+                    .await?
+                {
+                    primary
+                        .verify_ref_identity(&object, &session.final_sha256, session.declared_size)
+                        .await?;
+                }
+                return Ok(false);
+            }
+        }
         if primary_session(&session.temp_object) {
             use std::io::Write;
             let mut file = tempfile::NamedTempFile::new()?;
@@ -972,6 +1023,9 @@ mod integration_tests {
         headers: HeaderMap,
         body: BodyBytes,
     ) -> axum::response::Response {
+        if uri.path().contains("b2-primary-writes") {
+            return (StatusCode::NOT_FOUND,axum::Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();
+        }
         let key = uri.path().to_string();
         if method == Method::PUT {
             objects.lock().unwrap().insert(
@@ -1041,7 +1095,7 @@ mod integration_tests {
             "secret".into(),
         )
         .unwrap()
-        .with_endpoint(endpoint);
+        .with_endpoint(endpoint.clone());
         let storage = MediaStorage::new(
             WriteMode::B2,
             None,
@@ -1061,11 +1115,12 @@ mod integration_tests {
             1024 * 1024,
             86400,
         );
+        let owner = "e".repeat(64);
         let bytes = Bytes::from(vec![42; 1024 * 1024 + 8]);
         let hash = hex::encode(Sha256::digest(&bytes));
         let init = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1087,7 +1142,13 @@ mod integration_tests {
             .await
             .unwrap();
         drop(manager);
-        let gcs = GcsClient::new(google_cloud_storage::client::ClientConfig::default().anonymous());
+        let gcs = GcsClient::new(
+            google_cloud_storage::client::ClientConfig {
+                storage_endpoint: endpoint.clone(),
+                ..Default::default()
+            }
+            .anonymous(),
+        );
         let switched = MediaStorage::new(
             WriteMode::Gcs,
             Some(gcs.clone()),
@@ -1145,7 +1206,7 @@ mod integration_tests {
             .await
             .unwrap();
         let complete = manager
-            .complete_session(&init.upload_id, "owner")
+            .complete_session(&init.upload_id, &owner)
             .await
             .unwrap();
         assert!(complete.newly_stored);
@@ -1165,7 +1226,7 @@ mod integration_tests {
         );
         assert!(
             !manager
-                .complete_session(&init.upload_id, "owner")
+                .complete_session(&init.upload_id, &owner)
                 .await
                 .unwrap()
                 .newly_stored
@@ -1208,7 +1269,7 @@ mod integration_tests {
         );
         let aborted = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1245,7 +1306,7 @@ mod integration_tests {
             .all(|key| !key.contains(&aborted.upload_id)));
         let expired = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: hash.clone(),
                     size: bytes.len() as u64,
@@ -1358,7 +1419,7 @@ mod integration_tests {
         assert_eq!(event_count, 0, "rejected bytes must not enqueue processing");
         let uncertain = manager
             .init_session(
-                "owner",
+                &owner,
                 ResumableUploadInitRequest {
                     sha256: "f".repeat(64),
                     size: 8,

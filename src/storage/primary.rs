@@ -47,9 +47,11 @@ fn record_key(key: &str) -> String {
         hex::encode(Sha256::digest(key.as_bytes()))
     )
 }
-pub(super) async fn exists(storage: &MediaStorage, key: &str) -> Result<bool> {
-    match storage
-        .gcs()?
+async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Versioned>> {
+    let Some(client) = storage.gcs.as_ref() else {
+        return Ok(None);
+    };
+    let metadata = match client
         .get_object(&GetObjectRequest {
             bucket: storage.gcs_bucket().into(),
             object: record_key(key),
@@ -57,10 +59,65 @@ pub(super) async fn exists(storage: &MediaStorage, key: &str) -> Result<bool> {
         })
         .await
     {
-        Ok(_) => Ok(true),
-        Err(error) if is_gcs_missing(&error) => Ok(false),
-        Err(_) => Err(anyhow!("Recorded write policy lookup failed")),
+        Ok(value) => value,
+        Err(error) if is_gcs_missing(&error) => return Ok(None),
+        Err(_) => bail!("B2-primary admission lookup failed"),
+    };
+    if metadata.generation <= 0 || !(0..=16384).contains(&metadata.size) {
+        bail!("Invalid B2-primary admission record");
     }
+    let bytes = client
+        .download_object(
+            &GetObjectRequest {
+                bucket: storage.gcs_bucket().into(),
+                object: record_key(key),
+                generation: Some(metadata.generation),
+                ..Default::default()
+            },
+            &Range::default(),
+        )
+        .await
+        .map_err(|_| anyhow!("B2-primary admission read failed"))?;
+    let old: Record = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow!("Invalid B2-primary admission record"))?;
+    if old.schema_version != 1
+        || old.mode != WriteMode::B2Primary
+        || old.key != key
+        || old.gcs_bucket != storage.gcs_bucket()
+        || Some(old.b2_bucket.as_str()) != storage.b2_bucket()
+    {
+        bail!("B2-primary admission identity or provider mapping changed");
+    }
+    for (provider, slot, bucket) in [
+        (StorageProvider::B2, &old.b2, &old.b2_bucket),
+        (StorageProvider::Gcs, &old.gcs, &old.gcs_bucket),
+    ] {
+        if let Slot::Acknowledged { object } | Slot::Verified { object } = slot {
+            if object.provider != provider
+                || object.bucket != *bucket
+                || object.key != old.key
+                || object
+                    .version
+                    .as_deref()
+                    .is_none_or(|v| v.is_empty() || v == "null")
+                || (provider == StorageProvider::Gcs
+                    && object
+                        .version
+                        .as_ref()
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .is_none_or(|v| v <= 0))
+            {
+                bail!("Invalid B2-primary recorded provider receipt");
+            }
+        }
+    }
+    Ok(Some(Versioned {
+        generation: metadata.generation,
+        record: old,
+    }))
+}
+pub(super) async fn exists(storage: &MediaStorage, key: &str) -> Result<bool> {
+    Ok(read_record(storage, key).await?.is_some())
 }
 impl Admission {
     async fn persist(&self, state: &mut Versioned, record: Record) -> Result<()> {
@@ -117,75 +174,19 @@ impl Admission {
             b2: Slot::NotIssued,
             gcs: Slot::NotIssued,
         };
-        let metadata = match client
-            .get_object(&GetObjectRequest {
-                bucket: storage.gcs_bucket().into(),
-                object: name.clone(),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(object) => Some(object),
-            Err(error) if is_gcs_missing(&error) => None,
-            Err(_) => bail!("B2-primary admission lookup failed"),
-        };
-        let (generation, stored) = if let Some(metadata) = metadata {
-            if metadata.generation <= 0 || metadata.size > 16384 {
-                bail!("Invalid B2-primary admission record");
-            }
-            let payload = client
-                .download_object(
-                    &GetObjectRequest {
-                        bucket: storage.gcs_bucket().into(),
-                        object: name.clone(),
-                        generation: Some(metadata.generation),
-                        ..Default::default()
-                    },
-                    &Range::default(),
-                )
-                .await
-                .map_err(|_| anyhow!("B2-primary admission read failed"))?;
-            let old: Record = serde_json::from_slice(&payload)
-                .map_err(|_| anyhow!("Invalid B2-primary admission record"))?;
-            if old.schema_version != 1
-                || old.mode != WriteMode::B2Primary
-                || old.key != record.key
-                || old.gcs_bucket != record.gcs_bucket
-                || old.b2_bucket != record.b2_bucket
-                || old.size != size
-                || old.sha256 != record.sha256
-            {
-                bail!("B2-primary admission identity or provider mapping changed");
-            }
-            for (provider, slot, bucket) in [
-                (StorageProvider::B2, &old.b2, &old.b2_bucket),
-                (StorageProvider::Gcs, &old.gcs, &old.gcs_bucket),
-            ] {
-                if let Slot::Acknowledged { object } | Slot::Verified { object } = slot {
-                    if object.provider != provider
-                        || object.bucket != *bucket
-                        || object.key != old.key
-                        || object
-                            .version
-                            .as_deref()
-                            .is_none_or(|v| v.is_empty() || v == "null")
-                        || (provider == StorageProvider::Gcs
-                            && object
-                                .version
-                                .as_ref()
-                                .and_then(|v| v.parse::<i64>().ok())
-                                .is_none_or(|v| v <= 0))
-                    {
-                        bail!("Invalid B2-primary recorded provider receipt");
-                    }
+        let (generation, stored) = match read_record(storage, key).await? {
+            Some(value) => {
+                if value.record.size != size || value.record.sha256 != record.sha256 {
+                    bail!("B2-primary admission byte identity changed");
                 }
+                (value.generation, value.record)
             }
-            (metadata.generation, old)
-        } else {
-            if completed_only {
-                bail!("Primary session receipts missing");
+            None => {
+                if completed_only {
+                    bail!("Primary session receipts missing");
+                }
+                (0, record)
             }
-            (0, record)
         };
         let admission = Self {
             client,
@@ -320,9 +321,6 @@ pub(super) async fn receipts(
     key: &str,
     size: u64,
 ) -> Result<Vec<ObjectRef>> {
-    if !exists(storage, key).await? {
-        bail!("Primary session receipts missing");
-    }
     let admission = Admission::open(
         storage,
         key,

@@ -129,12 +129,18 @@ impl MediaStorage {
     /// A GCS rollback stops new B2 admissions without retargeting a recorded
     /// B2-primary direct retry or a derivative of an already accepted original.
     /// Outbox callers keep using their own historical intent resolution.
-    pub(crate) async fn for_recorded_write(&self, key: &str) -> Result<Self> {
-        if self.mode == WriteMode::Gcs && primary::exists(self, key).await? {
-            self.with_mode(WriteMode::B2Primary)
+    pub(crate) async fn accepted_primary(&self, key: &str) -> Result<Option<Self>> {
+        if primary::exists(self, key).await? {
+            self.with_mode(WriteMode::B2Primary).map(Some)
         } else {
-            Ok(self.clone())
+            Ok(None)
         }
+    }
+    pub(crate) async fn for_recorded_write(&self, key: &str) -> Result<Self> {
+        Ok(self
+            .accepted_primary(key)
+            .await?
+            .unwrap_or_else(|| self.clone()))
     }
     pub fn with_mode(&self, mode: WriteMode) -> Result<Self> {
         let mut storage = Self::new(
@@ -458,6 +464,31 @@ impl MediaStorage {
             objects,
             newly_stored,
         })
+    }
+    pub(crate) async fn verify_ref_identity(
+        &self,
+        reference: &ObjectRef,
+        hash: &str,
+        size: u64,
+    ) -> Result<()> {
+        use futures::StreamExt;
+        let mut stream = self.stream_ref(reference).await?;
+        let mut digest = Sha256::new();
+        let mut total = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow!("Media length overflow"))?;
+            if total > size {
+                bail!("Recorded copy length mismatch");
+            }
+            digest.update(&chunk);
+        }
+        if total != size || hex::encode(digest.finalize()) != hash {
+            bail!("Recorded copy integrity mismatch");
+        }
+        Ok(())
     }
     pub async fn stream_ref(
         &self,

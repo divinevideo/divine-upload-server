@@ -1132,20 +1132,20 @@ async fn stream_to_gcs_with_hash(
             .await?;
         return Err(original_write::Error::Unavailable.into());
     }
-    let historical = if outbox.is_none() {
-        outbox::historical_outbox(client, &sha256_hash, owner).await?
-    } else {
-        None
-    };
-    let outbox = outbox.or(historical.as_ref());
-    let (client, thumbnail_reservation) = if let Some(outbox) = outbox {
-        let intent = outbox
-            .begin_direct_upload(&sha256_hash, total_size, content_type, owner, client)
-            .await?;
-        (intent.storage, intent.thumbnail)
-    } else {
-        (client.for_recorded_write(&sha256_hash).await?, None)
-    };
+    let resolved = outbox::resolve_admission(
+        client,
+        outbox,
+        &sha256_hash,
+        total_size,
+        content_type,
+        owner,
+        true,
+    )
+    .await?;
+    let client = resolved.storage;
+    let thumbnail_reservation = resolved.thumbnail;
+    let selected_outbox = resolved.processing_outbox;
+    let outbox = selected_outbox.as_ref();
     let written = client
         .put_file(&sha256_hash, spool.path(), content_type, Some(owner))
         .await?;
@@ -1364,6 +1364,9 @@ fn recorded_write_mode(
 }
 
 async fn thumbnail_storage(state: &AppState, hash: &str) -> Result<storage::MediaStorage> {
+    if let Some(primary) = state.media_storage.accepted_primary(hash).await? {
+        return Ok(primary);
+    }
     let objects = match &state.processing_outbox {
         Some(outbox) => outbox.source_objects(hash).await?,
         None => return state.media_storage.for_recorded_write(hash).await,
@@ -3472,19 +3475,19 @@ async fn finish_migrate_storage(
     let processing_outbox = state.processing_outbox.as_ref().or(historical.as_ref());
     let trusted_owner = migration_owner(request.owner.as_deref(), processing_outbox.is_some());
     let owner = trusted_owner.unwrap_or("");
-    let storage = if let Some(outbox) = processing_outbox {
-        outbox
-            .begin_or_resume_upload(
-                &sha256_hash,
-                total_size,
-                &content_type,
-                owner,
-                &state.media_storage,
-            )
-            .await?
-    } else {
-        state.media_storage.for_recorded_write(&sha256_hash).await?
-    };
+    let resolved = outbox::resolve_admission(
+        &state.media_storage,
+        processing_outbox,
+        &sha256_hash,
+        total_size,
+        &content_type,
+        owner,
+        false,
+    )
+    .await?;
+    let storage = resolved.storage;
+    let selected_outbox = resolved.processing_outbox;
+    let processing_outbox = selected_outbox.as_ref();
     let written = storage
         .put_file(&sha256_hash, path, &content_type, trusted_owner)
         .await?;

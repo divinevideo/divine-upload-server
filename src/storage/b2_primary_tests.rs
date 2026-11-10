@@ -128,6 +128,19 @@ async fn origin(
             .or_else(|| decoded.get("name"))
             .cloned()
             .unwrap_or_default();
+        if method == Method::POST && uri.path().contains("/copyTo/") {
+            assert_eq!(query.get("ifGenerationMatch").unwrap(), "0");
+            assert!(f.gcs.is_none());
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let bytes = f.staging.values().next().unwrap().clone();
+            f.gcs = Some(Copy {
+                bytes,
+                owner: value["metadata"]["owner"].as_str().map(str::to_owned),
+                mime: value["contentType"].as_str().unwrap().into(),
+            });
+            f.writes.push("gcs");
+            return Json(metadata(f.gcs.as_ref().unwrap())).into_response();
+        }
         if query.get("uploadType").is_some_and(|v| v == "resumable") {
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let key = value["name"].as_str().unwrap().to_owned();
@@ -146,7 +159,7 @@ async fn origin(
             )
                 .into_response();
         }
-        if name.starts_with("__resumable/b2_primary/") {
+        if name.starts_with("__resumable/b2_primary/") || name.starts_with("__resumable/uploads/") {
             if method == Method::DELETE {
                 f.staging.remove(&name);
                 return StatusCode::NO_CONTENT.into_response();
@@ -225,7 +238,7 @@ async fn origin(
             return Json(metadata(f.gcs.as_ref().unwrap())).into_response();
         }
         let Some(copy) = f.gcs.as_ref() else {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":{"code":404,"message":"fixture missing","errors":[]}}))).into_response();
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":{"code":404,"message":"No such object","errors":[]}}))).into_response();
         };
         if uri.query().unwrap_or_default().contains("alt=media") {
             assert!(uri.query().unwrap().contains("generation=1"));
@@ -1546,7 +1559,7 @@ async fn b2_primary_review_old_staged_session_retains_its_historical_processing_
     .await
     .unwrap();
     let session = UploadSession {
-        revision: 1,
+        revision: 0,
         chunk_size: 1024,
         upload_id: "up_historical".into(),
         owner: "e".repeat(64),
@@ -1566,6 +1579,8 @@ async fn b2_primary_review_old_staged_session_retains_its_historical_processing_
         storage_complete: true,
         finalized_object: None,
     };
+    use crate::resumable::SessionStore;
+    runtime.store.save(&session).await.unwrap();
     let history = runtime
         .backend
         .historical_processing(&session)
@@ -1590,4 +1605,643 @@ async fn b2_primary_review_old_staged_session_retains_its_historical_processing_
         "b2"
     );
     assert!(f.objects.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+async fn b2_primary_second_review_outbox_enabled_rollback_rejects_missing_primary_on_direct_and_mirror(
+) {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let outbox = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().fail_backup_admission_once = true;
+    let hash = hex::encode(Sha256::digest(b"original"));
+    let owner = "e".repeat(64);
+    assert!(f
+        .storage
+        .put(
+            &hash,
+            Bytes::from_static(b"original"),
+            "application/octet-stream",
+            Some(&owner)
+        )
+        .await
+        .is_err());
+    let rollback = MediaStorage::new(
+        WriteMode::Gcs,
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        None,
+    )
+    .unwrap();
+    let direct = crate::stream_to_gcs_with_hash(
+        &rollback,
+        Some(&outbox),
+        "application/octet-stream",
+        axum::body::Body::from("original"),
+        &owner,
+        None,
+    )
+    .await;
+    let direct_failed = direct.is_err();
+    let mut state = crate::tests::test_state(None, 1);
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.media_storage = rollback;
+    mutable.processing_outbox = Some(outbox);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"original").unwrap();
+    let request = crate::MigrateRequest {
+        source_url: "https://cdn.divine.video/fixture".into(),
+        expected_hash: Some(hash.clone()),
+        owner: None,
+    };
+    let mirror_failed = crate::finish_migrate_storage(
+        &state,
+        &request,
+        hash,
+        8,
+        "application/octet-stream".into(),
+        file.path(),
+    )
+    .await
+    .is_err();
+    assert!(
+        direct_failed && mirror_failed,
+        "direct_failed={direct_failed}, mirror_failed={mirror_failed}"
+    );
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
+    let db = crate::coordination::connect(&url).await.unwrap();
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM upload_processing_intents", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+}
+#[tokio::test]
+async fn b2_primary_second_review_thumbnail_outbox_cannot_drop_primary_record_policy() {
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let outbox = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let hash = hex::encode(Sha256::digest(b"original"));
+    f.storage
+        .put(
+            &hash,
+            Bytes::from_static(b"original"),
+            "application/octet-stream",
+            None,
+        )
+        .await
+        .unwrap();
+    let mut state = crate::tests::test_state(None, 1);
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.media_storage = f.storage.with_mode(WriteMode::Gcs).unwrap();
+    mutable.processing_outbox = Some(outbox);
+    assert_eq!(
+        crate::thumbnail_storage(&state, &hash).await.unwrap().mode,
+        WriteMode::B2Primary,
+        "outbox history absence is not authority to downgrade a pinned primary"
+    );
+}
+
+#[tokio::test]
+async fn b2_primary_second_review_native_gcs_session_keeps_existing_processing_contract() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
+    for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
+        for global in [false, true] {
+            let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                return;
+            };
+            let old = crate::outbox::ProcessingOutbox::connect(
+                &url,
+                "https://processor.invalid/finalized",
+                "fixture-token",
+            )
+            .await
+            .unwrap();
+            let f = Fixture::new().await;
+            let owner = "e".repeat(64);
+            let hash = hex::encode(Sha256::digest(b"original"));
+            let gcs = f.storage.with_mode(WriteMode::Gcs).unwrap();
+            let runtime = ResumableRuntime::new(
+                gcs.clone(),
+                f.storage.gcs.clone(),
+                "fixture-gcs".into(),
+                Some(&url),
+            )
+            .await
+            .unwrap();
+            let manager = ResumableManager::new(
+                runtime.backend,
+                runtime.store,
+                "https://upload.invalid",
+                "https://media.invalid",
+                256 * 1024,
+                300,
+            )
+            .with_outbox(Some(old.clone()));
+            let init = manager
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hash.clone(),
+                        size: 8,
+                        content_type: "application/octet-stream".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            manager
+                .upload_chunk(
+                    &init.upload_id,
+                    Some(&init.required_headers["Authorization"]),
+                    "bytes 0-7/8",
+                    Bytes::from_static(b"original"),
+                )
+                .await
+                .unwrap();
+            old.begin_upload(&hash, 8, "application/octet-stream", &owner, &gcs)
+                .await
+                .unwrap();
+            let runtime = ResumableRuntime::new(
+                f.storage.with_mode(mode).unwrap(),
+                f.storage.gcs.clone(),
+                "fixture-gcs".into(),
+                Some(&url),
+            )
+            .await
+            .unwrap();
+            let migrated = ResumableManager::new(
+                runtime.backend.clone(),
+                runtime.store.clone(),
+                "https://upload.invalid",
+                "https://media.invalid",
+                256 * 1024,
+                300,
+            );
+            let migrated = migrated.with_outbox(global.then_some(old));
+            let result = migrated
+                .complete_session(&init.upload_id, &owner)
+                .await
+                .unwrap();
+            assert!(
+                result.processing_via_outbox,
+                "native GCS session's accepted PG contract must remain scoped to completion"
+            );
+            let db = crate::coordination::connect(&url).await.unwrap();
+            assert_eq!(
+                db.query_one(
+                    "SELECT count(*) FROM upload_processing_session_receipts",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+                1
+            );
+            assert!(db
+                .query_one("SELECT completed FROM upload_processing_intents", &[])
+                .await
+                .unwrap()
+                .get::<_, bool>(0));
+            assert_eq!(f.objects.lock().unwrap().writes, ["gcs"]);
+            db.execute("UPDATE upload_sessions SET state=jsonb_set(state,'{expires_at_epoch_secs}','0'::jsonb)",&[]).await.unwrap();
+            assert_eq!(runtime.sweep_expired(1, None).await.unwrap(), 1);
+            assert_eq!(
+                db.query_one(
+                    "SELECT count(*) FROM upload_processing_session_receipts",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+                0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b2_primary_policy_precedence_matrix_covers_direct_mirror_and_thumbnail() {
+    let mut scenarios = 0;
+    for mode in [WriteMode::B2Primary, WriteMode::Gcs] {
+        for global_outbox in [false, true] {
+            for binding in [false, true] {
+                for route in ["direct", "mirror", "thumbnail"] {
+                    let f = Fixture::new().await;
+                    let configured = MediaStorage::new(
+                        mode,
+                        f.storage.gcs.clone(),
+                        "fixture-gcs".into(),
+                        binding.then(|| f.storage.b2.clone().unwrap()),
+                    );
+                    scenarios += 1;
+                    if mode == WriteMode::B2Primary && !binding {
+                        assert!(configured.is_err());
+                        continue;
+                    }
+                    let configured = configured.unwrap();
+                    let outbox = if global_outbox {
+                        let Some((value, _)) = database().await else {
+                            return;
+                        };
+                        Some(value)
+                    } else {
+                        None
+                    };
+                    let owner = "e".repeat(64);
+                    let hash = hex::encode(Sha256::digest(b"original"));
+                    f.objects.lock().unwrap().fail_backup_admission_once = true;
+                    assert!(f
+                        .storage
+                        .put(
+                            &hash,
+                            Bytes::from_static(b"original"),
+                            "application/octet-stream",
+                            Some(&owner)
+                        )
+                        .await
+                        .is_err());
+                    match route {
+                        "direct" => {
+                            let result = crate::stream_to_gcs_with_hash(
+                                &configured,
+                                outbox.as_ref(),
+                                "application/octet-stream",
+                                axum::body::Body::from("original"),
+                                &owner,
+                                None,
+                            )
+                            .await;
+                            if binding {
+                                let result = result.unwrap();
+                                assert_eq!(result.storage.mode, WriteMode::B2Primary);
+                                assert_eq!(result.processing_outbox.is_some(), global_outbox);
+                            } else {
+                                assert!(result.is_err());
+                            }
+                        }
+                        "mirror" => {
+                            let mut state = crate::tests::test_state(None, 1);
+                            let mutable = Arc::get_mut(&mut state).unwrap();
+                            mutable.media_storage = configured;
+                            mutable.processing_outbox = outbox;
+                            let file = tempfile::NamedTempFile::new().unwrap();
+                            std::fs::write(file.path(), b"original").unwrap();
+                            let request = crate::MigrateRequest {
+                                source_url: "https://cdn.divine.video/fixture".into(),
+                                expected_hash: Some(hash.clone()),
+                                owner: None,
+                            };
+                            let result = crate::finish_migrate_storage(
+                                &state,
+                                &request,
+                                hash,
+                                8,
+                                "application/octet-stream".into(),
+                                file.path(),
+                            )
+                            .await;
+                            assert_eq!(result.is_ok(), binding);
+                        }
+                        "thumbnail" => {
+                            let mut state = crate::tests::test_state(None, 1);
+                            let mutable = Arc::get_mut(&mut state).unwrap();
+                            mutable.media_storage = configured;
+                            mutable.processing_outbox = outbox;
+                            let selected = crate::thumbnail_storage(&state, &hash).await;
+                            if binding {
+                                assert_eq!(selected.unwrap().mode, WriteMode::B2Primary);
+                            } else {
+                                assert!(selected.is_err());
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    let expected = if binding && route != "thumbnail" {
+                        vec!["b2", "gcs"]
+                    } else {
+                        vec!["b2"]
+                    };
+                    assert_eq!(
+                        f.objects.lock().unwrap().writes,
+                        expected,
+                        "{mode:?}/{global_outbox}/{binding}/{route}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(scenarios, 24);
+}
+
+#[tokio::test]
+async fn b2_primary_policy_conflict_never_rewrites_an_accepted_pg_mode() {
+    let Some((outbox, db)) = database().await else {
+        return;
+    };
+    let f = Fixture::new().await;
+    let owner = "e".repeat(64);
+    let hash = hex::encode(Sha256::digest(b"original"));
+    outbox
+        .begin_upload(
+            &hash,
+            8,
+            "application/octet-stream",
+            &owner,
+            &f.storage.with_mode(WriteMode::Gcs).unwrap(),
+        )
+        .await
+        .unwrap();
+    f.objects.lock().unwrap().fail_backup_admission_once = true;
+    assert!(f
+        .storage
+        .put(
+            &hash,
+            Bytes::from_static(b"original"),
+            "application/octet-stream",
+            Some(&owner)
+        )
+        .await
+        .is_err());
+    let rollback = f.storage.with_mode(WriteMode::Gcs).unwrap();
+    assert!(crate::stream_to_gcs_with_hash(
+        &rollback,
+        Some(&outbox),
+        "application/octet-stream",
+        axum::body::Body::from("original"),
+        &owner,
+        None
+    )
+    .await
+    .is_err());
+    let row = db
+        .query_one(
+            "SELECT write_mode,completed FROM upload_processing_intents",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "gcs");
+    assert!(!row.get::<_, bool>(1));
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
+}
+
+#[tokio::test]
+async fn b2_primary_policy_precedence_matrix_covers_resumable_completion_and_replay() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
+    let mut scenarios = 0;
+    for mode in [WriteMode::B2Primary, WriteMode::Gcs] {
+        for global in [false, true] {
+            for binding in [false, true] {
+                scenarios += 1;
+                let f = Fixture::new().await;
+                let configured = MediaStorage::new(
+                    mode,
+                    f.storage.gcs.clone(),
+                    "fixture-gcs".into(),
+                    binding.then(|| f.storage.b2.clone().unwrap()),
+                );
+                if mode == WriteMode::B2Primary && !binding {
+                    assert!(configured.is_err());
+                    continue;
+                }
+                let configured = configured.unwrap();
+                let history = if global {
+                    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                        return;
+                    };
+                    let outbox = crate::outbox::ProcessingOutbox::connect(
+                        &url,
+                        "https://processor.invalid/finalized",
+                        "fixture-token",
+                    )
+                    .await
+                    .unwrap();
+                    Some((url, outbox))
+                } else {
+                    None
+                };
+                let database = history.as_ref().map(|(url, _)| url.as_str());
+                let runtime = ResumableRuntime::new(
+                    f.storage.clone(),
+                    f.storage.gcs.clone(),
+                    "fixture-gcs".into(),
+                    database,
+                )
+                .await
+                .unwrap();
+                let initial = ResumableManager::new(
+                    runtime.backend,
+                    runtime.store,
+                    "https://upload.invalid",
+                    "https://media.invalid",
+                    256 * 1024,
+                    300,
+                );
+                let owner = "e".repeat(64);
+                let hash = hex::encode(Sha256::digest(b"original"));
+                let init = initial
+                    .init_session(
+                        &owner,
+                        ResumableUploadInitRequest {
+                            sha256: hash.clone(),
+                            size: 8,
+                            content_type: "application/octet-stream".into(),
+                            file_name: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                initial
+                    .upload_chunk(
+                        &init.upload_id,
+                        Some(&init.required_headers["Authorization"]),
+                        "bytes 0-7/8",
+                        Bytes::from_static(b"original"),
+                    )
+                    .await
+                    .unwrap();
+                let runtime = ResumableRuntime::new(
+                    configured,
+                    f.storage.gcs.clone(),
+                    "fixture-gcs".into(),
+                    database,
+                )
+                .await
+                .unwrap();
+                let manager = ResumableManager::new(
+                    runtime.backend,
+                    runtime.store,
+                    "https://upload.invalid",
+                    "https://media.invalid",
+                    256 * 1024,
+                    300,
+                )
+                .with_outbox(history.as_ref().map(|(_, outbox)| outbox.clone()));
+                let result = manager.complete_session(&init.upload_id, &owner).await;
+                if binding {
+                    assert_eq!(result.unwrap().sha256, hash);
+                    assert!(
+                        !manager
+                            .complete_session(&init.upload_id, &owner)
+                            .await
+                            .unwrap()
+                            .newly_stored
+                    );
+                    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+                } else {
+                    assert!(result.is_err());
+                    assert!(f.objects.lock().unwrap().writes.is_empty());
+                }
+            }
+        }
+    }
+    assert_eq!(scenarios, 8);
+}
+
+#[tokio::test]
+async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_exact_copies() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
+    for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
+        for global in [false, true] {
+            let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                return;
+            };
+            let old = crate::outbox::ProcessingOutbox::connect(
+                &url,
+                "https://processor.invalid/finalized",
+                "fixture-token",
+            )
+            .await
+            .unwrap();
+            let f = Fixture::new().await;
+            let owner = "e".repeat(64);
+            let new_owner = "d".repeat(64);
+            let hash = hex::encode(Sha256::digest(b"original"));
+            let gcs = f.storage.with_mode(WriteMode::Gcs).unwrap();
+            let runtime = ResumableRuntime::new(
+                gcs.clone(),
+                f.storage.gcs.clone(),
+                "fixture-gcs".into(),
+                Some(&url),
+            )
+            .await
+            .unwrap();
+            let initial = ResumableManager::new(
+                runtime.backend,
+                runtime.store,
+                "https://upload.invalid",
+                "https://media.invalid",
+                256 * 1024,
+                300,
+            )
+            .with_outbox(Some(old.clone()));
+            let init = initial
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hash.clone(),
+                        size: 8,
+                        content_type: "application/octet-stream".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            initial
+                .upload_chunk(
+                    &init.upload_id,
+                    Some(&init.required_headers["Authorization"]),
+                    "bytes 0-7/8",
+                    Bytes::from_static(b"original"),
+                )
+                .await
+                .unwrap();
+            old.begin_upload(&hash, 8, "application/octet-stream", &owner, &gcs)
+                .await
+                .unwrap();
+            f.objects.lock().unwrap().fail_backup_admission_once = true;
+            assert!(f
+                .storage
+                .put(
+                    &hash,
+                    Bytes::from_static(b"original"),
+                    "application/octet-stream",
+                    Some(&new_owner)
+                )
+                .await
+                .is_err());
+            let runtime = ResumableRuntime::new(
+                f.storage.with_mode(mode).unwrap(),
+                f.storage.gcs.clone(),
+                "fixture-gcs".into(),
+                Some(&url),
+            )
+            .await
+            .unwrap();
+            let manager = ResumableManager::new(
+                runtime.backend,
+                runtime.store,
+                "https://upload.invalid",
+                "https://media.invalid",
+                256 * 1024,
+                300,
+            )
+            .with_outbox(global.then_some(old));
+            assert!(
+                manager
+                    .complete_session(&init.upload_id, &owner)
+                    .await
+                    .is_err(),
+                "old GCS writes cannot bypass a partial new primary admission"
+            );
+            assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
+            f.storage
+                .put(
+                    &hash,
+                    Bytes::from_static(b"original"),
+                    "application/octet-stream",
+                    Some(&new_owner),
+                )
+                .await
+                .unwrap();
+            let result = manager
+                .complete_session(&init.upload_id, &owner)
+                .await
+                .unwrap();
+            assert!(result.processing_via_outbox);
+            assert!(!result.newly_stored);
+            assert_eq!(
+                f.objects.lock().unwrap().writes,
+                ["b2", "gcs"],
+                "old session must reuse both pinned copies without a fresh PUT"
+            );
+            let db = crate::coordination::connect(&url).await.unwrap();
+            let event: serde_json::Value = db
+                .query_one("SELECT payload FROM upload_processing_outbox", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(event["source"]["provider"], "gcs");
+            assert_eq!(event["source"]["version"], "1");
+        }
+    }
 }
