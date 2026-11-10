@@ -334,6 +334,9 @@ impl ResumableBackend for MediaResumableBackend {
                 )
                 .await
             }
+            None if session.processing_outbox_required == Some(true) => {
+                Err(crate::outbox::HistoricalSessionUnavailable.into())
+            }
             None => Ok(None),
         }
     }

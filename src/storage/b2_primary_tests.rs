@@ -19,6 +19,72 @@ struct Copy {
 }
 
 #[tokio::test]
+async fn declared_processing_cleanup_requires_its_database_binding() {
+    use crate::resumable::{
+        ResumableBackend, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
+        SessionStore,
+    };
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let outbox = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let runtime = ResumableRuntime::new(
+        f.storage.with_mode(WriteMode::Gcs).unwrap(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        Some(&url),
+    )
+    .await
+    .unwrap();
+    let manager = ResumableManager::new(
+        runtime.backend,
+        runtime.store.clone(),
+        "https://upload.invalid",
+        "https://media.invalid",
+        256 * 1024,
+        300,
+    )
+    .with_outbox(Some(outbox));
+    let init = manager
+        .init_session(
+            &"e".repeat(64),
+            ResumableUploadInitRequest {
+                sha256: hex::encode(Sha256::digest(b"original")),
+                size: 8,
+                content_type: "application/octet-stream".into(),
+                file_name: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut session = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
+    let missing = ResumableRuntime::new(
+        f.storage.clone(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(missing.backend.historical_cleanup(&session).await.is_err());
+    session.processing_outbox_required = Some(false);
+    assert!(missing
+        .backend
+        .historical_cleanup(&session)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f.objects.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
 async fn expired_unknown_native_sessions_without_receipts_are_cleaned() {
     use crate::resumable::{
         ResumableError, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
