@@ -873,7 +873,7 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            if state.processing_outbox.is_none() && !response.processing_via_outbox {
+            if !response.processing_via_outbox {
                 spawn_nsfw_scan(
                     &state,
                     &response.sha256,

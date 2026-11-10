@@ -223,7 +223,7 @@ pub(crate) async fn history_for_accepted_session(
     birth_policy: Option<bool>,
 ) -> Result<Option<ProcessingOutbox>> {
     let database = crate::coordination::connect(url).await?;
-    let required = old_non_gcs || birth_policy == Some(true);
+    let required = birth_policy == Some(true) || (old_non_gcs && birth_policy.is_none());
     let tables = database.query_one("SELECT to_regclass('upload_sessions') IS NOT NULL, to_regclass('upload_processing_intents') IS NOT NULL, to_regclass('upload_processing_session_receipts') IS NOT NULL, to_regclass('upload_processing_outbox') IS NOT NULL", &[]).await?;
     let session_table = tables.get::<_, bool>(0);
     let processing_tables = (1..=3).filter(|i| tables.get::<_, bool>(*i)).count();

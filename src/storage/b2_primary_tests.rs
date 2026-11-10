@@ -3048,3 +3048,156 @@ async fn b2_primary_next_review_retained_database_does_not_create_new_pg_tracker
         .unwrap()
         .get::<_, bool>(0));
 }
+
+#[tokio::test]
+async fn b2_primary_complete_handler_keeps_legacy_scan_across_outbox_rollback() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
+    use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
+    use tower::ServiceExt;
+    let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+        return;
+    };
+    let old = crate::outbox::ProcessingOutbox::connect(
+        &url,
+        "https://processor.invalid/finalized",
+        "fixture-token",
+    )
+    .await
+    .unwrap();
+    let f = Fixture::new().await;
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]).unwrap();
+    let owner = hex::encode(signing_key.verifying_key().to_bytes());
+    let hash = hex::encode(Sha256::digest(b"original"));
+    let runtime = ResumableRuntime::new(
+        f.storage.clone(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        Some(&url),
+    )
+    .await
+    .unwrap();
+    let manager = ResumableManager::new(
+        runtime.backend,
+        runtime.store,
+        "https://upload.invalid",
+        "https://media.invalid",
+        256 * 1024,
+        300,
+    );
+    let init = manager
+        .init_session(
+            &owner,
+            ResumableUploadInitRequest {
+                sha256: hash.clone(),
+                size: 8,
+                content_type: "video/mp4".into(),
+                file_name: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .upload_chunk(
+            &init.upload_id,
+            Some(&init.required_headers["Authorization"]),
+            "bytes 0-7/8",
+            Bytes::from_static(b"original"),
+        )
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let detector = Router::new().route(
+        "/detect",
+        axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+            let tx = tx.clone();
+            async move {
+                tx.send(payload).await.unwrap();
+                Json(serde_json::json!({"signals":{"nsfw":{"state":"absent"}}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let detector_task = tokio::spawn(async move { axum::serve(listener, detector).await.unwrap() });
+    let mut state = crate::tests::test_state(None, 1);
+    let s = Arc::get_mut(&mut state).unwrap();
+    s.resumable_runtime = ResumableRuntime::new(
+        f.storage.with_mode(WriteMode::Gcs).unwrap(),
+        f.storage.gcs.clone(),
+        "fixture-gcs".into(),
+        Some(&url),
+    )
+    .await
+    .unwrap();
+    s.processing_outbox = Some(old);
+    s.config.ai_detector_base_url = Some(endpoint);
+    s.config.cdn_base_url = "https://media.invalid".into();
+    let mut event = crate::NostrEvent {
+        id: String::new(),
+        pubkey: owner,
+        created_at: 1,
+        kind: 24242,
+        tags: vec![vec!["t".into(), "upload".into()]],
+        content: String::new(),
+        sig: String::new(),
+    };
+    event.id = crate::compute_event_id(&event).unwrap();
+    event.sig = hex::encode(
+        signing_key
+            .sign_prehash(&hex::decode(&event.id).unwrap())
+            .unwrap()
+            .to_bytes(),
+    );
+    let authorization = format!(
+        "Nostr {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&serde_json::json!({"id":event.id,"pubkey":event.pubkey,"created_at":event.created_at,"kind":event.kind,"tags":event.tags,"content":event.content,"sig":event.sig})).unwrap()
+        )
+    );
+    let request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/upload/{}/complete", init.upload_id))
+            .header("Authorization", &authorization)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let app = crate::build_router(state);
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+    // Stop the local actor even on the deliberately failing RED observation.
+    if captured.is_err() {
+        detector_task.abort();
+    }
+    let captured = captured
+        .expect("successful legacy session must dispatch its NSFW scan")
+        .unwrap();
+    assert_eq!(captured["sha256"], hash);
+    assert_eq!(captured["url"], format!("https://media.invalid/{hash}"));
+    assert_eq!(captured["signals"], serde_json::json!(["nsfw"]));
+    assert_eq!(
+        app.oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .is_err(),
+        "completion replay must not dispatch a second scan"
+    );
+    let db = crate::coordination::connect(&url).await.unwrap();
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM upload_processing_outbox", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+    detector_task.abort();
+}

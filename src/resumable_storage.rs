@@ -699,7 +699,7 @@ mod tests {
     }
     fn session() -> UploadSession {
         UploadSession {
-            processing_outbox_required: None,
+            processing_outbox_required: Some(false),
             revision: 0,
             chunk_size: 1024 * 1024,
             upload_id: format!("test_{}", random_hex(12)),
@@ -893,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn uncertain_cleanup_does_not_block_other_expired_sessions_or_later_pages() {
         let _sweep_guard = SWEEP_TEST_LOCK.lock().await;
-        let Ok(url) = std::env::var("TEST_COORDINATION_DATABASE_URL") else {
+        let Some(url) = crate::outbox::tests::isolated_database_url().await else {
             return;
         };
         let storage = MediaStorage::new(
@@ -995,9 +995,14 @@ mod tests {
         let mut value = serde_json::to_value(session()).unwrap();
         value.as_object_mut().unwrap().remove("revision");
         value.as_object_mut().unwrap().remove("chunk_size");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("processing_outbox_required");
         let decoded: UploadSession = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.revision, 0);
         assert_eq!(decoded.chunk_size, 0);
+        assert_eq!(decoded.processing_outbox_required, None);
     }
 }
 
@@ -1079,7 +1084,7 @@ mod integration_tests {
             eprintln!("Skipping PostgreSQL integration: TEST_COORDINATION_DATABASE_URL unset");
             return;
         }
-        let database_url = std::env::var("TEST_COORDINATION_DATABASE_URL").unwrap();
+        let database_url = crate::outbox::tests::isolated_database_url().await.unwrap();
         let objects: Objects = Arc::new(Mutex::new(HashMap::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
