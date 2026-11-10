@@ -19,6 +19,93 @@ struct Copy {
 }
 
 #[tokio::test]
+async fn expired_unknown_native_sessions_without_receipts_are_cleaned() {
+    use crate::resumable::{
+        ResumableError, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
+        SessionStore,
+    };
+    for action in ["head", "complete", "sweep"] {
+        for schema in [false, true] {
+            let Some(url) = crate::outbox::tests::isolated_database_url().await else {
+                return;
+            };
+            if schema {
+                crate::outbox::ProcessingOutbox::connect(
+                    &url,
+                    "https://processor.invalid/finalized",
+                    "fixture-token",
+                )
+                .await
+                .unwrap();
+            }
+            let f = Fixture::new().await;
+            let runtime = ResumableRuntime::new(
+                f.storage.with_mode(WriteMode::Gcs).unwrap(),
+                f.storage.gcs.clone(),
+                "fixture-gcs".into(),
+                Some(&url),
+            )
+            .await
+            .unwrap();
+            let manager = ResumableManager::new(
+                runtime.backend.clone(),
+                runtime.store.clone(),
+                "https://upload.invalid",
+                "https://media.invalid",
+                256 * 1024,
+                300,
+            );
+            let owner = "e".repeat(64);
+            let init = manager
+                .init_session(
+                    &owner,
+                    ResumableUploadInitRequest {
+                        sha256: hex::encode(Sha256::digest(b"original")),
+                        size: 8,
+                        content_type: "application/octet-stream".into(),
+                        file_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+            manager
+                .upload_chunk(
+                    &init.upload_id,
+                    Some(&init.required_headers["Authorization"]),
+                    "bytes 0-7/8",
+                    Bytes::from_static(b"original"),
+                )
+                .await
+                .unwrap();
+            let db = crate::coordination::connect(&url).await.unwrap();
+            db.execute("UPDATE upload_sessions SET state=jsonb_set(state-'processing_outbox_required','{expires_at_epoch_secs}','0'::jsonb)", &[]).await.unwrap();
+            match action {
+                "head" => assert!(matches!(
+                    manager
+                        .head_session(
+                            &init.upload_id,
+                            Some(&init.required_headers["Authorization"])
+                        )
+                        .await,
+                    Err(ResumableError::Gone(_))
+                )),
+                "complete" => assert!(matches!(
+                    manager.complete_session(&init.upload_id, &owner).await,
+                    Err(ResumableError::Gone(_))
+                )),
+                _ => assert_eq!(runtime.sweep_expired(1, None).await.unwrap(), 1),
+            }
+            assert!(
+                runtime.store.load(&init.upload_id).await.unwrap().is_none(),
+                "{action}/{schema}"
+            );
+            assert_eq!(runtime.sweep_expired(1, None).await.unwrap(), 0);
+            assert!(f.objects.lock().unwrap().staging.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn mirror_registration_stays_anonymous_with_retained_history() {
     for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
         for global in [false, true] {

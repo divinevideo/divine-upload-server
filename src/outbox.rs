@@ -256,6 +256,36 @@ pub(crate) async fn history_for_accepted_session(
     )
 }
 
+pub(crate) async fn history_for_session_cleanup(
+    url: &str,
+    id: &str,
+    declared_processing: bool,
+) -> Result<Option<ProcessingOutbox>> {
+    let database = crate::coordination::connect(url).await?;
+    let tables = database.query_one("SELECT to_regclass('upload_processing_intents') IS NOT NULL, to_regclass('upload_processing_session_receipts') IS NOT NULL, to_regclass('upload_processing_outbox') IS NOT NULL", &[]).await
+        .map_err(|_| anyhow!("Historical cleanup schema lookup failed"))?;
+    let present = (0..3).filter(|i| tables.get::<_, bool>(*i)).count();
+    if present != 3 {
+        return if present == 0 && !declared_processing {
+            Ok(None)
+        } else {
+            Err(HistoricalSessionUnavailable.into())
+        };
+    }
+    let has_receipt = database
+        .query_opt(
+            "SELECT 1 FROM upload_processing_session_receipts WHERE upload_id=$1",
+            &[&id],
+        )
+        .await
+        .map_err(|_| anyhow!("Historical session cleanup lookup failed"))?
+        .is_some();
+    Ok(has_receipt.then(|| ProcessingOutbox {
+        database: Arc::new(Mutex::new(database)),
+        consumer: None,
+    }))
+}
+
 impl ProcessingOutbox {
     pub async fn connect(database_url: &str, endpoint: &str, bearer_token: &str) -> Result<Self> {
         let consumer = ProcessingClient::new(endpoint, bearer_token)?;

@@ -76,6 +76,11 @@ impl ResumableRuntime {
                 if session.expires_at_epoch_secs > now_epoch_secs() {
                     return Ok(false);
                 }
+                let historical = if outbox.is_none() {
+                    self.backend.historical_cleanup(&session).await?
+                } else {
+                    None
+                };
                 if session.session_url == "staged-v1" {
                     self.backend.delete_object(&session.temp_object).await?;
                 } else if session.finalized_object.is_none() {
@@ -84,11 +89,6 @@ impl ResumableRuntime {
                 }
                 // Before the session, so a failure leaves it for the next pass
                 // rather than orphaning a receipt no sweep will find again.
-                let historical = if outbox.is_none() {
-                    self.backend.historical_processing(&session).await?
-                } else {
-                    None
-                };
                 if let Some(outbox) = outbox.or(historical.as_ref()) {
                     outbox.forget_session_receipt(&id).await?;
                 }
@@ -321,6 +321,22 @@ impl MediaResumableBackend {
 
 #[async_trait]
 impl ResumableBackend for MediaResumableBackend {
+    async fn historical_cleanup(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        match self.database_url.as_deref() {
+            Some(url) => {
+                crate::outbox::history_for_session_cleanup(
+                    url,
+                    &session.upload_id,
+                    session.processing_outbox_required == Some(true),
+                )
+                .await
+            }
+            None => Ok(None),
+        }
+    }
     async fn historical_processing(
         &self,
         session: &UploadSession,

@@ -113,7 +113,8 @@ These are code defaults. Deployed values differ per environment and live in the 
 `MEDIA_WRITE_PROVIDER=b2_primary` selects a separate staged migration policy:
 B2 is authoritative and is written and fully verified first; the canonical GCS
 backup must then be stored and independently verified before upload success.
-Both immutable references are retained in B2, GCS order. Public hash URLs remain
+Both immutable references are retained in the private admission record and
+in-process write result in B2, GCS order. Public hash URLs remain
 unchanged. `dual` retains its historical GCS-first policy.
 
 This mode uses the existing GCS bucket for small private admission records and
@@ -138,12 +139,17 @@ session manifests use generation preconditions; deleting a session retains a
 small tombstone so stale writers cannot resurrect it. Old GCS/B2/dual sessions
 retain their original policy and provider requirements. Session JSON now records
 whether processing was admitted through the outbox, independently of later
-configuration. A pre-field native GCS session in a historical PostgreSQL store
+configuration. A recorded legacy choice keeps its follow-up selection per
+completion, even if a dispatcher is
+configured later. A pre-field native GCS session in a historical PostgreSQL store
 with no processing intent/receipt cannot prove that choice: completion stays
 unavailable before promotion until the original processing configuration is
 restored or the retained state is explicitly reconciled. This does not apply to
 the ordinary GCS-only deployment without a coordination database. Expiry cleanup
 retains the session if historical contract lookup or receipt removal fails.
+Expiry cleanup checks existing receipts separately from permission to promote:
+an expired unknown-choice session with no receipt is cleaned normally. A partial
+processing schema or failed receipt lookup/removal retains the discovery state.
 
 Per-key admission records at `__resumable/b2-primary-writes/v1/` bind the bytes,
 first metadata and provider buckets using GCS create-only/generation CAS.
@@ -160,6 +166,12 @@ cannot then issue an effect using its stale generation.
 An issued operation with missing/unverified receipt stays pending for explicit
 reconciliation; no TTL, latest-HEAD adoption, automatic repair or blind re-PUT
 clears it. These private records are retained, not automatically garbage-collected.
+This conservative policy also holds a received provider error or a failed read
+of an acknowledged version pending; it does not automatically classify errors
+as safe to reissue. No operator reconciliation command ships in this change.
+Before activation, assign an operator and an authorized reconciliation procedure
+for original and derivative records, including `<hash>.jpg`. A post-issuance
+failure can otherwise keep that key unavailable.
 
 Direct, mirror and on-demand policy selection checks accepted state before either
 legacy or outbox handling: a validated GCS primary record pins its provider set;
@@ -191,6 +203,20 @@ events still require their already configured consumer/deployment for delivery;
 this mode does not create a replacement dispatcher. A deployment with no such
 history needs no database. Do not discard an existing history database or its
 consumer while accepted work remains.
+The dispatcher is part of the legacy-mode service binary. Retain a separately
+running historical `b2`/`dual` service with its existing database and
+`MEDIA_FINALIZED_*` consumer configuration until its backlog drains; a new
+`b2_primary` instance is not a dispatcher for it. Neither is a GCS-mode or GCS
+rollback instance with historical database state but no `MEDIA_FINALIZED_*`
+consumer configured. Alternatively, drain accepted work before switching the
+only instance. Do not activate with a stranded backlog.
+
+An accepted primary record or retained PostgreSQL source contract determines
+on-demand thumbnail policy. Without either recorded contract, new-mode reads
+do not fall back to GCS for old media. Before routing such historical thumbnail
+requests here, backfill and verify their original/thumbnail copies in B2, or
+retain their existing serving route. An unrecorded GCS-only historical original
+is not a readable B2-primary thumbnail source.
 
 To roll back new admissions, keep this image, GCS compatibility and the B2
 bucket/credential bindings, and set `MEDIA_WRITE_PROVIDER=gcs`. This GCS-plus-B2

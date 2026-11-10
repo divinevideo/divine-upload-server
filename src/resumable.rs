@@ -238,6 +238,12 @@ pub trait ResumableBackend: Clone + Send + Sync + 'static {
     ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
         Ok(None)
     }
+    async fn historical_cleanup(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        self.historical_processing(session).await
+    }
     async fn begin_finalization(
         &self,
         _session: &UploadSession,
@@ -752,7 +758,7 @@ where
         // Resolve before any cleanup. On failure keep the discovery record and
         // its receipt together for a later pass under the original configuration.
         let historical = if self.outbox.is_none() {
-            match self.backend.historical_processing(session).await {
+            match self.backend.historical_cleanup(session).await {
                 Ok(outbox) => outbox,
                 Err(_) => return,
             }
