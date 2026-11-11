@@ -171,7 +171,15 @@ same bytes through resumable upload. Finalization refuses missing, extra,
 reordered or wrong-bucket references rather than marking such an intent complete.
 An already committed resumable completion remains replayable after a later
 upload changes policy: its durable session receipt is acknowledged without
-changing the newer intent or artifact source ordering. Startup adds the
+changing the newer intent or artifact source ordering, even if the process stopped
+before saving the final session manifest. The event, intent completion and receipt
+commit before that manifest save; staging is retained until they commit. A receipt
+also prevents aborting an already committed upload whose manifest save failed.
+An unreceipted completion must match the current intent's destination policy; an
+identical event from a different session does not establish completion. A session
+saved by an older binary between storage finalization and receipt commit returns
+409 if the policy has since changed. Reconcile that upload through its recorded
+policy; do not delete or retarget the newer intent. Startup adds the
 `upload_processing_session_receipts` table under the existing schema lock. Its
 receipt/event/intent transaction distinguishes a new session reusing an event
 identity from replay of a previously completed session. Expired-session cleanup,
@@ -195,20 +203,6 @@ any event for the bytes records a GCS copy, their derivatives require GCS, so a
 B2-only deployment without GCS compatibility cannot generate them. Retiring GCS
 therefore needs an explicit change to how derivatives treat recorded GCS copies;
 removing the GCS binding alone does not do it.
-
-<!-- TODO(#33): remove this paragraph with the pre-receipt replay path. -->
-A resumable session completed before the receipts schema existed has no
-receipt. If its client replays `complete` while the owner's current intent has
-the same policy, the replay counts as a new completion and makes its event the
-newest for those bytes again, as it did before receipts. This is accepted for the
-transition. Derivatives keep every recorded provider either way, so the reorder
-can only change which event's object versions lead. Uploads reuse the object
-already stored for the bytes rather than rewrite it, so those are the same
-objects unless the media was erased and uploaded again within the window. The
-window closes once those sessions expire, one `RESUMABLE_SESSION_TTL_SECS`
-(24 hours by default) after the receipts schema is live. As a precaution, do not
-enable dual admission in an environment until that much time has passed since
-the receipts schema went live there.
 
 Before changing a required destination bucket or removing a provider, drain or
 reconcile affected unfinished intents and accepted sessions. A mismatched mapping

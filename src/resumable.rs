@@ -576,19 +576,11 @@ where
             return Err(ResumableError::Gone("Upload session expired".to_string()));
         }
 
-        let configured = self
-            .outbox
-            .as_ref()
-            .filter(|_| session.processing_outbox_required != Some(false));
-        let historical = if configured.is_none() {
-            self.backend
-                .historical_processing(&session)
-                .await
-                .map_err(internal_error)?
-        } else {
-            None
-        };
-        let outbox = configured.or(historical.as_ref());
+        let outbox = self
+            .session_outbox(&session)
+            .await
+            .map_err(internal_error)?;
+        let outbox = outbox.as_ref();
         if session.next_offset != session.declared_size {
             return Err(ResumableError::Conflict(format!(
                 "Upload incomplete: {} of {} bytes committed",
@@ -596,30 +588,30 @@ where
             )));
         }
 
-        if session.finalized_object.is_some() {
-            // A committed receipt answers the replay without asking storage for
-            // the final objects again.
-            if let Some(outbox) = outbox {
-                if outbox
-                    .has_session_receipt(
-                        &session.upload_id,
-                        &session.final_sha256,
-                        session.declared_size,
-                        &session.owner,
-                    )
-                    .await
-                    .map_err(internal_error)?
-                {
-                    let mut response = self.build_complete_upload_response(
-                        &session.final_sha256,
-                        session.declared_size,
-                        &session.content_type,
-                        false,
-                    );
-                    response.processing_via_outbox = true;
-                    return Ok(response);
-                }
+        // A receipt commits before the final session save. It is the authority
+        // for replay even if that save failed or the process stopped before it.
+        if let Some(outbox) = outbox {
+            if outbox
+                .has_session_receipt(
+                    &session.upload_id,
+                    &session.final_sha256,
+                    session.declared_size,
+                    &session.owner,
+                )
+                .await
+                .map_err(internal_error)?
+            {
+                let mut response = self.build_complete_upload_response(
+                    &session.final_sha256,
+                    session.declared_size,
+                    &session.content_type,
+                    false,
+                );
+                response.processing_via_outbox = true;
+                return Ok(response);
             }
+        }
+        if session.finalized_object.is_some() {
             return self.completed_response(&session, false, outbox).await;
         }
 
@@ -659,13 +651,16 @@ where
             .await
             .map_err(internal_error)?;
 
+        // Commit the processing event and session receipt before the fallible
+        // manifest save. Until the receipt commits, retain staging for a retry.
+        let response = self
+            .completed_response(&session, newly_stored, outbox)
+            .await?;
         session.storage_complete = true;
         session.finalized_object = Some(session.final_sha256.clone());
         self.store.save(&session).await.map_err(internal_error)?;
         let _ = self.backend.delete_object(&session.temp_object).await;
-
-        self.completed_response(&session, newly_stored, outbox)
-            .await
+        Ok(response)
     }
 
     pub async fn abort_session(
@@ -680,6 +675,27 @@ where
                 "Upload session already finalized".to_string(),
             ));
         }
+        let outbox = self
+            .session_outbox(&session)
+            .await
+            .map_err(internal_error)?;
+        let committed = match outbox {
+            Some(outbox) => outbox
+                .has_session_receipt(
+                    &session.upload_id,
+                    &session.final_sha256,
+                    session.declared_size,
+                    &session.owner,
+                )
+                .await
+                .map_err(internal_error)?,
+            None => false,
+        };
+        if committed {
+            return Err(ResumableError::Conflict(
+                "Upload session already finalized".to_string(),
+            ));
+        }
 
         self.backend
             .cancel_session(&session)
@@ -688,6 +704,20 @@ where
         let _ = self.backend.delete_object(&session.temp_object).await;
         self.store.delete(upload_id).await.map_err(internal_error)?;
         Ok(())
+    }
+
+    async fn session_outbox(
+        &self,
+        session: &UploadSession,
+    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+        match self
+            .outbox
+            .as_ref()
+            .filter(|_| session.processing_outbox_required != Some(false))
+        {
+            Some(outbox) => Ok(Some(outbox.clone())),
+            None => self.backend.historical_processing(session).await,
+        }
     }
 
     async fn completed_response(
@@ -765,18 +795,35 @@ where
         } else {
             None
         };
-        if session.finalized_object.is_none()
-            && (self.backend.cancel_session(session).await.is_err()
+        let outbox = self.outbox.as_ref().or(historical.as_ref());
+        if session.finalized_object.is_none() {
+            let committed = match outbox {
+                Some(outbox) => match outbox
+                    .has_session_receipt(
+                        &session.upload_id,
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.owner,
+                    )
+                    .await
+                {
+                    Ok(committed) => committed,
+                    Err(_) => return,
+                },
+                None => false,
+            };
+            if (!committed && self.backend.cancel_session(session).await.is_err())
                 || self
                     .backend
                     .delete_object(&session.temp_object)
                     .await
-                    .is_err())
-        {
-            return;
+                    .is_err()
+            {
+                return;
+            }
         }
         // Before the session, so a failure leaves both for the background sweep.
-        if let Some(outbox) = self.outbox.as_ref().or(historical.as_ref()) {
+        if let Some(outbox) = outbox {
             if outbox
                 .forget_session_receipt(&session.upload_id)
                 .await
@@ -1427,6 +1474,7 @@ mod tests {
         temp_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_final_object_lookup: bool,
+        fail_cancel_session: bool,
         final_refs: Vec<crate::storage::ObjectRef>,
     }
 
@@ -1481,6 +1529,9 @@ mod tests {
         }
 
         async fn cancel_session(&self, _session: &UploadSession) -> Result<()> {
+            if self.fail_cancel_session {
+                return Err(anyhow!("a completed upload must not be cancelled"));
+            }
             Ok(())
         }
 
@@ -1922,6 +1973,327 @@ mod tests {
             replay.err()
         );
         assert!(!replay.unwrap().newly_stored);
+    }
+
+    #[derive(Clone)]
+    struct FailFinalizedSaveStore(InMemoryStore);
+
+    #[async_trait]
+    impl SessionStore for FailFinalizedSaveStore {
+        async fn load(&self, upload_id: &str) -> Result<Option<UploadSession>> {
+            self.0.load(upload_id).await
+        }
+        async fn save(&self, session: &UploadSession) -> Result<()> {
+            if session.finalized_object.is_some() {
+                return Err(anyhow!("injected final session save failure"));
+            }
+            self.0.save(session).await
+        }
+        async fn delete(&self, upload_id: &str) -> Result<()> {
+            self.0.delete(upload_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_session_survives_a_failed_final_state_save_and_policy_change() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url, newest_event_objects};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let gcs = ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        };
+        let backend = FakeBackend {
+            final_refs: vec![gcs.clone()],
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            FailFinalizedSaveStore(store.clone()),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &storage.with_mode(WriteMode::Gcs).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Internal(_))
+        ));
+        assert!(store
+            .load(&init.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finalized_object
+            .is_none());
+        assert!(
+            outbox
+                .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+                .await
+                .unwrap(),
+            "the receipt must commit before the fallible final session save"
+        );
+
+        let dual_refs = vec![
+            gcs,
+            ObjectRef {
+                provider: StorageProvider::B2,
+                bucket: "fixture-b2".into(),
+                key: hash.clone(),
+                version: Some("v1".into()),
+            },
+        ];
+        outbox
+            .begin_upload(&hash, 5, "video/mp4", &owner, &storage)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                manager
+                    .abort_session(
+                        &init.upload_id,
+                        init.required_headers
+                            .get("Authorization")
+                            .map(String::as_str)
+                    )
+                    .await,
+                Err(ResumableError::Conflict(_))
+            ),
+            "a committed receipt must also prevent abort before the session save"
+        );
+        // Simulate a restarted replica with no access to the provider state.
+        let restarted = ResumableManager::new(
+            FakeBackend {
+                fail_final_object_lookup: true,
+                ..Default::default()
+            },
+            FailFinalizedSaveStore(store.clone()),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        let replay = restarted
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(!replay.newly_stored);
+        assert!(replay.processing_via_outbox);
+        assert_eq!(
+            outbox.pending_intents(10).await.unwrap().len(),
+            1,
+            "an old receipt cannot complete the new admission"
+        );
+        outbox
+            .enqueue_upload(&hash, 5, "video/mp4", &owner, dual_refs.clone())
+            .await
+            .unwrap();
+        restarted
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert_eq!(newest_event_objects(&outbox, &hash).await, dual_refs);
+
+        // Expiry must clean the receipt and staging without trying to cancel an
+        // already committed native upload whose final session save failed.
+        let mut expired = store.load(&init.upload_id).await.unwrap().unwrap();
+        expired.expires_at_epoch_secs = 0;
+        store.save(&expired).await.unwrap();
+        let cleanup = ResumableManager::new(
+            FakeBackend {
+                fail_cancel_session: true,
+                ..backend.clone()
+            },
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        assert!(matches!(
+            cleanup.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Gone(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert!(!outbox
+            .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert!(!backend
+            .temp_objects
+            .lock()
+            .await
+            .contains_key(&expired.temp_object));
+        assert!(backend.final_objects.lock().await.contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn failed_receipt_commit_keeps_staging_and_session_retryable() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let db = crate::coordination::connect(&url).await.unwrap();
+        db.batch_execute("CREATE FUNCTION reject_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture receipt failure'; END $$; CREATE TRIGGER reject_receipt BEFORE INSERT ON upload_processing_session_receipts FOR EACH ROW EXECUTE FUNCTION reject_receipt();").await.unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let backend = FakeBackend {
+            final_refs: vec![ObjectRef {
+                provider: StorageProvider::Gcs,
+                bucket: "fixture-gcs".into(),
+                key: hash.clone(),
+                version: Some("1".into()),
+            }],
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .is_err());
+        let session = store.load(&init.upload_id).await.unwrap().unwrap();
+        assert!(
+            session.finalized_object.is_none(),
+            "a failed receipt transaction must not mark the session finalized"
+        );
+        assert_eq!(
+            backend
+                .temp_objects
+                .lock()
+                .await
+                .get(&session.temp_object)
+                .unwrap(),
+            b"hello"
+        );
+        assert!(!outbox
+            .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+            .await
+            .unwrap());
+        assert_eq!(outbox.pending_intents(10).await.unwrap().len(), 1);
+        db.batch_execute("DROP TRIGGER reject_receipt ON upload_processing_session_receipts")
+            .await
+            .unwrap();
+        manager
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(store
+            .load(&init.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finalized_object
+            .is_some());
+        assert!(!backend
+            .temp_objects
+            .lock()
+            .await
+            .contains_key(&session.temp_object));
+        assert!(outbox
+            .has_session_receipt(&init.upload_id, &hash, 5, &owner)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
