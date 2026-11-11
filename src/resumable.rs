@@ -576,11 +576,19 @@ where
             return Err(ResumableError::Gone("Upload session expired".to_string()));
         }
 
-        let outbox = self
-            .session_outbox(&session)
-            .await
-            .map_err(internal_error)?;
-        let outbox = outbox.as_ref();
+        let configured = self
+            .outbox
+            .as_ref()
+            .filter(|_| session.processing_outbox_required != Some(false));
+        let historical = if configured.is_none() {
+            self.backend
+                .historical_processing(&session)
+                .await
+                .map_err(internal_error)?
+        } else {
+            None
+        };
+        let outbox = configured.or(historical.as_ref());
         if session.next_offset != session.declared_size {
             return Err(ResumableError::Conflict(format!(
                 "Upload incomplete: {} of {} bytes committed",
@@ -590,26 +598,18 @@ where
 
         // A receipt commits before the final session save. It is the authority
         // for replay even if that save failed or the process stopped before it.
-        if let Some(outbox) = outbox {
-            if outbox
-                .has_session_receipt(
-                    &session.upload_id,
-                    &session.final_sha256,
-                    session.declared_size,
-                    &session.owner,
-                )
-                .await
-                .map_err(internal_error)?
-            {
-                let mut response = self.build_complete_upload_response(
-                    &session.final_sha256,
-                    session.declared_size,
-                    &session.content_type,
-                    false,
-                );
-                response.processing_via_outbox = true;
-                return Ok(response);
-            }
+        if receipt_committed(outbox, &session)
+            .await
+            .map_err(internal_error)?
+        {
+            let mut response = self.build_complete_upload_response(
+                &session.final_sha256,
+                session.declared_size,
+                &session.content_type,
+                false,
+            );
+            response.processing_via_outbox = true;
+            return Ok(response);
         }
         if session.finalized_object.is_some() {
             return self.completed_response(&session, false, outbox).await;
@@ -686,19 +686,10 @@ where
                     .await
                     .map_err(internal_error)?,
             };
-            let committed = match self.outbox.as_ref().or(historical.as_ref()) {
-                Some(outbox) => outbox
-                    .has_session_receipt(
-                        &session.upload_id,
-                        &session.final_sha256,
-                        session.declared_size,
-                        &session.owner,
-                    )
-                    .await
-                    .map_err(internal_error)?,
-                None => false,
-            };
-            if committed {
+            if receipt_committed(self.outbox.as_ref().or(historical.as_ref()), &session)
+                .await
+                .map_err(internal_error)?
+            {
                 return Err(ResumableError::Conflict(
                     "Upload session already finalized".to_string(),
                 ));
@@ -712,20 +703,6 @@ where
         let _ = self.backend.delete_object(&session.temp_object).await;
         self.store.delete(upload_id).await.map_err(internal_error)?;
         Ok(())
-    }
-
-    async fn session_outbox(
-        &self,
-        session: &UploadSession,
-    ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
-        match self
-            .outbox
-            .as_ref()
-            .filter(|_| session.processing_outbox_required != Some(false))
-        {
-            Some(outbox) => Ok(Some(outbox.clone())),
-            None => self.backend.historical_processing(session).await,
-        }
     }
 
     async fn completed_response(
@@ -1333,6 +1310,26 @@ fn is_video_content_type(content_type: &str) -> bool {
 #[derive(Debug, thiserror::Error)]
 #[error("Upload session is busy; retry the request")]
 pub struct SessionBusy;
+
+/// Whether this session already committed its processing event and receipt.
+async fn receipt_committed(
+    outbox: Option<&crate::outbox::ProcessingOutbox>,
+    session: &UploadSession,
+) -> Result<bool> {
+    match outbox {
+        Some(outbox) => {
+            outbox
+                .has_session_receipt(
+                    &session.upload_id,
+                    &session.final_sha256,
+                    session.declared_size,
+                    &session.owner,
+                )
+                .await
+        }
+        None => Ok(false),
+    }
+}
 
 fn internal_error(error: anyhow::Error) -> ResumableError {
     if error.is::<SessionBusy>() || error.is::<crate::outbox::HistoricalSessionUnavailable>() {
