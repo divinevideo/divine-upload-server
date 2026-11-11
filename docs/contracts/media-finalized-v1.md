@@ -80,15 +80,17 @@ or B2 then GCS for an explicitly recorded B2-primary policy. Supporting that
 ordered receipt shape does not enable outbox dispatch in `b2_primary` mode. Missing,
 extra, duplicate, reordered or wrong-bucket references cannot complete the intent.
 Resumable completion records a per-session receipt atomically with the outbox
-event and intent completion. A repeated session uses that receipt without
-changing the current intent or refreshing finalization order. A new session
-still completes its own admission even when it reuses a historical event ID.
-<!-- TODO(#33): remove the next sentence with the pre-receipt replay path once sessions completed before receipts have expired everywhere. -->
-For completed sessions predating receipts, an exact historical event may be
-adopted when the current intent has a different policy; this does not mutate the
-newer intent. A receipt is deleted with its session when the expired session is
-cleaned up, because an expired session's completion is refused before its
-receipt is read. Receipt rows reference outbox events by foreign key, so any
+event and intent completion, before saving the final session manifest. A repeated
+session uses that receipt without changing the current intent, refreshing
+finalization order or looking up provider objects, including after a failed final
+manifest save. The receipt also prevents aborting that committed upload. A failed
+receipt transaction leaves staging and the session retryable. A new or unreceipted
+session still completes its own admission even when it reuses a historical event
+ID; a mismatched destination policy returns 409. An event shared by other sessions
+is not evidence that this session committed. A receipt is deleted with its session
+when the expired session is cleaned up, including when its final manifest save
+failed, because an expired session's completion is refused before its receipt is
+read. Receipt rows reference outbox events by foreign key, so any
 future outbox retention must delete referencing receipts first.
 
 Outbox workers claim jobs through PostgreSQL `FOR UPDATE SKIP LOCKED`, with a

@@ -484,8 +484,8 @@ impl ProcessingOutbox {
             .await
     }
 
-    /// A completed session may be replayed after a newer upload changes the
-    /// mutable intent. An exact event already committed needs no new admission.
+    /// A committed session receipt acknowledges a replay without touching the
+    /// mutable intent. Unreceipted sessions must complete their current admission.
     pub async fn enqueue_completed_session(
         &self,
         upload_id: &str,
@@ -601,45 +601,29 @@ impl ProcessingOutbox {
         event.replicas = objects;
         event.refresh_job_id()?;
         let payload = serde_json::to_value(&event)?;
-        // TODO(#33): remove this pre-receipt replay path, its lookup query and
-        // the matching contract and deployment text once every session completed
-        // before receipts has expired: one session lifetime after the receipts
-        // schema is live in every environment.
-        let historical_replay = upload_id.is_some()
-            && !matches_intent
-            && transaction
-                .query_opt(
-                    "SELECT 1 FROM upload_processing_outbox WHERE job_id=$1 AND payload=$2",
-                    &[&event.job_id, &payload],
-                )
-                .await
-                .map_err(|_| anyhow!("completed processing event lookup failed"))?
-                .is_some();
-        if !matches_intent && !historical_replay {
+        if !matches_intent {
             return Err(IntentConflict.into());
         }
-        if !historical_replay {
-            if intent.get::<_, bool>(4) {
-                let receipt: ThumbnailReceipt = serde_json::from_value(
-                    intent
-                        .get::<_, Option<serde_json::Value>>(5)
-                        .ok_or(ThumbnailPending)?,
-                )
-                .map_err(|_| ThumbnailPending)?;
-                validate_thumbnail_receipt(
-                    hash,
-                    &receipt,
-                    &required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?,
-                )?;
-                if receipt.originals != original_objects {
-                    return Err(ThumbnailPending.into());
-                }
+        if intent.get::<_, bool>(4) {
+            let receipt: ThumbnailReceipt = serde_json::from_value(
+                intent
+                    .get::<_, Option<serde_json::Value>>(5)
+                    .ok_or(ThumbnailPending)?,
+            )
+            .map_err(|_| ThumbnailPending)?;
+            validate_thumbnail_receipt(
+                hash,
+                &receipt,
+                &required_destinations(mode, &gcs_bucket, b2_bucket.as_deref())?,
+            )?;
+            if receipt.originals != original_objects {
+                return Err(ThumbnailPending.into());
             }
-            transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
-            let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
-            if updated != 1 {
-                bail!("processing event has no matching upload intent");
-            }
+        }
+        transaction.execute("INSERT INTO upload_processing_outbox(job_id,payload) VALUES($1,$2) ON CONFLICT(job_id) DO UPDATE SET finalized_at=clock_timestamp()",&[&event.job_id,&payload]).await.map_err(|_|anyhow!("processing event persistence failed"))?;
+        let updated=transaction.execute("UPDATE upload_processing_intents SET completed=true,updated_at=now() WHERE sha256=$1 AND owner=$2 AND size=$3 AND content_type=$4",&[&hash,&owner,&stored_size,&content_type]).await.map_err(|_|anyhow!("upload intent completion failed"))?;
+        if updated != 1 {
+            bail!("processing event has no matching upload intent");
         }
         if let Some(upload_id) = upload_id {
             transaction.execute(
@@ -1758,6 +1742,56 @@ pub(crate) mod tests {
                 "{field} mismatch"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn historical_event_without_session_receipt_cannot_bypass_current_intent() {
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox =
+            ProcessingOutbox::connect(&url, "https://processing.invalid/finalized", "fixture")
+                .await
+                .unwrap();
+        let hash = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let storage = fixture_storage(WriteMode::Dual, Some("fixture-b2"));
+        let gcs = ObjectRef {
+            provider: StorageProvider::Gcs,
+            bucket: "fixture-gcs".into(),
+            key: hash.clone(),
+            version: Some("1".into()),
+        };
+        outbox
+            .begin_upload(
+                &hash,
+                3,
+                "video/mp4",
+                &owner,
+                &storage.with_mode(WriteMode::Gcs).unwrap(),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_upload(&hash, 3, "video/mp4", &owner, vec![gcs.clone()])
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(&hash, 3, "video/mp4", &owner, &storage)
+            .await
+            .unwrap();
+        let before = newest_event_objects(&outbox, &hash).await;
+        let error = outbox
+            .enqueue_completed_session("unreceipted-session", &hash, 3, &owner, vec![gcs])
+            .await
+            .unwrap_err();
+        assert!(error.is::<IntentConflict>());
+        assert!(!outbox
+            .has_session_receipt("unreceipted-session", &hash, 3, &owner)
+            .await
+            .unwrap());
+        assert_eq!(outbox.pending_intents(10).await.unwrap()[0].mode, "dual");
+        assert_eq!(newest_event_objects(&outbox, &hash).await, before);
     }
 
     #[tokio::test]

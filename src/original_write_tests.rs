@@ -318,6 +318,11 @@ async fn original_write_both_resumable_paths_prepare_without_provider_reads_or_p
 }
 #[tokio::test]
 async fn original_write_session_receipt_replay_is_pg_only() {
+    check_session_receipt_replay(true).await;
+    check_session_receipt_replay(false).await;
+}
+
+async fn check_session_receipt_replay(final_session_saved: bool) {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -328,7 +333,9 @@ async fn original_write_session_receipt_replay_is_pg_only() {
         return;
     };
     let mut s = session("up_complete", false);
-    s.finalized_object = Some(s.final_sha256.clone());
+    if final_session_saved {
+        s.finalized_object = Some(s.final_sha256.clone());
+    }
     s.storage_complete = true;
     save_session(&one, &s).await;
     let event = crate::processing::MediaFinalizedV1::new(

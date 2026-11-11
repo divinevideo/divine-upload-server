@@ -84,7 +84,22 @@ impl ResumableRuntime {
                 if session.session_url == "staged-v1" {
                     self.backend.delete_object(&session.temp_object).await?;
                 } else if session.finalized_object.is_none() {
-                    self.backend.cancel_session(&session).await?;
+                    let committed = match outbox.or(historical.as_ref()) {
+                        Some(outbox) => {
+                            outbox
+                                .has_session_receipt(
+                                    &id,
+                                    &session.final_sha256,
+                                    session.declared_size,
+                                    &session.owner,
+                                )
+                                .await?
+                        }
+                        None => false,
+                    };
+                    if !committed {
+                        self.backend.cancel_session(&session).await?;
+                    }
                     self.backend.delete_object(&session.temp_object).await?;
                 }
                 // Before the session, so a failure leaves it for the next pass
@@ -765,16 +780,55 @@ mod tests {
     }
     #[tokio::test]
     async fn sweep_forgets_the_completion_receipt_of_an_expired_session() {
+        check_expired_receipt_sweep(true).await;
+        check_expired_receipt_sweep(false).await;
+    }
+
+    async fn check_expired_receipt_sweep(final_manifest_saved: bool) {
         use crate::outbox::tests::{fixture_storage, isolated_database_url};
         use crate::storage::StorageProvider;
+        use axum::{http::StatusCode, http::Uri, routing::any, Router};
+        use std::future::IntoFuture;
         // A fresh schema, so the sweep sees only this test's sessions.
         let Some(url) = isolated_database_url().await else {
             return;
         };
         let storage = fixture_storage(WriteMode::Gcs, None);
-        let runtime = ResumableRuntime::new(storage.clone(), None, String::new(), Some(&url))
-            .await
-            .unwrap();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/*path",
+                    any(move |uri: Uri| {
+                        let observed = observed.clone();
+                        async move {
+                            observed.lock().await.push(uri.path().to_owned());
+                            if uri.path() == "/native-session" {
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            } else {
+                                StatusCode::NO_CONTENT
+                            }
+                        }
+                    }),
+                ),
+            )
+            .into_future(),
+        );
+        let gcs = GcsClient::new(
+            google_cloud_storage::client::ClientConfig {
+                storage_endpoint: endpoint.clone(),
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let runtime =
+            ResumableRuntime::new(storage.clone(), Some(gcs), "fixture-gcs".into(), Some(&url))
+                .await
+                .unwrap();
         let outbox = crate::outbox::ProcessingOutbox::connect(
             &url,
             "https://processing.invalid/finalized",
@@ -786,9 +840,9 @@ mod tests {
         completed.final_sha256 = random_hex(32);
         completed.next_offset = completed.declared_size;
         completed.storage_complete = true;
-        completed.finalized_object = Some(completed.final_sha256.clone());
-        // Not staged: a finalized session's sweep then needs no provider I/O.
-        completed.session_url = "https://upload.invalid/session".into();
+        completed.processing_outbox_required = Some(true);
+        completed.finalized_object = final_manifest_saved.then(|| completed.final_sha256.clone());
+        completed.session_url = format!("{endpoint}/native-session");
         completed.expires_at_epoch_secs = 0;
         runtime.store.save(&completed).await.unwrap();
         let (hash, size, owner) = (
@@ -830,6 +884,17 @@ mod tests {
                 .unwrap(),
             "an expired session can never be replayed, so its receipt must go with it"
         );
+        assert!(
+            !outbox.source_objects(&hash).await.unwrap().is_empty(),
+            "receipt cleanup must retain the outbox event"
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), usize::from(!final_manifest_saved));
+        assert!(
+            requests.iter().all(|path| path.ends_with("/o/test-temp")),
+            "cleanup must only delete staging, never cancel a committed session: {requests:?}"
+        );
+        server.abort();
     }
     #[tokio::test]
     async fn postgres_session_lock_excludes_another_connection() {
