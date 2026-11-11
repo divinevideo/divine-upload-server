@@ -713,7 +713,11 @@ where
                 .await
                 .map_err(internal_error)?;
         }
-        let _ = self.backend.delete_object(&session.temp_object).await;
+        // Retain the discovery record until staging cleanup succeeds.
+        self.backend
+            .delete_object(&session.temp_object)
+            .await
+            .map_err(internal_error)?;
         self.store.delete(upload_id).await.map_err(internal_error)?;
         Ok(())
     }
@@ -1479,6 +1483,7 @@ mod tests {
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_final_object_lookup: bool,
         fail_cancel_session: bool,
+        fail_delete_object: bool,
         fail_historical_lookup: bool,
         historical: Option<crate::outbox::ProcessingOutbox>,
         cancelled: Arc<Mutex<Vec<String>>>,
@@ -1593,6 +1598,9 @@ mod tests {
         }
 
         async fn delete_object(&self, object_key: &str) -> Result<()> {
+            if self.fail_delete_object {
+                return Err(anyhow!("staging delete failed"));
+            }
             self.temp_objects.lock().await.remove(object_key);
             self.final_objects.lock().await.remove(object_key);
             Ok(())
@@ -2730,6 +2738,85 @@ mod tests {
             .unwrap();
         assert!(store.load(&init.upload_id).await.unwrap().is_none());
         assert!(!backend.temp_objects.lock().await.contains_key(&temp_object));
+        assert!(backend.cancelled.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_abort_delete_retains_a_completed_session_for_retry() {
+        let backend = FakeBackend {
+            fail_cancel_session: true,
+            fail_delete_object: true,
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let init = manager
+            .init_session(
+                &"b".repeat(64),
+                ResumableUploadInitRequest {
+                    sha256: hex::encode(Sha256::digest(b"hello")),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let authorization = init
+            .required_headers
+            .get("Authorization")
+            .map(String::as_str);
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                authorization,
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        let session = store.load(&init.upload_id).await.unwrap().unwrap();
+        assert!(session.storage_complete);
+
+        assert!(matches!(
+            manager.abort_session(&init.upload_id, authorization).await,
+            Err(ResumableError::Internal(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_some());
+        assert!(backend
+            .temp_objects
+            .lock()
+            .await
+            .contains_key(&session.temp_object));
+
+        let recovered = ResumableManager::new(
+            FakeBackend {
+                fail_delete_object: false,
+                ..backend.clone()
+            },
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        recovered
+            .abort_session(&init.upload_id, authorization)
+            .await
+            .unwrap();
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert!(!backend
+            .temp_objects
+            .lock()
+            .await
+            .contains_key(&session.temp_object));
         assert!(backend.cancelled.lock().await.is_empty());
     }
 
