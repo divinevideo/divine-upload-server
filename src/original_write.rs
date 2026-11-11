@@ -209,9 +209,19 @@ impl Runtime {
         }
         authorize(auth, &session.final_sha256)?;
         // The receipt may have committed before a failed final session save.
-        if let Some(row)=tx.query_opt("SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1",&[&id]).await.map_err(|_|Error::Unavailable)? {
-            crate::outbox::check_session_receipt(row.get(0),&session.final_sha256,session.declared_size,owner).map_err(|_|Error::Unavailable)?;
-            tx.commit().await.map_err(|_|Error::Unavailable)?;
+        if let Some(row) = tx
+            .query_opt(crate::outbox::SESSION_RECEIPT_EVENT, &[&id])
+            .await
+            .map_err(|_| Error::Unavailable)?
+        {
+            crate::outbox::check_session_receipt(
+                row.get(0),
+                &session.final_sha256,
+                session.declared_size,
+                owner,
+            )
+            .map_err(|_| Error::Unavailable)?;
+            tx.commit().await.map_err(|_| Error::Unavailable)?;
             return Ok(SessionPreparation::Committed(Box::new(session)));
         }
         if session.finalized_object.is_some() {

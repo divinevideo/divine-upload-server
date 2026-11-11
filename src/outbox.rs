@@ -16,7 +16,7 @@ fn schema() -> String {
         include_str!("../database/migrations/007_sync_thumbnail_barrier.sql")
     )
 }
-const SESSION_RECEIPT_EVENT: &str = "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1";
+pub(crate) const SESSION_RECEIPT_EVENT: &str = "SELECT o.payload FROM upload_processing_session_receipts r JOIN upload_processing_outbox o ON o.job_id=r.job_id WHERE r.upload_id=$1";
 
 #[derive(Debug, thiserror::Error)]
 #[error("Upload intent requires its recorded storage policy and destination mapping; retain the required providers or reconcile the intent")]
