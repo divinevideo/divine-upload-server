@@ -55,11 +55,11 @@ async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Version
     let Some(client) = storage.gcs.as_ref() else {
         return Ok(None);
     };
-    let Some((generation, bytes)) =
-        read_record_bytes(client, storage.gcs_bucket(), &record_key(key)).await?
-    else {
+    let name = record_key(key);
+    let Some(generation) = record_generation(client, storage.gcs_bucket(), &name).await? else {
         return Ok(None);
     };
+    let bytes = download_record(client, storage.gcs_bucket(), &name, generation).await?;
     let old: Record = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow!("Invalid B2-primary admission record"))?;
     if old.schema_version != 1
@@ -99,11 +99,7 @@ async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Version
     }))
 }
 
-async fn read_record_bytes(
-    client: &GcsClient,
-    bucket: &str,
-    name: &str,
-) -> Result<Option<(i64, Vec<u8>)>> {
+async fn record_generation(client: &GcsClient, bucket: &str, name: &str) -> Result<Option<i64>> {
     let metadata = match client
         .get_object(&GetObjectRequest {
             bucket: bucket.into(),
@@ -119,19 +115,26 @@ async fn read_record_bytes(
     if metadata.generation <= 0 || !(0..=16384).contains(&metadata.size) {
         bail!("Invalid B2-primary admission record");
     }
-    let bytes = client
+    Ok(Some(metadata.generation))
+}
+async fn download_record(
+    client: &GcsClient,
+    bucket: &str,
+    name: &str,
+    generation: i64,
+) -> Result<Vec<u8>> {
+    client
         .download_object(
             &GetObjectRequest {
                 bucket: bucket.into(),
                 object: name.into(),
-                generation: Some(metadata.generation),
+                generation: Some(generation),
                 ..Default::default()
             },
             &Range::default(),
         )
         .await
-        .map_err(|_| anyhow!("B2-primary admission read failed"))?;
-    Ok(Some((metadata.generation, bytes)))
+        .map_err(|_| anyhow!("B2-primary admission read failed"))
 }
 pub(super) async fn exists(storage: &MediaStorage, key: &str) -> Result<bool> {
     Ok(read_record(storage, key).await?.is_some())
@@ -163,14 +166,20 @@ impl Admission {
 
             // The control write may have committed before its response was lost.
             // Only the exact proposed bytes can establish this actor's transition.
-            if let Ok(Some((generation, stored))) =
-                read_record_bytes(&self.client, &self.bucket, &self.key).await
+            // An unchanged generation shows it has not committed as of this readback,
+            // so the body is downloaded only when the generation moved.
+            if let Ok(Some(generation)) =
+                record_generation(&self.client, &self.bucket, &self.key).await
             {
                 if generation != state.generation {
-                    if stored == payload {
-                        break generation;
+                    if let Ok(stored) =
+                        download_record(&self.client, &self.bucket, &self.key, generation).await
+                    {
+                        if stored == payload {
+                            break generation;
+                        }
+                        bail!("B2-primary admission changed during update; retain pending state");
                     }
-                    bail!("B2-primary admission changed during update; retain pending state");
                 }
             }
 

@@ -253,6 +253,8 @@ struct Objects {
     throttle_final_admission: bool,
     land_stale_final_before_fence: bool,
     final_admission_requests: Vec<(i64, Bytes)>,
+    record_downloads: usize,
+    fail_record_download_once: bool,
     change_attempt_on_ack_loss: bool,
     hide_lost_admission_ack: bool,
     fail_record_read_once: bool,
@@ -490,6 +492,13 @@ async fn origin(
             if method == Method::GET && f.fail_record_read_once {
                 f.fail_record_read_once = false;
                 return error(503);
+            }
+            if query.get("alt").is_some_and(|v| v == "media") && f.records.contains_key(&name) {
+                f.record_downloads += 1;
+                if f.fail_record_download_once {
+                    f.fail_record_download_once = false;
+                    return error(503);
+                }
             }
             let Some((generation, bytes)) = f.records.get(&name) else {
                 return error(404);
@@ -1570,6 +1579,27 @@ async fn primary_final_receipt_recovers_a_lost_control_write_ack() {
 }
 
 #[tokio::test]
+async fn primary_lost_control_ack_with_unreadable_body_stays_unresolved() {
+    let f = Fixture::new().await;
+    {
+        let mut objects = f.objects.lock().unwrap();
+        objects.lose_final_admission_ack_once = true;
+        objects.fail_record_download_once = true;
+    }
+    // The generation moved, but without the body nothing proves the commit was
+    // this actor's, so the write must not be reported as done.
+    let error = f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("update unresolved"));
+    let objects = f.objects.lock().unwrap();
+    assert_eq!(objects.record_downloads, 1);
+    assert_eq!(objects.writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
 async fn primary_final_receipt_retries_control_write_rate_limits() {
     let f = Fixture::new().await;
     f.objects.lock().unwrap().fail_final_admission_once = Some(429);
@@ -1584,6 +1614,9 @@ async fn primary_final_receipt_retries_control_write_rate_limits() {
         objects.final_admission_requests[0],
         objects.final_admission_requests[1]
     );
+    // The unchanged record generation already shows the throttled write did
+    // not land, so its body is never downloaded.
+    assert_eq!(objects.record_downloads, 0);
 }
 
 #[tokio::test]
