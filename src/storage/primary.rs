@@ -370,6 +370,11 @@ fn is_gcs_missing(error: &google_cloud_storage::http::Error) -> bool {
     matches!(error,google_cloud_storage::http::Error::Response(response) if response.code==404)
 }
 
+/// Every stored copy must carry the admitted size, content type and owner.
+fn matches_provenance(object: &StoredObject, size: u64, mime: &str, owner: Option<&str>) -> bool {
+    object.size == size && object.content_type == mime && object.owner.as_deref() == owner
+}
+
 pub(super) async fn receipts(
     storage: &MediaStorage,
     key: &str,
@@ -455,7 +460,7 @@ pub(super) async fn put_file(
         .stat_reference(&primary)
         .await?
         .ok_or_else(|| anyhow!("B2 canonical winner disappeared"))?;
-    if winner.size != size || winner.content_type != mime || winner.owner != owner {
+    if !matches_provenance(&winner, size, &mime, owner.as_deref()) {
         bail!("B2 pinned canonical metadata does not match admitted provenance");
     }
     let slot = admission.slot(StorageProvider::Gcs).await;
@@ -468,12 +473,12 @@ pub(super) async fn put_file(
                 .stat_ref(&reference)
                 .await?
                 .ok_or_else(|| anyhow!("Recorded GCS backup generation is missing"))?;
-            if existing.size != size || existing.content_type != mime || existing.owner != owner {
+            if !matches_provenance(&existing, size, &mime, owner.as_deref()) {
                 bail!("Recorded GCS backup provenance does not match admitted primary");
             }
             reference
         } else if let Some(existing) = storage.gcs_stat(key).await? {
-            if existing.size != size || existing.content_type != mime || existing.owner != owner {
+            if !matches_provenance(&existing, size, &mime, owner.as_deref()) {
                 bail!("Existing GCS backup provenance does not match admitted primary");
             }
             admission.acknowledged(&existing.reference).await?;
