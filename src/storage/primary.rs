@@ -482,6 +482,12 @@ pub(super) async fn put_file(
             if !matches_provenance(&existing, size, &mime, owner.as_deref()) {
                 bail!("Recorded GCS backup provenance does not match admitted primary");
             }
+            // An earlier attempt recorded this backup but never returned, so hooks
+            // gated on a new store have not run for this upload. The fence in
+            // `open` lets only one request finish it. A backup adopted from an
+            // earlier storage mode looks the same here, so this is at-least-once:
+            // that rare retry repeats a best-effort hook rather than skipping one.
+            newly_stored = true;
             reference
         } else if let Some(existing) = storage.gcs_stat(key).await? {
             if !matches_provenance(&existing, size, &mime, owner.as_deref()) {

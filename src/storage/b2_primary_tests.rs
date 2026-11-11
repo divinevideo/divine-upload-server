@@ -1657,6 +1657,11 @@ async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
             .put("media", Bytes::from_static(b"original"), "video/mp4", None)
             .await;
         assert_eq!(resumed.is_ok(), !corrupt_backup);
+        if let Ok(result) = resumed {
+            // The failed attempt never returned, so hooks gated on this flag
+            // have not run for the upload yet.
+            assert!(result.newly_stored);
+        }
         assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
     }
 }
