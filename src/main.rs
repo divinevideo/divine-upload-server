@@ -2005,17 +2005,24 @@ mod tests {
             },
         ));
         let admission_requested = AtomicBool::new(false);
+        let session_checks = Arc::new(tokio::sync::Semaphore::new(1));
         let response = super::handle_session_chunk_with_admission(
             state,
             "fixture-session".into(),
             headers,
             body,
             || {
-                Arc::new(tokio::sync::Semaphore::new(1))
+                session_checks
+                    .clone()
                     .try_acquire_owned()
                     .map_err(Into::into)
             },
             async {
+                assert_eq!(
+                    session_checks.available_permits(),
+                    1,
+                    "a queued chunk must release its session-check slot"
+                );
                 admission_requested.store(true, Ordering::SeqCst);
                 Err(crate::resources::ResourceError::Busy.into())
             },
