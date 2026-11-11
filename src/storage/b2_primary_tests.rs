@@ -1590,11 +1590,13 @@ async fn primary_final_receipt_retries_control_write_rate_limits() {
 async fn primary_control_retries_have_a_fixed_budget() {
     let f = Fixture::new().await;
     f.objects.lock().unwrap().throttle_final_admission = true;
-    assert!(f
+    let error = f
         .storage
         .put("media", Bytes::from_static(b"original"), "video/mp4", None)
         .await
-        .is_err());
+        .unwrap_err();
+    // Every attempt was rejected, so the failure is not an uncertain outcome.
+    assert!(format!("{error:#}").contains("throttled after retries"));
     let objects = f.objects.lock().unwrap();
     assert_eq!(objects.writes, ["b2", "gcs"]);
     assert_eq!(objects.final_admission_requests.len(), 3);

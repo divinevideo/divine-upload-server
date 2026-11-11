@@ -179,8 +179,12 @@ impl Admission {
                 retry = retries,
                 "B2-primary admission control update failed"
             );
-            if status != Some(429) || retries == 2 {
+            if status != Some(429) {
                 bail!("B2-primary admission update unresolved; retain pending state");
+            }
+            if retries == 2 {
+                // A 429 rejects the request, so this update is known not to have landed.
+                bail!("B2-primary admission update throttled after retries; retain pending state");
             }
             let delay = std::time::Duration::from_millis(
                 CONTROL_RETRY_BASE_MS * 2u64.pow(retries)
