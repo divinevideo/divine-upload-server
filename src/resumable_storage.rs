@@ -85,7 +85,7 @@ impl ResumableRuntime {
                     self.backend.delete_object(&session.temp_object).await?;
                 } else if session.finalized_object.is_none() {
                     // A native upload completes at the provider on its last byte
-                    // and can no longer be cancelled, committed or not.
+                    // and can no longer be cancelled; deleting staging discards it.
                     if !session.storage_complete {
                         self.backend.cancel_session(&session).await?;
                     }

@@ -705,10 +705,14 @@ where
             }
         }
 
-        self.backend
-            .cancel_session(&session)
-            .await
-            .map_err(internal_error)?;
+        // A native upload completes at the provider on its last byte and can no
+        // longer be cancelled; deleting staging below discards it.
+        if !session.storage_complete {
+            self.backend
+                .cancel_session(&session)
+                .await
+                .map_err(internal_error)?;
+        }
         let _ = self.backend.delete_object(&session.temp_object).await;
         self.store.delete(upload_id).await.map_err(internal_error)?;
         Ok(())
@@ -791,7 +795,7 @@ where
         };
         let outbox = self.outbox.as_ref().or(historical.as_ref());
         // A native upload completes at the provider on its last byte and can no
-        // longer be cancelled, committed or not.
+        // longer be cancelled; deleting staging below discards it.
         if session.finalized_object.is_none()
             && ((!session.storage_complete && self.backend.cancel_session(session).await.is_err())
                 || self
@@ -1476,6 +1480,8 @@ mod tests {
         fail_final_object_lookup: bool,
         fail_cancel_session: bool,
         fail_historical_lookup: bool,
+        historical: Option<crate::outbox::ProcessingOutbox>,
+        cancelled: Arc<Mutex<Vec<String>>>,
         final_refs: Vec<crate::storage::ObjectRef>,
     }
 
@@ -1488,7 +1494,7 @@ mod tests {
             if self.fail_historical_lookup {
                 return Err(anyhow!("historical processing lookup failed"));
             }
-            Ok(None)
+            Ok(self.historical.clone())
         }
 
         async fn final_objects(
@@ -1539,7 +1545,8 @@ mod tests {
             })
         }
 
-        async fn cancel_session(&self, _session: &UploadSession) -> Result<()> {
+        async fn cancel_session(&self, session: &UploadSession) -> Result<()> {
+            self.cancelled.lock().await.push(session.upload_id.clone());
             if self.fail_cancel_session {
                 return Err(anyhow!("a completed upload must not be cancelled"));
             }
@@ -2536,6 +2543,62 @@ mod tests {
             .await
             .unwrap();
         assert!(store.load(&init.upload_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn aborting_an_upload_that_received_every_byte_never_cancels_it() {
+        let backend = FakeBackend {
+            fail_cancel_session: true,
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let init = manager
+            .init_session(
+                &"b".repeat(64),
+                ResumableUploadInitRequest {
+                    sha256: hex::encode(Sha256::digest(b"hello")),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let authorization = init
+            .required_headers
+            .get("Authorization")
+            .map(String::as_str);
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                authorization,
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        let temp_object = store
+            .load(&init.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .temp_object;
+
+        manager
+            .abort_session(&init.upload_id, authorization)
+            .await
+            .unwrap();
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert!(!backend.temp_objects.lock().await.contains_key(&temp_object));
+        assert!(backend.cancelled.lock().await.is_empty());
     }
 
     #[tokio::test]
