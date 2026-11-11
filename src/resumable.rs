@@ -602,6 +602,15 @@ where
             .await
             .map_err(internal_error)?
         {
+            // Finish an interrupted final save, best effort, so staging goes now
+            // rather than waiting for an expiry pass that may never list it.
+            if session.finalized_object.is_none() {
+                session.storage_complete = true;
+                session.finalized_object = Some(session.final_sha256.clone());
+                if self.store.save(&session).await.is_ok() {
+                    let _ = self.backend.delete_object(&session.temp_object).await;
+                }
+            }
             let mut response = self.build_complete_upload_response(
                 &session.final_sha256,
                 session.declared_size,
@@ -2177,6 +2186,112 @@ mod tests {
             .lock()
             .await
             .contains_key(&expired.temp_object));
+        assert!(backend.final_objects.lock().await.contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn receipt_replay_finishes_the_interrupted_session_save() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let backend = FakeBackend {
+            final_refs: vec![ObjectRef {
+                provider: StorageProvider::Gcs,
+                bucket: "fixture-gcs".into(),
+                key: hash.clone(),
+                version: Some("1".into()),
+            }],
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let failing = ResumableManager::new(
+            backend.clone(),
+            FailFinalizedSaveStore(store.clone()),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        let init = failing
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        failing
+            .upload_chunk(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            failing.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Internal(_))
+        ));
+        let temp_object = store
+            .load(&init.upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .temp_object;
+
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        )
+        .with_outbox(Some(outbox.clone()));
+        manager
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load(&init.upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .finalized_object
+                .is_some(),
+            "a receipt-backed replay must finish the session save it answers for"
+        );
+        assert!(!backend.temp_objects.lock().await.contains_key(&temp_object));
         assert!(backend.final_objects.lock().await.contains_key(&hash));
     }
 
