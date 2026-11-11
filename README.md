@@ -120,9 +120,10 @@ unchanged. `dual` retains its historical GCS-first policy.
 Admission-record updates retry GCS HTTP 429 responses at most twice with backoff,
 retaining the exact payload and generation precondition. A lost response can be
 confirmed by reading back the exact proposed record. Upload retries with a
-verified B2 receipt and acknowledged GCS backup reverify both recorded object
-versions before completing the final receipt. Issued writes without a pinned
-acknowledgement still require authorized reconciliation.
+verified B2 receipt and acknowledged GCS backup take a fresh attempt fence, so
+an older in-flight attempt cannot also complete, then reverify both recorded
+object versions before completing the final receipt. Issued writes without a
+pinned acknowledgement still require authorized reconciliation.
 
 This mode uses the existing GCS bucket for small private admission records and
 resumable session state; it requires **no coordination database or new worker**.
