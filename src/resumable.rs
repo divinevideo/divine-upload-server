@@ -796,31 +796,17 @@ where
             None
         };
         let outbox = self.outbox.as_ref().or(historical.as_ref());
-        if session.finalized_object.is_none() {
-            let committed = match outbox {
-                Some(outbox) => match outbox
-                    .has_session_receipt(
-                        &session.upload_id,
-                        &session.final_sha256,
-                        session.declared_size,
-                        &session.owner,
-                    )
-                    .await
-                {
-                    Ok(committed) => committed,
-                    Err(_) => return,
-                },
-                None => false,
-            };
-            if (!committed && self.backend.cancel_session(session).await.is_err())
+        // A native upload completes at the provider on its last byte and can no
+        // longer be cancelled, committed or not.
+        if session.finalized_object.is_none()
+            && ((!session.storage_complete && self.backend.cancel_session(session).await.is_err())
                 || self
                     .backend
                     .delete_object(&session.temp_object)
                     .await
-                    .is_err()
-            {
-                return;
-            }
+                    .is_err())
+        {
+            return;
         }
         // Before the session, so a failure leaves both for the background sweep.
         if let Some(outbox) = outbox {
@@ -2378,6 +2364,64 @@ mod tests {
                 .unwrap(),
             "an expired session can never be replayed, so its receipt must go with it"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_cleanup_never_cancels_an_upload_that_received_every_byte() {
+        // The provider completes a native upload on its last byte, so cancelling
+        // it fails. Cleanup must not depend on a receipt to know that.
+        let backend = FakeBackend {
+            fail_cancel_session: true,
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let owner = "b".repeat(64);
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hex::encode(Sha256::digest(b"hello")),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+        assert!(session.storage_complete);
+        session.expires_at_epoch_secs = now_epoch_secs() - 1;
+        store.save(&session).await.unwrap();
+
+        assert!(matches!(
+            manager.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Gone(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert!(!backend
+            .temp_objects
+            .lock()
+            .await
+            .contains_key(&session.temp_object));
     }
 
     #[tokio::test]
