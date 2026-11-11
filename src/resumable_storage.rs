@@ -84,20 +84,9 @@ impl ResumableRuntime {
                 if session.session_url == "staged-v1" {
                     self.backend.delete_object(&session.temp_object).await?;
                 } else if session.finalized_object.is_none() {
-                    let committed = match outbox.or(historical.as_ref()) {
-                        Some(outbox) => {
-                            outbox
-                                .has_session_receipt(
-                                    &id,
-                                    &session.final_sha256,
-                                    session.declared_size,
-                                    &session.owner,
-                                )
-                                .await?
-                        }
-                        None => false,
-                    };
-                    if !committed {
+                    // A native upload completes at the provider on its last byte
+                    // and can no longer be cancelled, committed or not.
+                    if !session.storage_complete {
                         self.backend.cancel_session(&session).await?;
                     }
                     self.backend.delete_object(&session.temp_object).await?;
@@ -780,11 +769,13 @@ mod tests {
     }
     #[tokio::test]
     async fn sweep_forgets_the_completion_receipt_of_an_expired_session() {
-        check_expired_receipt_sweep(true).await;
-        check_expired_receipt_sweep(false).await;
+        check_expired_receipt_sweep(true, false).await;
+        check_expired_receipt_sweep(false, false).await;
+        // An earlier pass forgot the receipt and then failed to delete the session.
+        check_expired_receipt_sweep(false, true).await;
     }
 
-    async fn check_expired_receipt_sweep(final_manifest_saved: bool) {
+    async fn check_expired_receipt_sweep(final_manifest_saved: bool, receipt_forgotten: bool) {
         use crate::outbox::tests::{fixture_storage, isolated_database_url};
         use crate::storage::StorageProvider;
         use axum::{http::StatusCode, http::Uri, routing::any, Router};
@@ -869,6 +860,12 @@ mod tests {
             )
             .await
             .unwrap();
+        if receipt_forgotten {
+            outbox
+                .forget_session_receipt(&completed.upload_id)
+                .await
+                .unwrap();
+        }
 
         assert_eq!(runtime.sweep_expired(100, Some(&outbox)).await.unwrap(), 1);
         assert!(runtime
