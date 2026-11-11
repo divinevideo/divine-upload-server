@@ -1,11 +1,12 @@
 use anyhow::Result;
 use axum::Router;
+use futures::{Stream, StreamExt};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::{conn::auto::Builder, graceful::GracefulShutdown},
 };
-use std::{future::Future, time::Duration};
-use tokio::net::TcpListener;
+use std::{future::Future, io, time::Duration};
+use tokio::net::{TcpListener, TcpStream};
 use tower::Service;
 use tracing::{error, info};
 
@@ -30,7 +31,44 @@ pub async fn serve(
     shutdown: impl Future<Output = Result<()>>,
     drain_timeout: Duration,
 ) -> Result<()> {
+    serve_incoming(connections(listener), app, shutdown, drain_timeout).await
+}
+
+fn connections(listener: TcpListener) -> impl Stream<Item = io::Result<TcpStream>> {
+    futures::stream::unfold(listener, |listener| async move {
+        let accepted = listener.accept().await.map(|(stream, _)| stream);
+        Some((accepted, listener))
+    })
+}
+
+// Accept failures are transient (a reset in the backlog, fd exhaustion), so
+// they must not end the server or skip the drain of uploads already running.
+async fn accepted(accepted: io::Result<TcpStream>) -> Option<TcpStream> {
+    match accepted {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+            ) {
+                error!("Failed to accept connection: {}", error);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            None
+        }
+    }
+}
+
+async fn serve_incoming(
+    incoming: impl Stream<Item = io::Result<TcpStream>>,
+    app: Router,
+    shutdown: impl Future<Output = Result<()>>,
+    drain_timeout: Duration,
+) -> Result<()> {
     let graceful = GracefulShutdown::new();
+    let mut incoming = Box::pin(incoming.filter_map(accepted));
     tokio::pin!(shutdown);
     loop {
         let stream = tokio::select! {
@@ -39,7 +77,7 @@ pub async fn serve(
                 result?;
                 break;
             },
-            accepted = listener.accept() => accepted?.0,
+            Some(stream) = incoming.next() => stream,
         };
         let app = app.clone();
         let watcher = graceful.watcher();
@@ -57,7 +95,7 @@ pub async fn serve(
             }
         });
     }
-    drop(listener);
+    drop(incoming);
     info!("Draining {} upload connections", graceful.count());
     tokio::time::timeout(drain_timeout, graceful.shutdown()).await?;
     Ok(())
@@ -130,6 +168,37 @@ mod tests {
                 .unwrap();
             assert!(tokio::net::TcpStream::connect(address).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn accept_errors_do_not_stop_the_server() {
+        let app = Router::new().route("/upload", put(|| async { "stored" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let failures = futures::stream::iter([
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            Err(io::Error::other("too many open files")),
+        ]);
+        let (shutdown, shutdown_requested) = oneshot::channel();
+        let server = tokio::spawn(serve_incoming(
+            failures.chain(connections(listener)),
+            app,
+            async { shutdown_requested.await.map_err(Into::into) },
+            Duration::from_secs(5),
+        ));
+        let response = reqwest::Client::new()
+            .put(format!("http://{address}/upload"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "stored");
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
