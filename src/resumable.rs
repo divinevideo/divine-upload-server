@@ -2274,6 +2274,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .temp_object;
+        // The receipt answers even when finishing the save fails again; staging
+        // then stays, because only a saved finalized state may drop it.
+        failing
+            .complete_session(&init.upload_id, &owner)
+            .await
+            .unwrap();
+        assert!(backend.temp_objects.lock().await.contains_key(&temp_object));
 
         let manager = ResumableManager::new(
             backend.clone(),
@@ -2543,6 +2550,131 @@ mod tests {
             .await
             .unwrap();
         assert!(store.load(&init.upload_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_cleanup_cancels_a_partial_upload() {
+        let backend = FakeBackend::default();
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let owner = "b".repeat(64);
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hex::encode(Sha256::digest(b"hello")),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut session = store.load(&init.upload_id).await.unwrap().unwrap();
+        session.expires_at_epoch_secs = now_epoch_secs() - 1;
+        store.save(&session).await.unwrap();
+
+        assert!(matches!(
+            manager.complete_session(&init.upload_id, &owner).await,
+            Err(ResumableError::Gone(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
+        assert_eq!(*backend.cancelled.lock().await, vec![init.upload_id]);
+    }
+
+    #[tokio::test]
+    async fn abort_without_an_outbox_finds_a_historical_receipt() {
+        use crate::outbox::tests::{fixture_storage, isolated_database_url};
+        use crate::storage::{ObjectRef, StorageProvider, WriteMode};
+        let Some(url) = isolated_database_url().await else {
+            return;
+        };
+        let outbox = crate::outbox::ProcessingOutbox::connect(
+            &url,
+            "https://processing.invalid/finalized",
+            "fixture",
+        )
+        .await
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let owner = "b".repeat(64);
+        let backend = FakeBackend {
+            historical: Some(outbox.clone()),
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        // No configured outbox: abort must resolve the receipt historically.
+        let manager = ResumableManager::new(
+            backend.clone(),
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let init = manager
+            .init_session(
+                &owner,
+                ResumableUploadInitRequest {
+                    sha256: hash.clone(),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let authorization = init
+            .required_headers
+            .get("Authorization")
+            .map(String::as_str);
+        manager
+            .upload_chunk(
+                &init.upload_id,
+                authorization,
+                "bytes 0-4/5",
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        outbox
+            .begin_upload(
+                &hash,
+                5,
+                "video/mp4",
+                &owner,
+                &fixture_storage(WriteMode::Gcs, None),
+            )
+            .await
+            .unwrap();
+        outbox
+            .enqueue_completed_session(
+                &init.upload_id,
+                &hash,
+                5,
+                &owner,
+                vec![ObjectRef {
+                    provider: StorageProvider::Gcs,
+                    bucket: "fixture-gcs".into(),
+                    key: hash.clone(),
+                    version: Some("1".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            manager.abort_session(&init.upload_id, authorization).await,
+            Err(ResumableError::Conflict(_))
+        ));
+        assert!(store.load(&init.upload_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
