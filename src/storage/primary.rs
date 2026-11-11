@@ -51,33 +51,11 @@ async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Version
     let Some(client) = storage.gcs.as_ref() else {
         return Ok(None);
     };
-    let metadata = match client
-        .get_object(&GetObjectRequest {
-            bucket: storage.gcs_bucket().into(),
-            object: record_key(key),
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(value) => value,
-        Err(error) if is_gcs_missing(&error) => return Ok(None),
-        Err(_) => bail!("B2-primary admission lookup failed"),
+    let Some((generation, bytes)) =
+        read_record_bytes(client, storage.gcs_bucket(), &record_key(key)).await?
+    else {
+        return Ok(None);
     };
-    if metadata.generation <= 0 || !(0..=16384).contains(&metadata.size) {
-        bail!("Invalid B2-primary admission record");
-    }
-    let bytes = client
-        .download_object(
-            &GetObjectRequest {
-                bucket: storage.gcs_bucket().into(),
-                object: record_key(key),
-                generation: Some(metadata.generation),
-                ..Default::default()
-            },
-            &Range::default(),
-        )
-        .await
-        .map_err(|_| anyhow!("B2-primary admission read failed"))?;
     let old: Record = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow!("Invalid B2-primary admission record"))?;
     if old.schema_version != 1
@@ -112,9 +90,44 @@ async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Version
         }
     }
     Ok(Some(Versioned {
-        generation: metadata.generation,
+        generation,
         record: old,
     }))
+}
+
+async fn read_record_bytes(
+    client: &GcsClient,
+    bucket: &str,
+    name: &str,
+) -> Result<Option<(i64, Vec<u8>)>> {
+    let metadata = match client
+        .get_object(&GetObjectRequest {
+            bucket: bucket.into(),
+            object: name.into(),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(value) => value,
+        Err(error) if is_gcs_missing(&error) => return Ok(None),
+        Err(_) => bail!("B2-primary admission lookup failed"),
+    };
+    if metadata.generation <= 0 || !(0..=16384).contains(&metadata.size) {
+        bail!("Invalid B2-primary admission record");
+    }
+    let bytes = client
+        .download_object(
+            &GetObjectRequest {
+                bucket: bucket.into(),
+                object: name.into(),
+                generation: Some(metadata.generation),
+                ..Default::default()
+            },
+            &Range::default(),
+        )
+        .await
+        .map_err(|_| anyhow!("B2-primary admission read failed"))?;
+    Ok(Some((metadata.generation, bytes)))
 }
 pub(super) async fn exists(storage: &MediaStorage, key: &str) -> Result<bool> {
     Ok(read_record(storage, key).await?.is_some())
@@ -125,23 +138,59 @@ impl Admission {
         let mut media = Media::new(self.key.clone());
         media.content_type = "application/json".into();
         media.content_length = Some(payload.len() as u64);
-        let object = self
-            .client
-            .upload_object(
-                &UploadObjectRequest {
-                    bucket: self.bucket.clone(),
-                    if_generation_match: Some(state.generation),
-                    ..Default::default()
-                },
-                payload,
-                &UploadType::Simple(media),
-            )
-            .await
-            .map_err(|_| anyhow!("B2-primary admission update unresolved; retain pending state"))?;
-        if object.generation <= 0 {
-            bail!("B2-primary admission generation missing");
-        }
-        state.generation = object.generation;
+        let request = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            if_generation_match: Some(state.generation),
+            ..Default::default()
+        };
+        let upload = UploadType::Simple(media);
+        let mut retries = 0;
+        let generation = loop {
+            let result = self
+                .client
+                .upload_object(&request, payload.clone(), &upload)
+                .await;
+            let status = match &result {
+                Err(google_cloud_storage::http::Error::Response(response)) => Some(response.code),
+                Err(google_cloud_storage::http::Error::HttpClient(error)) => {
+                    error.status().map(|status| status.as_u16())
+                }
+                _ => None,
+            };
+            if let Ok(object) = result {
+                if object.generation > 0 {
+                    break object.generation;
+                }
+            }
+
+            // The control write may have committed before its response was lost.
+            // Only the exact proposed bytes can establish this actor's transition.
+            if let Ok(Some((generation, stored))) =
+                read_record_bytes(&self.client, &self.bucket, &self.key).await
+            {
+                if generation != state.generation {
+                    if stored == payload {
+                        break generation;
+                    }
+                    bail!("B2-primary admission changed during update; retain pending state");
+                }
+            }
+
+            tracing::warn!(
+                provider_http_status = ?status,
+                retry = retries,
+                "B2-primary admission control update failed"
+            );
+            if status != Some(429) || retries == 2 {
+                bail!("B2-primary admission update unresolved; retain pending state");
+            }
+            let delay = std::time::Duration::from_millis(
+                1000 * 2u64.pow(retries) + rand::random::<u64>() % 250,
+            );
+            tokio::time::sleep(delay).await;
+            retries += 1;
+        };
+        state.generation = generation;
         state.record = record;
         Ok(())
     }
@@ -209,9 +258,12 @@ impl Admission {
                 let record = state.record.clone();
                 admission.persist(&mut state, record).await?;
             } else if matches!(state.record.b2, Slot::Verified { .. })
-                && matches!(state.record.gcs, Slot::Verified { .. })
+                && matches!(
+                    state.record.gcs,
+                    Slot::Verified { .. } | Slot::Acknowledged { .. }
+                )
             {
-                // Completed receipts are read-only replays, independently verified below.
+                // Re-read both pinned copies before replay or final acknowledgement.
             } else if matches!(state.record.b2, Slot::NotIssued | Slot::Verified { .. })
                 && matches!(state.record.gcs, Slot::NotIssued)
             {
@@ -311,6 +363,14 @@ impl Admission {
             _ => None,
         }
     }
+
+    async fn acknowledged_backup(&self) -> Option<ObjectRef> {
+        let state = self.state.lock().await;
+        match &state.record.gcs {
+            Slot::Acknowledged { object } => Some(object.clone()),
+            _ => None,
+        }
+    }
 }
 fn is_gcs_missing(error: &google_cloud_storage::http::Error) -> bool {
     matches!(error,google_cloud_storage::http::Error::Response(response) if response.code==404)
@@ -405,7 +465,16 @@ pub(super) async fn put_file(
         verify_stream(storage.stream_ref(&reference).await?, path).await?;
         reference
     } else {
-        let reference = if let Some(existing) = storage.gcs_stat(key).await? {
+        let reference = if let Some(reference) = admission.acknowledged_backup().await {
+            let existing = storage
+                .stat_ref(&reference)
+                .await?
+                .ok_or_else(|| anyhow!("Recorded GCS backup generation is missing"))?;
+            if existing.size != size || existing.content_type != mime || existing.owner != owner {
+                bail!("Recorded GCS backup provenance does not match admitted primary");
+            }
+            reference
+        } else if let Some(existing) = storage.gcs_stat(key).await? {
             if existing.size != size || existing.content_type != mime || existing.owner != owner {
                 bail!("Existing GCS backup provenance does not match admitted primary");
             }

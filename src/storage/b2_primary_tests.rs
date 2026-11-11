@@ -248,6 +248,13 @@ struct Objects {
     resume_key: Option<String>,
     fail_backup_admission_once: bool,
     lose_admission_ack_once: bool,
+    fail_final_admission_once: Option<u16>,
+    lose_final_admission_ack_once: bool,
+    throttle_final_admission: bool,
+    final_admission_requests: Vec<(i64, Bytes)>,
+    change_attempt_on_ack_loss: bool,
+    hide_lost_admission_ack: bool,
+    fail_record_read_once: bool,
     lose_gcs_put_ack: bool,
     lose_b2_put_ack: bool,
     latest_b2_version: Option<String>,
@@ -426,6 +433,15 @@ async fn origin(
                     .parse::<i64>()
                     .unwrap();
                 let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if value["gcs"]["state"] == "verified" {
+                    f.final_admission_requests.push((expected, body.clone()));
+                    if f.throttle_final_admission {
+                        return error(429);
+                    }
+                    if let Some(status) = f.fail_final_admission_once.take() {
+                        return error(status);
+                    }
+                }
                 if f.fail_backup_admission_once && value["gcs"]["state"] == "issued" {
                     f.fail_backup_admission_once = false;
                     return error(503);
@@ -435,10 +451,30 @@ async fn origin(
                     return error(412);
                 }
                 f.records.insert(name.clone(), (current + 1, body));
-                if expected == 0 && f.lose_admission_ack_once {
-                    f.lose_admission_ack_once = false;
+                if value["gcs"]["state"] == "verified" && f.lose_final_admission_ack_once {
+                    f.lose_final_admission_ack_once = false;
                     return error(503);
                 }
+                if expected == 0 && f.lose_admission_ack_once {
+                    f.lose_admission_ack_once = false;
+                    if f.change_attempt_on_ack_loss {
+                        let mut changed = value;
+                        changed["attempt"] = "another-fixture-attempt".into();
+                        f.records.insert(
+                            name.clone(),
+                            (
+                                current + 2,
+                                Bytes::from(serde_json::to_vec(&changed).unwrap()),
+                            ),
+                        );
+                    }
+                    f.fail_record_read_once = f.hide_lost_admission_ack;
+                    return error(503);
+                }
+            }
+            if method == Method::GET && f.fail_record_read_once {
+                f.fail_record_read_once = false;
+                return error(503);
             }
             let Some((generation, bytes)) = f.records.get(&name) else {
                 return error(404);
@@ -1500,6 +1536,83 @@ async fn b2_primary_review_missing_b2_rollback_binding_never_downgrades_accepted
 async fn b2_primary_review_lost_unissued_admission_ack_resumes_with_generation_fence() {
     let f = Fixture::new().await;
     f.objects.lock().unwrap().lose_admission_ack_once = true;
+    f.storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .expect("exact admission readback recovers the lost acknowledgement");
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn primary_final_receipt_recovers_a_lost_control_write_ack() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().lose_final_admission_ack_once = true;
+    f.storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .expect("read back the exact committed receipt after a lost ACK");
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn primary_final_receipt_retries_control_write_rate_limits() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().fail_final_admission_once = Some(429);
+    f.storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .expect("retry a throttled conditional control write");
+    let objects = f.objects.lock().unwrap();
+    assert_eq!(objects.writes, ["b2", "gcs"]);
+    assert_eq!(objects.final_admission_requests.len(), 2);
+    assert_eq!(
+        objects.final_admission_requests[0],
+        objects.final_admission_requests[1]
+    );
+}
+
+#[tokio::test]
+async fn primary_control_retries_have_a_fixed_budget() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().throttle_final_admission = true;
+    assert!(f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .is_err());
+    let objects = f.objects.lock().unwrap();
+    assert_eq!(objects.writes, ["b2", "gcs"]);
+    assert_eq!(objects.final_admission_requests.len(), 3);
+    assert!(objects
+        .final_admission_requests
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
+}
+
+#[tokio::test]
+async fn primary_control_recovery_preserves_a_competing_attempt_fence() {
+    let f = Fixture::new().await;
+    {
+        let mut objects = f.objects.lock().unwrap();
+        objects.lose_admission_ack_once = true;
+        objects.change_attempt_on_ack_loss = true;
+    }
+    assert!(f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .is_err());
+    assert!(f.objects.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+async fn primary_unreadable_control_ack_stays_pending_then_resumes_unissued() {
+    let f = Fixture::new().await;
+    {
+        let mut objects = f.objects.lock().unwrap();
+        objects.lose_admission_ack_once = true;
+        objects.hide_lost_admission_ack = true;
+    }
     assert!(f
         .storage
         .put("media", Bytes::from_static(b"original"), "video/mp4", None)
@@ -1509,8 +1622,28 @@ async fn b2_primary_review_lost_unissued_admission_ack_resumes_with_generation_f
     f.storage
         .put("media", Bytes::from_static(b"original"), "video/mp4", None)
         .await
-        .expect("no issued provider effect may be resumed under CAS");
+        .unwrap();
     assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
+    for corrupt_backup in [false, true] {
+        let f = Fixture::new().await;
+        f.objects.lock().unwrap().fail_final_admission_once = Some(503);
+        assert!(f
+            .storage
+            .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+            .await
+            .is_err());
+        f.objects.lock().unwrap().corrupt_gcs = corrupt_backup;
+        let resumed = f
+            .storage
+            .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+            .await;
+        assert_eq!(resumed.is_ok(), !corrupt_backup);
+        assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+    }
 }
 #[tokio::test]
 async fn b2_primary_review_direct_none_outbox_preserves_existing_dual_intent_barrier() {
