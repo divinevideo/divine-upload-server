@@ -71,6 +71,51 @@ mod tests {
         drop(verification);
         assert!(admission.verify_session().is_ok());
     }
+
+    #[tokio::test]
+    async fn metrics_track_admission_and_release_after_cancellation() {
+        let admission = super::UploadAdmission::new(1, std::time::Duration::from_secs(5));
+        assert!(admission.metrics().contains("divine_upload_active 0\n"));
+        let active = admission.acquire().await.unwrap();
+        assert!(admission.metrics().contains("divine_upload_active 1\n"));
+        {
+            let mut queued = std::pin::pin!(admission.acquire());
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            assert!(admission.metrics().contains("divine_upload_waiting 1\n"));
+        }
+        assert!(admission.metrics().contains("divine_upload_waiting 0\n"));
+        drop(active);
+        assert!(admission.metrics().contains("divine_upload_active 0\n"));
+        assert!(admission.metrics().contains("divine_upload_capacity 1\n"));
+    }
+
+    #[tokio::test]
+    async fn metrics_listener_serves_prometheus_gauges() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::metrics_router())
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; version=0.0.4"
+        );
+        let body = response.text().await.unwrap();
+        for metric in [
+            "divine_upload_active",
+            "divine_upload_waiting",
+            "divine_upload_capacity",
+        ] {
+            assert!(body.contains(&format!("# TYPE {metric} gauge\n")));
+        }
+        server.abort();
+    }
 }
 
 use anyhow::{anyhow, Result};
@@ -127,6 +172,7 @@ fn check_size_with_limit(size: u64, limit: u64) -> Result<()> {
     Ok(())
 }
 struct UploadAdmission {
+    capacity: usize,
     active: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
     session_checks: Arc<Semaphore>,
@@ -136,11 +182,29 @@ struct UploadAdmission {
 impl UploadAdmission {
     fn new(concurrency: usize, wait: Duration) -> Self {
         Self {
+            capacity: concurrency,
             active: Arc::new(Semaphore::new(concurrency)),
             waiting: Arc::new(Semaphore::new(concurrency)),
             session_checks: Arc::new(Semaphore::new(concurrency)),
             wait,
         }
+    }
+
+    fn metrics(&self) -> String {
+        let active = self.capacity - self.active.available_permits();
+        let waiting = self.capacity - self.waiting.available_permits();
+        format!(
+            "# HELP divine_upload_active Upload requests holding an admission slot.\n\
+             # TYPE divine_upload_active gauge\n\
+             divine_upload_active {active}\n\
+             # HELP divine_upload_waiting Upload requests waiting for admission.\n\
+             # TYPE divine_upload_waiting gauge\n\
+             divine_upload_waiting {waiting}\n\
+             # HELP divine_upload_capacity Active upload slots per process.\n\
+             # TYPE divine_upload_capacity gauge\n\
+             divine_upload_capacity {}\n",
+            self.capacity
+        )
     }
 
     fn verify_session(&self) -> Result<OwnedSemaphorePermit> {
@@ -191,6 +255,21 @@ fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
 }
 pub async fn acquire() -> Result<OwnedSemaphorePermit> {
     UPLOAD_ADMISSION.acquire().await
+}
+
+pub fn metrics_router() -> axum::Router {
+    axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(|| async {
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4",
+                )],
+                UPLOAD_ADMISSION.metrics(),
+            )
+        }),
+    )
 }
 pub fn acquire_session_verification() -> Result<OwnedSemaphorePermit> {
     UPLOAD_ADMISSION.verify_session()

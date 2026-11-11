@@ -92,6 +92,7 @@ All configuration comes from environment variables. The table below lists the co
 | `CDN_BASE_URL` | `https://media.divine.video` | Base URL for returned blob and thumbnail URLs. |
 | `UPLOAD_BASE_URL` | `https://upload.divine.video` | Base URL used to build opaque session `uploadUrl`s. |
 | `PORT` | `8080` | Listen port. |
+| `METRICS_PORT` | — | Optional internal Prometheus listener. Exposes `/metrics` on a separate port. |
 | `MAX_CONCURRENT_UPLOADS` | `4` | Active upload requests per process. The same number can wait for a slot. |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
@@ -113,6 +114,13 @@ slot. The server starts reading direct and chunk request bodies after admission.
 Chunk session checks have a separate concurrency limit of the same size. A full
 queue, exhausted session-check limit, or expired wait returns HTTP 503 with
 `Retry-After: 5`.
+
+The internal metrics listener reports `divine_upload_active`,
+`divine_upload_waiting`, and `divine_upload_capacity` from the admission
+semaphores. Scale on active and waiting requests to include storage I/O pressure.
+On SIGTERM or Ctrl-C the HTTP server stops accepting connections and allows
+existing requests up to 300 seconds to finish. Configure the pod termination
+grace period above that drain timeout.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 

@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tower = "0.5"
 hyper = { version = "1", features = ["http2", "server"] }
-hyper-util = { version = "0.1", features = ["server", "http2", "tokio", "service"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http2", "tokio", "service"] }
 
 # GCS - pinned to avoid edition2024 dependency issues
 google-cloud-storage = "=0.17.0"

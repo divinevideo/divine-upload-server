@@ -11,6 +11,7 @@ mod processing;
 mod request_log;
 mod resources;
 mod resumable;
+mod server;
 mod storage;
 mod thumbnail;
 
@@ -26,8 +27,6 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder;
 use k256::schnorr::{
     signature::hazmat::{PrehashSigner, PrehashVerifier},
     Signature, SigningKey, VerifyingKey,
@@ -40,7 +39,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::NamedTempFile;
-use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::Directive;
@@ -537,29 +535,24 @@ async fn main() -> Result<()> {
     info!("Starting HTTP/2 server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    // Use hyper's auto builder which supports both HTTP/1 and HTTP/2
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let app = app.clone();
-
+    if let Ok(metrics_port) = env::var("METRICS_PORT") {
+        let metrics_port: u16 = metrics_port.parse()?;
+        let metrics_listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, metrics_port)).await?;
         tokio::spawn(async move {
-            let builder = Builder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(e) = builder
-                .serve_connection(
-                    io,
-                    hyper::service::service_fn(move |req| {
-                        let mut app = app.clone();
-                        async move { app.call(req).await }
-                    }),
-                )
-                .await
-            {
-                error!("Connection error: {}", e);
+            if let Err(error) = axum::serve(metrics_listener, resources::metrics_router()).await {
+                error!("Metrics server failed: {}", error);
             }
         });
     }
+
+    server::serve(
+        listener,
+        app,
+        server::shutdown_signal(),
+        std::time::Duration::from_secs(300),
+    )
+    .await
 }
 
 async fn handle_landing() -> impl IntoResponse {
