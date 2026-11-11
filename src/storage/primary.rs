@@ -154,13 +154,7 @@ impl Admission {
                 .client
                 .upload_object(&request, payload.clone(), &upload)
                 .await;
-            let status = match &result {
-                Err(google_cloud_storage::http::Error::Response(response)) => Some(response.code),
-                Err(google_cloud_storage::http::Error::HttpClient(error)) => {
-                    error.status().map(|status| status.as_u16())
-                }
-                _ => None,
-            };
+            let status = result.as_ref().err().and_then(gcs_status);
             if let Ok(object) = result {
                 if object.generation > 0 {
                     break object.generation;
@@ -368,6 +362,17 @@ impl Admission {
 }
 fn is_gcs_missing(error: &google_cloud_storage::http::Error) -> bool {
     matches!(error,google_cloud_storage::http::Error::Response(response) if response.code==404)
+}
+/// HTTP status of a failed GCS call, including responses whose error body did not
+/// parse. Absence checks deliberately keep using parsed 404s only.
+fn gcs_status(error: &google_cloud_storage::http::Error) -> Option<u16> {
+    match error {
+        google_cloud_storage::http::Error::Response(response) => Some(response.code),
+        google_cloud_storage::http::Error::HttpClient(error) => {
+            error.status().map(|status| status.as_u16())
+        }
+        _ => None,
+    }
 }
 
 /// Every stored copy must carry the admitted size, content type and owner.
