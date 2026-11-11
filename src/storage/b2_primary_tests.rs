@@ -294,6 +294,14 @@ fn metadata(copy: &Copy) -> serde_json::Value {
         .unwrap_or(serde_json::json!({}));
     serde_json::json!({"name":"media","bucket":"fixture-gcs","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"fixture-gcs/media/1","size":copy.bytes.len().to_string(),"contentType":copy.mime,"metadata":owner})
 }
+fn admission_record(objects: &Objects) -> &(i64, Bytes) {
+    objects
+        .records
+        .iter()
+        .find(|(name, _)| name.starts_with("__resumable/b2-primary-writes/"))
+        .map(|(_, record)| record)
+        .unwrap()
+}
 fn find(bytes: &[u8], pattern: &[u8]) -> usize {
     bytes
         .windows(pattern.len())
@@ -1652,7 +1660,27 @@ async fn primary_control_recovery_preserves_a_competing_attempt_fence() {
         .put("media", Bytes::from_static(b"original"), "video/mp4", None)
         .await
         .is_err());
-    assert!(f.objects.lock().unwrap().writes.is_empty());
+    {
+        let objects = f.objects.lock().unwrap();
+        assert!(objects.writes.is_empty());
+        // The losing actor leaves the competitor's record exactly as it was.
+        let (generation, bytes) = admission_record(&objects);
+        assert_eq!(*generation, 2);
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(value["attempt"], "another-fixture-attempt");
+        assert_eq!(value["b2"]["state"], "not_issued");
+        assert_eq!(value["gcs"]["state"], "not_issued");
+    }
+    // A later retry takes a fresh fence over the unissued slots and finishes.
+    f.storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .unwrap();
+    let objects = f.objects.lock().unwrap();
+    assert_eq!(objects.writes, ["b2", "gcs"]);
+    let (_, bytes) = admission_record(&objects);
+    let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_ne!(value["attempt"], "another-fixture-attempt");
 }
 
 #[tokio::test]
@@ -1720,12 +1748,7 @@ async fn primary_acknowledged_backup_resume_fences_the_stale_attempt() {
         .await
         .unwrap();
     let objects = f.objects.lock().unwrap();
-    let (_, committed) = objects
-        .records
-        .iter()
-        .find(|(name, _)| name.starts_with("__resumable/b2-primary-writes/"))
-        .map(|(_, record)| record)
-        .unwrap();
+    let (_, committed) = admission_record(&objects);
     // A still-running original actor reads back the record after its own final
     // write fails its precondition. It must not find its exact proposal there.
     assert_ne!(committed, &stale_final);
