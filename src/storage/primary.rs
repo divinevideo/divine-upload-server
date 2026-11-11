@@ -358,22 +358,11 @@ impl Admission {
         };
         self.persist(&mut state, next).await
     }
-    async fn reference(&self, provider: StorageProvider) -> Option<ObjectRef> {
+    async fn slot(&self, provider: StorageProvider) -> Slot {
         let state = self.state.lock().await;
-        match match provider {
-            StorageProvider::B2 => &state.record.b2,
-            StorageProvider::Gcs => &state.record.gcs,
-        } {
-            Slot::Verified { object } => Some(object.clone()),
-            _ => None,
-        }
-    }
-
-    async fn acknowledged_backup(&self) -> Option<ObjectRef> {
-        let state = self.state.lock().await;
-        match &state.record.gcs {
-            Slot::Acknowledged { object } => Some(object.clone()),
-            _ => None,
+        match provider {
+            StorageProvider::B2 => state.record.b2.clone(),
+            StorageProvider::Gcs => state.record.gcs.clone(),
         }
     }
 }
@@ -447,16 +436,19 @@ pub(super) async fn put_file(
         )
     };
     let mut newly_stored = false;
-    let primary = if let Some(reference) = admission.reference(StorageProvider::B2).await {
-        verify_stream(storage.stream_ref(&reference).await?, path).await?;
-        reference
-    } else {
-        let (reference, new) = storage
-            .b2()?
-            .put_file_admitted(key, path, &mime, owner.as_deref(), &admission)
-            .await?;
-        newly_stored |= new;
-        reference
+    let primary = match admission.slot(StorageProvider::B2).await {
+        Slot::Verified { object: reference } => {
+            verify_stream(storage.stream_ref(&reference).await?, path).await?;
+            reference
+        }
+        _ => {
+            let (reference, new) = storage
+                .b2()?
+                .put_file_admitted(key, path, &mime, owner.as_deref(), &admission)
+                .await?;
+            newly_stored |= new;
+            reference
+        }
     };
     let winner = storage
         .b2()?
@@ -466,11 +458,12 @@ pub(super) async fn put_file(
     if winner.size != size || winner.content_type != mime || winner.owner != owner {
         bail!("B2 pinned canonical metadata does not match admitted provenance");
     }
-    let backup = if let Some(reference) = admission.reference(StorageProvider::Gcs).await {
+    let slot = admission.slot(StorageProvider::Gcs).await;
+    let backup = if let Slot::Verified { object: reference } = slot {
         verify_stream(storage.stream_ref(&reference).await?, path).await?;
         reference
     } else {
-        let reference = if let Some(reference) = admission.acknowledged_backup().await {
+        let reference = if let Slot::Acknowledged { object: reference } = slot {
             let existing = storage
                 .stat_ref(&reference)
                 .await?
