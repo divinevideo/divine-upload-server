@@ -675,26 +675,34 @@ where
                 "Upload session already finalized".to_string(),
             ));
         }
-        let outbox = self
-            .session_outbox(&session)
-            .await
-            .map_err(internal_error)?;
-        let committed = match outbox {
-            Some(outbox) => outbox
-                .has_session_receipt(
-                    &session.upload_id,
-                    &session.final_sha256,
-                    session.declared_size,
-                    &session.owner,
-                )
-                .await
-                .map_err(internal_error)?,
-            None => false,
-        };
-        if committed {
-            return Err(ResumableError::Conflict(
-                "Upload session already finalized".to_string(),
-            ));
+        // Only a fully uploaded session can hold a receipt. Resolve it like
+        // cleanup does, without a completion's admission checks.
+        if session.next_offset == session.declared_size {
+            let historical = match self.outbox {
+                Some(_) => None,
+                None => self
+                    .backend
+                    .historical_cleanup(&session)
+                    .await
+                    .map_err(internal_error)?,
+            };
+            let committed = match self.outbox.as_ref().or(historical.as_ref()) {
+                Some(outbox) => outbox
+                    .has_session_receipt(
+                        &session.upload_id,
+                        &session.final_sha256,
+                        session.declared_size,
+                        &session.owner,
+                    )
+                    .await
+                    .map_err(internal_error)?,
+                None => false,
+            };
+            if committed {
+                return Err(ResumableError::Conflict(
+                    "Upload session already finalized".to_string(),
+                ));
+            }
         }
 
         self.backend
@@ -1461,11 +1469,22 @@ mod tests {
         final_objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_final_object_lookup: bool,
         fail_cancel_session: bool,
+        fail_historical_lookup: bool,
         final_refs: Vec<crate::storage::ObjectRef>,
     }
 
     #[async_trait]
     impl ResumableBackend for FakeBackend {
+        async fn historical_processing(
+            &self,
+            _session: &UploadSession,
+        ) -> Result<Option<crate::outbox::ProcessingOutbox>> {
+            if self.fail_historical_lookup {
+                return Err(anyhow!("historical processing lookup failed"));
+            }
+            Ok(None)
+        }
+
         async fn final_objects(
             &self,
             _session: &UploadSession,
@@ -2364,6 +2383,47 @@ mod tests {
                 .unwrap(),
             "an expired session can never be replayed, so its receipt must go with it"
         );
+    }
+
+    #[tokio::test]
+    async fn aborting_a_partial_upload_needs_no_processing_lookup() {
+        // Only a fully uploaded session can hold a receipt, so discarding a
+        // partial one must not depend on historical processing resolving.
+        let backend = FakeBackend {
+            fail_historical_lookup: true,
+            ..Default::default()
+        };
+        let store = InMemoryStore::default();
+        let manager = ResumableManager::new(
+            backend,
+            store.clone(),
+            "https://upload.example",
+            "https://media.example",
+            DEFAULT_RESUMABLE_CHUNK_SIZE,
+            DEFAULT_RESUMABLE_SESSION_TTL_SECS,
+        );
+        let init = manager
+            .init_session(
+                &"b".repeat(64),
+                ResumableUploadInitRequest {
+                    sha256: hex::encode(Sha256::digest(b"hello")),
+                    size: 5,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .abort_session(
+                &init.upload_id,
+                init.required_headers
+                    .get("Authorization")
+                    .map(String::as_str),
+            )
+            .await
+            .unwrap();
+        assert!(store.load(&init.upload_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
