@@ -257,17 +257,18 @@ impl Admission {
                 let record = state.record.clone();
                 admission.persist(&mut state, record).await?;
             } else if matches!(state.record.b2, Slot::Verified { .. })
-                && matches!(
-                    state.record.gcs,
-                    Slot::Verified { .. } | Slot::Acknowledged { .. }
-                )
+                && matches!(state.record.gcs, Slot::Verified { .. })
             {
-                // Re-read both pinned copies before replay or final acknowledgement.
-            } else if matches!(state.record.b2, Slot::NotIssued | Slot::Verified { .. })
-                && matches!(state.record.gcs, Slot::NotIssued)
+                // Completed receipts are read-only replays, independently verified below.
+            } else if (matches!(state.record.b2, Slot::NotIssued | Slot::Verified { .. })
+                && matches!(state.record.gcs, Slot::NotIssued))
+                || (matches!(state.record.b2, Slot::Verified { .. })
+                    && matches!(state.record.gcs, Slot::Acknowledged { .. }))
             {
-                // Exactly one retry can acquire an unissued backup slot. An older
-                // actor's generation will fail before it can issue that effect.
+                // Exactly one retry can acquire an unissued backup slot or finish an
+                // acknowledged one. An older actor's generation fails before it can
+                // issue that effect, and its readback cannot match this attempt's
+                // final receipt.
                 let mut next = state.record.clone();
                 next.attempt = attempt;
                 admission.persist(&mut state, next).await?;

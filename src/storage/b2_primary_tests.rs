@@ -251,6 +251,7 @@ struct Objects {
     fail_final_admission_once: Option<u16>,
     lose_final_admission_ack_once: bool,
     throttle_final_admission: bool,
+    land_stale_final_before_fence: bool,
     final_admission_requests: Vec<(i64, Bytes)>,
     change_attempt_on_ack_loss: bool,
     hide_lost_admission_ack: bool,
@@ -447,6 +448,20 @@ async fn origin(
                     return error(503);
                 }
                 let current = f.records.get(&name).map(|r| r.0).unwrap_or(0);
+                if f.land_stale_final_before_fence
+                    && expected == current
+                    && value["b2"]["state"] == "verified"
+                    && value["gcs"]["state"] == "acknowledged"
+                {
+                    // An older actor's final receipt lands first, so this fence loses.
+                    f.land_stale_final_before_fence = false;
+                    let mut landed: serde_json::Value =
+                        serde_json::from_slice(&f.records[&name].1).unwrap();
+                    landed["gcs"]["state"] = "verified".into();
+                    let landed = Bytes::from(serde_json::to_vec(&landed).unwrap());
+                    f.records.insert(name.clone(), (current + 1, landed));
+                    return error(412);
+                }
                 if expected != current {
                     return error(412);
                 }
@@ -1644,6 +1659,68 @@ async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
         assert_eq!(resumed.is_ok(), !corrupt_backup);
         assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
     }
+}
+
+#[tokio::test]
+async fn primary_acknowledged_backup_resume_fences_the_stale_attempt() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().throttle_final_admission = true;
+    assert!(f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .is_err());
+    let stale_final = {
+        let mut objects = f.objects.lock().unwrap();
+        objects.throttle_final_admission = false;
+        objects.final_admission_requests[0].1.clone()
+    };
+    f.storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .unwrap();
+    let objects = f.objects.lock().unwrap();
+    let (_, committed) = objects
+        .records
+        .iter()
+        .find(|(name, _)| name.starts_with("__resumable/b2-primary-writes/"))
+        .map(|(_, record)| record)
+        .unwrap();
+    // A still-running original actor reads back the record after its own final
+    // write fails its precondition. It must not find its exact proposal there.
+    assert_ne!(committed, &stale_final);
+    assert_eq!(objects.writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn primary_acknowledged_backup_retry_yields_to_a_landed_original() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().throttle_final_admission = true;
+    assert!(f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .is_err());
+    {
+        let mut objects = f.objects.lock().unwrap();
+        objects.throttle_final_admission = false;
+        objects.land_stale_final_before_fence = true;
+    }
+    // The original's final receipt lands between the retry's read and its fence
+    // write, so the retry must stand down instead of completing a second time.
+    let error = f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("changed during update"));
+    let replay = f
+        .storage
+        .put("media", Bytes::from_static(b"original"), "video/mp4", None)
+        .await
+        .unwrap();
+    assert!(!replay.newly_stored);
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
 }
 #[tokio::test]
 async fn b2_primary_review_direct_none_outbox_preserves_existing_dual_intent_barrier() {
