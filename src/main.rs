@@ -708,14 +708,9 @@ async fn handle_upload(
 }
 
 fn upload_busy_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, "5")],
-        Json(ErrorResponse {
-            error: resources::ResourceError::Busy.to_string(),
-        }),
-    )
-        .into_response()
+    resumable_error_response(resumable::ResumableError::Unavailable(
+        resources::ResourceError::Busy.to_string(),
+    ))
 }
 
 fn resumable_manager(
