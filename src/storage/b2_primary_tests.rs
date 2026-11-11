@@ -1557,7 +1557,7 @@ async fn b2_primary_review_missing_b2_rollback_binding_never_downgrades_accepted
     assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
 }
 #[tokio::test]
-async fn b2_primary_review_lost_unissued_admission_ack_resumes_with_generation_fence() {
+async fn b2_primary_review_lost_initial_admission_ack_recovers_by_exact_readback() {
     let f = Fixture::new().await;
     f.objects.lock().unwrap().lose_admission_ack_once = true;
     f.storage
