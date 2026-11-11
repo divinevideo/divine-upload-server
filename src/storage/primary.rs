@@ -31,6 +31,10 @@ struct Record {
     b2: Slot,
     gcs: Slot,
 }
+/// Backoff base for control-record write retries; tests keep the schedule shape
+/// without spending wall-clock seconds.
+const CONTROL_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 1000 };
+const CONTROL_RETRY_JITTER_MS: u64 = if cfg!(test) { 2 } else { 250 };
 struct Versioned {
     generation: i64,
     record: Record,
@@ -185,7 +189,8 @@ impl Admission {
                 bail!("B2-primary admission update unresolved; retain pending state");
             }
             let delay = std::time::Duration::from_millis(
-                1000 * 2u64.pow(retries) + rand::random::<u64>() % 250,
+                CONTROL_RETRY_BASE_MS * 2u64.pow(retries)
+                    + rand::random::<u64>() % CONTROL_RETRY_JITTER_MS,
             );
             tokio::time::sleep(delay).await;
             retries += 1;
