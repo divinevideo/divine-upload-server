@@ -3,10 +3,13 @@ mod tests {
     #[test]
     fn maintenance_and_upload_admission_use_distinct_pools() {
         assert!(!std::sync::Arc::ptr_eq(
-            &super::SLOTS,
+            &super::UPLOAD_ADMISSION.active,
             &super::THUMBNAIL_SLOTS
         ));
-        assert!(!std::sync::Arc::ptr_eq(&super::SLOTS, &super::MIRROR_SLOTS));
+        assert!(!std::sync::Arc::ptr_eq(
+            &super::UPLOAD_ADMISSION.active,
+            &super::MIRROR_SLOTS
+        ));
         assert!(!std::sync::Arc::ptr_eq(
             &super::THUMBNAIL_SLOTS,
             &super::MIRROR_SLOTS
@@ -19,17 +22,51 @@ mod tests {
         assert!(super::check_size_with_limit(u64::MAX, 1024).is_err());
     }
     #[tokio::test]
-    async fn exhausted_capacity_is_retryable() {
-        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = super::acquire_from(slots.clone()).unwrap();
-        assert!(super::acquire_from(slots.clone()).is_err());
-        drop(permit);
-        assert!(super::acquire_from(slots).is_ok());
+    async fn short_burst_waits_for_capacity_and_excess_requests_shed() {
+        let admission = super::UploadAdmission::new(1, std::time::Duration::from_secs(5));
+        let active = admission.acquire().await.unwrap();
+        let mut queued = std::pin::pin!(admission.acquire());
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+
+        let mut excess = std::pin::pin!(admission.acquire());
+        assert!(matches!(
+            futures::poll!(excess.as_mut()),
+            std::task::Poll::Ready(Err(error)) if error.is::<super::ResourceError>()
+        ));
+
+        drop(active);
+        let _admitted = queued.await.unwrap();
+        assert_eq!(admission.waiting.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiter_releases_its_queue_slot() {
+        let admission = super::UploadAdmission::new(1, std::time::Duration::from_secs(5));
+        let _active = admission.acquire().await.unwrap();
+        {
+            let mut queued = std::pin::pin!(admission.acquire());
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+        }
+        assert_eq!(admission.waiting.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_waiters_release_their_queue_slots() {
+        let admission = super::UploadAdmission::new(1, std::time::Duration::ZERO);
+        let active = admission.acquire().await.unwrap();
+        assert!(admission.acquire().await.is_err());
+        assert_eq!(admission.waiting.available_permits(), 1);
+
+        drop(active);
+        assert!(admission.acquire().await.is_ok());
     }
 }
 
 use anyhow::{anyhow, Result};
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, thiserror::Error)]
@@ -78,12 +115,42 @@ fn check_size_with_limit(size: u64, limit: u64) -> Result<()> {
     }
     Ok(())
 }
-static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
+struct UploadAdmission {
+    active: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+    wait: Duration,
+}
+
+impl UploadAdmission {
+    fn new(concurrency: usize, wait: Duration) -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(concurrency)),
+            waiting: Arc::new(Semaphore::new(concurrency)),
+            wait,
+        }
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = self.active.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+
+        // Admit only a bounded number of waiters and never read their bodies here.
+        let _waiting = acquire_from(self.waiting.clone())?;
+        let permit = tokio::time::timeout(self.wait, self.active.clone().acquire_owned())
+            .await
+            .map_err(|_| ResourceError::Busy)?;
+        permit.map_err(|_| ResourceError::Busy.into())
+    }
+}
+
+static UPLOAD_ADMISSION: LazyLock<UploadAdmission> = LazyLock::new(|| {
+    UploadAdmission::new(
         positive_setting("MAX_CONCURRENT_UPLOADS", 4)
             .unwrap_or(4)
             .min(1024) as usize,
-    ))
+        Duration::from_secs(5),
+    )
 });
 // Public mirrors and thumbnail generation cannot starve each other or uploads.
 static THUMBNAIL_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
@@ -105,8 +172,8 @@ fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
         .try_acquire_owned()
         .map_err(|_| ResourceError::Busy.into())
 }
-pub fn acquire() -> Result<OwnedSemaphorePermit> {
-    acquire_from(SLOTS.clone())
+pub async fn acquire() -> Result<OwnedSemaphorePermit> {
+    UPLOAD_ADMISSION.acquire().await
 }
 pub fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
     acquire_from(THUMBNAIL_SLOTS.clone())

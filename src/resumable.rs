@@ -626,6 +626,7 @@ where
         crate::resources::check_size(session.declared_size)
             .map_err(|error| ResumableError::PayloadTooLarge(error.to_string()))?;
         let _resource_permit = crate::resources::acquire()
+            .await
             .map_err(|error| ResumableError::Unavailable(error.to_string()))?;
         let (computed_hash, computed_size) = self
             .hash_temp_object(&session.temp_object)

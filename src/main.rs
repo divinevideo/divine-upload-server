@@ -673,19 +673,15 @@ async fn handle_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    let _permit = match resources::acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-            )
-                .into_response()
-        }
-    };
     match process_upload(state, headers, body).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
+            if matches!(
+                e.downcast_ref::<resources::ResourceError>(),
+                Some(resources::ResourceError::Busy)
+            ) {
+                return upload_busy_response();
+            }
             if let Some(response) = original_write::error_response(&e) {
                 return response;
             }
@@ -716,6 +712,17 @@ async fn handle_upload(
             response
         }
     }
+}
+
+fn upload_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "5")],
+        Json(ErrorResponse {
+            error: resources::ResourceError::Busy.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn resumable_manager(
@@ -785,26 +792,16 @@ async fn handle_session_chunk(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    handle_session_chunk_admitted(state, upload_id, headers, body, resources::acquire()).await
+    handle_session_chunk_with_admission(state, upload_id, headers, body, resources::acquire()).await
 }
 
-async fn handle_session_chunk_admitted(
+async fn handle_session_chunk_with_admission(
     state: Arc<AppState>,
     upload_id: String,
     headers: axum::http::HeaderMap,
     body: Body,
-    admission: Result<tokio::sync::OwnedSemaphorePermit>,
+    admission: impl std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Response {
-    let _permit = match admission {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-            )
-                .into_response()
-        }
-    };
     let content_range = match headers
         .get(header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -831,6 +828,10 @@ async fn handle_session_chunk_admitted(
     {
         return resumable_error_response(error);
     }
+    let _permit = match admission.await {
+        Ok(permit) => permit,
+        Err(_) => return upload_busy_response(),
+    };
     let chunk = match collect_body_bytes(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -921,6 +922,7 @@ async fn process_upload(
 ) -> Result<UploadResponse> {
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
+    let _permit = resources::acquire().await?;
 
     // Get content type
     let content_type = headers
@@ -1876,16 +1878,9 @@ mod tests {
         drop(permits);
     }
 
-    #[tokio::test]
-    async fn chunk_admission_sheds_before_collecting_the_request_body() {
-        let response = super::handle_session_chunk_admitted(
-            test_state(None, 1),
-            "fixture-session".to_string(),
-            axum::http::HeaderMap::new(),
-            Body::empty(),
-            Err(crate::resources::ResourceError::Busy.into()),
-        )
-        .await;
+    #[test]
+    fn upload_admission_busy_response_is_retryable() {
+        let response = super::upload_busy_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
     }
@@ -1936,15 +1931,12 @@ mod tests {
             header::CONTENT_RANGE,
             HeaderValue::from_static("bytes 0-7/8"),
         );
-        let permit = Arc::new(tokio::sync::Semaphore::new(1))
-            .try_acquire_owned()
-            .unwrap();
-        let response = super::handle_session_chunk_admitted(
+        let response = super::handle_session_chunk_with_admission(
             state,
             "missing".into(),
             headers,
             body,
-            Ok(permit),
+            async { panic!("unverified session must not occupy upload admission") },
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
