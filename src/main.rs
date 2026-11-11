@@ -1883,6 +1883,35 @@ mod tests {
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
     }
 
+    /// Serves `storage` as the GCS endpoint behind the resumable session store.
+    async fn state_with_session_storage(
+        storage: Router,
+    ) -> (Arc<AppState>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, storage).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let media = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(gcs.clone()),
+            "fixture".into(),
+            None,
+        )
+        .unwrap();
+        let runtime = resumable::ResumableRuntime::new(media, Some(gcs), "fixture".into(), None)
+            .await
+            .unwrap();
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        (state, server)
+    }
+
     #[tokio::test]
     async fn unknown_chunk_session_is_rejected_before_reading_body() {
         use axum::{routing::any, Router};
@@ -1897,28 +1926,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let gcs = GcsClient::new(
-            ClientConfig {
-                storage_endpoint: endpoint,
-                ..Default::default()
-            }
-            .anonymous(),
-        );
-        let storage = storage::MediaStorage::new(
-            storage::WriteMode::Gcs,
-            Some(gcs.clone()),
-            "fixture".into(),
-            None,
-        )
-        .unwrap();
-        let runtime = resumable::ResumableRuntime::new(storage, Some(gcs), "fixture".into(), None)
-            .await
-            .unwrap();
-        let mut state = test_state(None, 1);
-        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        let (state, server) = state_with_session_storage(app).await;
         let body = Body::from_stream(futures::stream::poll_fn(
             |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
                 panic!("unverified session body must not be read")
@@ -1943,6 +1951,82 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn verified_chunk_sheds_on_exhausted_admission_before_reading_body() {
+        use axum::routing::any;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let expires_at_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let manifest = serde_json::to_vec(&resumable::UploadSession {
+            processing_outbox_required: None,
+            revision: 0,
+            chunk_size: 0,
+            upload_id: "fixture-session".into(),
+            owner: "fixture-owner".into(),
+            final_sha256: "0".repeat(64),
+            declared_size: 8,
+            content_type: "video/mp4".into(),
+            file_name: None,
+            expires_at_epoch_secs,
+            next_offset: 0,
+            session_url: "https://upload.divine.video/fixture-session".into(),
+            session_token: "fixture".into(),
+            temp_object: "__resumable/fixture-session".into(),
+            storage_complete: false,
+            finalized_object: None,
+        })
+        .unwrap();
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let manifest = manifest.clone();
+                async move { manifest }
+            }),
+        );
+        let (state, server) = state_with_session_storage(app).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("refused chunk body must not be read")
+            },
+        ));
+        let admission_requested = AtomicBool::new(false);
+        let response = super::handle_session_chunk_with_admission(
+            state,
+            "fixture-session".into(),
+            headers,
+            body,
+            || {
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .map_err(Into::into)
+            },
+            async {
+                admission_requested.store(true, Ordering::SeqCst);
+                Err(crate::resources::ResourceError::Busy.into())
+            },
+        )
+        .await;
+        assert!(
+            admission_requested.load(Ordering::SeqCst),
+            "a verified session must reach upload admission"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
         server.abort();
     }
 
