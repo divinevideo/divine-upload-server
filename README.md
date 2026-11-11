@@ -92,6 +92,8 @@ All configuration comes from environment variables. The table below lists the co
 | `CDN_BASE_URL` | `https://media.divine.video` | Base URL for returned blob and thumbnail URLs. |
 | `UPLOAD_BASE_URL` | `https://upload.divine.video` | Base URL used to build opaque session `uploadUrl`s. |
 | `PORT` | `8080` | Listen port. |
+| `METRICS_PORT` | — | Optional internal Prometheus listener. Exposes `/metrics` on a separate port. |
+| `MAX_CONCURRENT_UPLOADS` | `4` | Active upload requests per process. The same number can wait for a slot. |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
@@ -105,6 +107,20 @@ All configuration comes from environment variables. The table below lists the co
 `RESUMABLE_MAX_REQUEST_BODY_SIZE` is **not** an enforced request-body limit, despite the name — it is consumed only by that clamp. Inbound chunk size is bounded by the ingress: the `divine-upload-server` HTTPRoute attaches the `upload-body-size` SnippetsFilter (`client_max_body_size 16m`), a location-context directive that overrides the 100 MiB gateway-wide `ClientSettingsPolicy`.
 
 On the chunk `PUT` path the server independently caps the collected body at 16 MiB and shares the `MAX_CONCURRENT_UPLOADS` admission slots. A chunk must also satisfy that the `Content-Range` total equals the session's declared size, that the range lies inside that size, that the range start equals the session's next offset, that the range length matches the body length, and that a non-final chunk is a multiple of 256 KiB. Lowering the advertised chunk size does not reject larger aligned chunks within the 16 MiB body cap and the declared size.
+
+Authenticated direct uploads, session chunks, and resumable completions share a
+bounded admission queue. Requests can wait up to five seconds for an active
+slot. The server starts reading direct and chunk request bodies after admission.
+Chunk session checks have a separate concurrency limit of the same size. A full
+queue, exhausted session-check limit, or expired wait returns HTTP 503 with
+`Retry-After: 5`.
+
+The internal metrics listener reports `divine_upload_active`,
+`divine_upload_waiting`, and `divine_upload_capacity` from the admission
+semaphores. Scale on active and waiting requests to include storage I/O pressure.
+On SIGTERM or Ctrl-C the HTTP server stops accepting connections and allows
+existing requests up to 300 seconds to finish. Configure the pod termination
+grace period above that drain timeout.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 

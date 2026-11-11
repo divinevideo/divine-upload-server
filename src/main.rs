@@ -11,6 +11,7 @@ mod processing;
 mod request_log;
 mod resources;
 mod resumable;
+mod server;
 mod storage;
 mod thumbnail;
 
@@ -26,8 +27,6 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder;
 use k256::schnorr::{
     signature::hazmat::{PrehashSigner, PrehashVerifier},
     Signature, SigningKey, VerifyingKey,
@@ -40,7 +39,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::NamedTempFile;
-use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::Directive;
@@ -537,29 +535,24 @@ async fn main() -> Result<()> {
     info!("Starting HTTP/2 server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    // Use hyper's auto builder which supports both HTTP/1 and HTTP/2
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let app = app.clone();
-
+    if let Ok(metrics_port) = env::var("METRICS_PORT") {
+        let metrics_port: u16 = metrics_port.parse()?;
+        let metrics_listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, metrics_port)).await?;
         tokio::spawn(async move {
-            let builder = Builder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(e) = builder
-                .serve_connection(
-                    io,
-                    hyper::service::service_fn(move |req| {
-                        let mut app = app.clone();
-                        async move { app.call(req).await }
-                    }),
-                )
-                .await
-            {
-                error!("Connection error: {}", e);
+            if let Err(error) = axum::serve(metrics_listener, resources::metrics_router()).await {
+                error!("Metrics server failed: {}", error);
             }
         });
     }
+
+    server::serve(
+        listener,
+        app,
+        server::shutdown_signal(),
+        std::time::Duration::from_secs(300),
+    )
+    .await
 }
 
 async fn handle_landing() -> impl IntoResponse {
@@ -673,19 +666,15 @@ async fn handle_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    let _permit = match resources::acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-            )
-                .into_response()
-        }
-    };
     match process_upload(state, headers, body).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
+            if matches!(
+                e.downcast_ref::<resources::ResourceError>(),
+                Some(resources::ResourceError::Busy)
+            ) {
+                return upload_busy_response();
+            }
             if let Some(response) = original_write::error_response(&e) {
                 return response;
             }
@@ -716,6 +705,12 @@ async fn handle_upload(
             response
         }
     }
+}
+
+fn upload_busy_response() -> Response {
+    resumable_error_response(resumable::ResumableError::Unavailable(
+        resources::ResourceError::Busy.to_string(),
+    ))
 }
 
 fn resumable_manager(
@@ -785,26 +780,25 @@ async fn handle_session_chunk(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    handle_session_chunk_admitted(state, upload_id, headers, body, resources::acquire()).await
+    handle_session_chunk_with_admission(
+        state,
+        upload_id,
+        headers,
+        body,
+        resources::acquire_session_verification,
+        resources::acquire(),
+    )
+    .await
 }
 
-async fn handle_session_chunk_admitted(
+async fn handle_session_chunk_with_admission(
     state: Arc<AppState>,
     upload_id: String,
     headers: axum::http::HeaderMap,
     body: Body,
-    admission: Result<tokio::sync::OwnedSemaphorePermit>,
+    verify_session: impl FnOnce() -> Result<tokio::sync::OwnedSemaphorePermit>,
+    admission: impl std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Response {
-    let _permit = match admission {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-            )
-                .into_response()
-        }
-    };
     let content_range = match headers
         .get(header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -817,20 +811,32 @@ async fn handle_session_chunk_admitted(
         }
     };
 
-    let manager = resumable_manager(state.as_ref());
-    // Validate the session before a slow body can occupy authenticated admission.
-    // upload_chunk rechecks under its mutation lock after collection.
-    if let Err(error) = manager
-        .head_session(
-            &upload_id,
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-        )
-        .await
-    {
-        return resumable_error_response(error);
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if resumable::parse_bearer_token(authorization).is_none() {
+        return resumable_error_response(resumable::ResumableError::Unauthorized(
+            "Bearer upload token required".to_string(),
+        ));
     }
+
+    let manager = resumable_manager(state.as_ref());
+    {
+        // Bound provider lookups before token ownership is known. Release this
+        // permit before entering the authenticated upload queue.
+        let _verification = match verify_session() {
+            Ok(permit) => permit,
+            Err(_) => return upload_busy_response(),
+        };
+        if let Err(error) = manager.head_session(&upload_id, authorization).await {
+            return resumable_error_response(error);
+        }
+    }
+
+    let _permit = match admission.await {
+        Ok(permit) => permit,
+        Err(_) => return upload_busy_response(),
+    };
     let chunk = match collect_body_bytes(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -842,14 +848,7 @@ async fn handle_session_chunk_admitted(
     };
 
     match manager
-        .upload_chunk(
-            &upload_id,
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            &content_range,
-            chunk,
-        )
+        .upload_chunk(&upload_id, authorization, &content_range, chunk)
         .await
     {
         Ok(status) => build_session_status_response(status),
@@ -921,6 +920,7 @@ async fn process_upload(
 ) -> Result<UploadResponse> {
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
+    let _permit = resources::acquire().await?;
 
     // Get content type
     let content_type = headers
@@ -1876,18 +1876,40 @@ mod tests {
         drop(permits);
     }
 
-    #[tokio::test]
-    async fn chunk_admission_sheds_before_collecting_the_request_body() {
-        let response = super::handle_session_chunk_admitted(
-            test_state(None, 1),
-            "fixture-session".to_string(),
-            axum::http::HeaderMap::new(),
-            Body::empty(),
-            Err(crate::resources::ResourceError::Busy.into()),
-        )
-        .await;
+    #[test]
+    fn upload_admission_busy_response_is_retryable() {
+        let response = super::upload_busy_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    }
+
+    /// Serves `storage` as the GCS endpoint behind the resumable session store.
+    async fn state_with_session_storage(
+        storage: Router,
+    ) -> (Arc<AppState>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, storage).await.unwrap() });
+        let gcs = GcsClient::new(
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..Default::default()
+            }
+            .anonymous(),
+        );
+        let media = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(gcs.clone()),
+            "fixture".into(),
+            None,
+        )
+        .unwrap();
+        let runtime = resumable::ResumableRuntime::new(media, Some(gcs), "fixture".into(), None)
+            .await
+            .unwrap();
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        (state, server)
     }
 
     #[tokio::test]
@@ -1904,28 +1926,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let gcs = GcsClient::new(
-            ClientConfig {
-                storage_endpoint: endpoint,
-                ..Default::default()
-            }
-            .anonymous(),
-        );
-        let storage = storage::MediaStorage::new(
-            storage::WriteMode::Gcs,
-            Some(gcs.clone()),
-            "fixture".into(),
-            None,
-        )
-        .unwrap();
-        let runtime = resumable::ResumableRuntime::new(storage, Some(gcs), "fixture".into(), None)
-            .await
-            .unwrap();
-        let mut state = test_state(None, 1);
-        Arc::get_mut(&mut state).unwrap().resumable_runtime = runtime;
+        let (state, server) = state_with_session_storage(app).await;
         let body = Body::from_stream(futures::stream::poll_fn(
             |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
                 panic!("unverified session body must not be read")
@@ -1936,19 +1937,133 @@ mod tests {
             header::CONTENT_RANGE,
             HeaderValue::from_static("bytes 0-7/8"),
         );
-        let permit = Arc::new(tokio::sync::Semaphore::new(1))
-            .try_acquire_owned()
-            .unwrap();
-        let response = super::handle_session_chunk_admitted(
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
+        let response = super::handle_session_chunk_with_admission(
             state,
             "missing".into(),
             headers,
             body,
-            Ok(permit),
+            crate::resources::acquire_session_verification,
+            async { panic!("unverified session must not occupy upload admission") },
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn verified_chunk_sheds_on_exhausted_admission_before_reading_body() {
+        use axum::routing::any;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let expires_at_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let manifest = serde_json::to_vec(&resumable::UploadSession {
+            processing_outbox_required: None,
+            revision: 0,
+            chunk_size: 0,
+            upload_id: "fixture-session".into(),
+            owner: "fixture-owner".into(),
+            final_sha256: "0".repeat(64),
+            declared_size: 8,
+            content_type: "video/mp4".into(),
+            file_name: None,
+            expires_at_epoch_secs,
+            next_offset: 0,
+            session_url: "https://upload.divine.video/fixture-session".into(),
+            session_token: "fixture".into(),
+            temp_object: "__resumable/fixture-session".into(),
+            storage_complete: false,
+            finalized_object: None,
+        })
+        .unwrap();
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let manifest = manifest.clone();
+                async move { manifest }
+            }),
+        );
+        let (state, server) = state_with_session_storage(app).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("refused chunk body must not be read")
+            },
+        ));
+        let admission_requested = AtomicBool::new(false);
+        let session_checks = Arc::new(tokio::sync::Semaphore::new(1));
+        let response = super::handle_session_chunk_with_admission(
+            state,
+            "fixture-session".into(),
+            headers,
+            body,
+            || {
+                session_checks
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(Into::into)
+            },
+            async {
+                assert_eq!(
+                    session_checks.available_permits(),
+                    1,
+                    "a queued chunk must release its session-check slot"
+                );
+                admission_requested.store(true, Ordering::SeqCst);
+                Err(crate::resources::ResourceError::Busy.into())
+            },
+        )
+        .await;
+        assert!(
+            admission_requested.load(Ordering::SeqCst),
+            "a verified session must reach upload admission"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chunk_verification_sheds_before_provider_lookup_or_body() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("busy session body must not be read")
+            },
+        ));
+        let response = super::handle_session_chunk_with_admission(
+            test_state(None, 1),
+            "fixture-session".into(),
+            headers,
+            body,
+            || Err(crate::resources::ResourceError::Busy.into()),
+            async { panic!("busy session must not occupy upload admission") },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
     }
 
     #[tokio::test]
