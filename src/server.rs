@@ -186,10 +186,12 @@ mod tests {
             async { shutdown_requested.await.map_err(Into::into) },
             Duration::from_secs(5),
         ));
-        let response = reqwest::Client::new()
+        let request = reqwest::Client::new()
             .put(format!("http://{address}/upload"))
-            .send()
+            .send();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
             .await
+            .expect("an accept error must not stall the accept loop")
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "stored");
