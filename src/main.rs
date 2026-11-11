@@ -792,7 +792,15 @@ async fn handle_session_chunk(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    handle_session_chunk_with_admission(state, upload_id, headers, body, resources::acquire()).await
+    handle_session_chunk_with_admission(
+        state,
+        upload_id,
+        headers,
+        body,
+        resources::acquire_session_verification,
+        resources::acquire(),
+    )
+    .await
 }
 
 async fn handle_session_chunk_with_admission(
@@ -800,6 +808,7 @@ async fn handle_session_chunk_with_admission(
     upload_id: String,
     headers: axum::http::HeaderMap,
     body: Body,
+    verify_session: impl FnOnce() -> Result<tokio::sync::OwnedSemaphorePermit>,
     admission: impl std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Response {
     let content_range = match headers
@@ -814,20 +823,28 @@ async fn handle_session_chunk_with_admission(
         }
     };
 
-    let manager = resumable_manager(state.as_ref());
-    // Validate the session before a slow body can occupy authenticated admission.
-    // upload_chunk rechecks under its mutation lock after collection.
-    if let Err(error) = manager
-        .head_session(
-            &upload_id,
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-        )
-        .await
-    {
-        return resumable_error_response(error);
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if resumable::parse_bearer_token(authorization).is_none() {
+        return resumable_error_response(resumable::ResumableError::Unauthorized(
+            "Bearer upload token required".to_string(),
+        ));
     }
+
+    let manager = resumable_manager(state.as_ref());
+    {
+        // Bound provider lookups before token ownership is known. Release this
+        // permit before entering the authenticated upload queue.
+        let _verification = match verify_session() {
+            Ok(permit) => permit,
+            Err(_) => return upload_busy_response(),
+        };
+        if let Err(error) = manager.head_session(&upload_id, authorization).await {
+            return resumable_error_response(error);
+        }
+    }
+
     let _permit = match admission.await {
         Ok(permit) => permit,
         Err(_) => return upload_busy_response(),
@@ -843,14 +860,7 @@ async fn handle_session_chunk_with_admission(
     };
 
     match manager
-        .upload_chunk(
-            &upload_id,
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            &content_range,
-            chunk,
-        )
+        .upload_chunk(&upload_id, authorization, &content_range, chunk)
         .await
     {
         Ok(status) => build_session_status_response(status),
@@ -1931,16 +1941,50 @@ mod tests {
             header::CONTENT_RANGE,
             HeaderValue::from_static("bytes 0-7/8"),
         );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
         let response = super::handle_session_chunk_with_admission(
             state,
             "missing".into(),
             headers,
             body,
+            crate::resources::acquire_session_verification,
             async { panic!("unverified session must not occupy upload admission") },
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn chunk_verification_sheds_before_provider_lookup_or_body() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-7/8"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture"),
+        );
+        let body = Body::from_stream(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::convert::Infallible>>> {
+                panic!("busy session body must not be read")
+            },
+        ));
+        let response = super::handle_session_chunk_with_admission(
+            test_state(None, 1),
+            "fixture-session".into(),
+            headers,
+            body,
+            || Err(crate::resources::ResourceError::Busy.into()),
+            async { panic!("busy session must not occupy upload admission") },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
     }
 
     #[tokio::test]

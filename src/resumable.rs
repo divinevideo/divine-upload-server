@@ -1282,7 +1282,7 @@ fn format_epoch_secs_as_rfc3339(epoch_secs: u64) -> String {
         .expect("rfc3339 timestamp formatting should succeed")
 }
 
-fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
+pub(crate) fn parse_bearer_token(authorization: Option<&str>) -> Option<&str> {
     authorization.and_then(|value| value.strip_prefix("Bearer "))
 }
 

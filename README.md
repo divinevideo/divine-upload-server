@@ -110,7 +110,9 @@ On the chunk `PUT` path the server independently caps the collected body at 16 M
 Authenticated direct uploads, session chunks, and resumable completions share a
 bounded admission queue. Requests can wait up to five seconds for an active
 slot. The server starts reading direct and chunk request bodies after admission.
-A full queue or expired wait returns HTTP 503 with `Retry-After: 5`.
+Chunk session checks have a separate concurrency limit of the same size. A full
+queue, exhausted session-check limit, or expired wait returns HTTP 503 with
+`Retry-After: 5`.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 

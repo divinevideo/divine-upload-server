@@ -60,6 +60,17 @@ mod tests {
         drop(active);
         assert!(admission.acquire().await.is_ok());
     }
+
+    #[tokio::test]
+    async fn pending_session_verification_is_bounded_independently() {
+        let admission = super::UploadAdmission::new(1, std::time::Duration::from_secs(5));
+        let verification = admission.verify_session().unwrap();
+        assert!(admission.verify_session().is_err());
+        let _active = admission.acquire().await.unwrap();
+
+        drop(verification);
+        assert!(admission.verify_session().is_ok());
+    }
 }
 
 use anyhow::{anyhow, Result};
@@ -118,6 +129,7 @@ fn check_size_with_limit(size: u64, limit: u64) -> Result<()> {
 struct UploadAdmission {
     active: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
+    session_checks: Arc<Semaphore>,
     wait: Duration,
 }
 
@@ -126,8 +138,13 @@ impl UploadAdmission {
         Self {
             active: Arc::new(Semaphore::new(concurrency)),
             waiting: Arc::new(Semaphore::new(concurrency)),
+            session_checks: Arc::new(Semaphore::new(concurrency)),
             wait,
         }
+    }
+
+    fn verify_session(&self) -> Result<OwnedSemaphorePermit> {
+        acquire_from(self.session_checks.clone())
     }
 
     async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
@@ -174,6 +191,9 @@ fn acquire_from(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
 }
 pub async fn acquire() -> Result<OwnedSemaphorePermit> {
     UPLOAD_ADMISSION.acquire().await
+}
+pub fn acquire_session_verification() -> Result<OwnedSemaphorePermit> {
+    UPLOAD_ADMISSION.verify_session()
 }
 pub fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
     acquire_from(THUMBNAIL_SLOTS.clone())
