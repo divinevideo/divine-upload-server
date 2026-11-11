@@ -179,7 +179,13 @@ An unreceipted completion must match the current intent's destination policy; an
 identical event from a different session does not establish completion. A session
 saved by an older binary between storage finalization and receipt commit returns
 409 if the policy has since changed. Reconcile that upload through its recorded
-policy; do not delete or retarget the newer intent. Startup adds the
+policy; do not delete or retarget the newer intent. A session completed through
+the outbox before the receipts schema existed has no receipt either: it returns
+the same 409 after a policy change, and with a matching policy its replay counts
+as a new completion that makes its event the newest for those bytes again. Where
+the outbox ran before that schema, wait one `RESUMABLE_SESSION_TTL_SECS` (24 hours
+by default) after the schema went live before upgrading to this behavior or
+enabling dual admission. Startup adds the
 `upload_processing_session_receipts` table under the existing schema lock. Its
 receipt/event/intent transaction distinguishes a new session reusing an event
 identity from replay of a previously completed session. Expired-session cleanup,
