@@ -259,19 +259,18 @@ impl Admission {
             }),
         };
         {
+            let backup_required = storage.requires_gcs_backup();
             let mut state = admission.state.lock().await;
+            let gcs_settled = matches!(state.record.gcs, Slot::Verified { .. })
+                || (!backup_required && matches!(state.record.gcs, Slot::NotIssued));
             if completed_only {
-                if !matches!(state.record.b2, Slot::Verified { .. })
-                    || !matches!(state.record.gcs, Slot::Verified { .. })
-                {
+                if !matches!(state.record.b2, Slot::Verified { .. }) || !gcs_settled {
                     bail!("Primary session receipts are not complete");
                 }
             } else if state.generation == 0 {
                 let record = state.record.clone();
                 admission.persist(&mut state, record).await?;
-            } else if matches!(state.record.b2, Slot::Verified { .. })
-                && matches!(state.record.gcs, Slot::Verified { .. })
-            {
+            } else if matches!(state.record.b2, Slot::Verified { .. }) && gcs_settled {
                 // Completed receipts are read-only replays, independently verified below.
             } else if (matches!(state.record.b2, Slot::NotIssued | Slot::Verified { .. })
                 && matches!(state.record.gcs, Slot::NotIssued))
@@ -414,6 +413,9 @@ pub(super) async fn receipts(
         (Slot::Verified { object: primary }, Slot::Verified { object: backup }) => {
             Ok(vec![primary.clone(), backup.clone()])
         }
+        (Slot::Verified { object: primary }, Slot::NotIssued) if !storage.requires_gcs_backup() => {
+            Ok(vec![primary.clone()])
+        }
         _ => bail!("Primary session receipts are not complete"),
     }
 }
@@ -483,6 +485,16 @@ pub(super) async fn put_file(
         bail!("B2 pinned canonical metadata does not match admitted provenance");
     }
     let slot = admission.slot(StorageProvider::Gcs).await;
+    if !storage.requires_gcs_backup() && matches!(slot, Slot::NotIssued | Slot::Verified { .. }) {
+        let mut objects = vec![primary];
+        if let Slot::Verified { object: backup } = slot {
+            objects.push(backup);
+        }
+        return Ok(WriteResult {
+            objects,
+            newly_stored,
+        });
+    }
     let backup = if let Slot::Verified { object: reference } = slot {
         verify_stream(storage.stream_ref(&reference).await?, path).await?;
         reference

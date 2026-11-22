@@ -155,6 +155,25 @@ Required configuration is the existing GCS bucket/credentials and
 GCS compatibility must remain enabled. `MEDIA_ORIGINAL_WRITE_ENABLED` remains off;
 its preparation-only API is not used as an upload prerequisite.
 
+### Disabling GCS media backups in `b2_primary` mode
+
+Set `MEDIA_GCS_BACKUP_ENABLED=false` alongside `MEDIA_WRITE_PROVIDER=b2_primary`
+to store new canonical originals and thumbnails only in B2 without uploading or
+verifying GCS media backups. Omission or `true` retains verified GCS backups;
+any other value fails startup. The switch has no effect in `gcs`, `dual`, or
+plain `b2` mode.
+
+Disabling backups eliminates GCS backup uploads, GCS backup readback
+verifications, and the GCS backup admission state transitions, while keeping
+full pinned B2 version and byte verification. Existing GCS objects are not
+deleted or modified, and an earlier admission whose GCS backup slot was already
+left in an uncertain `issued` state still fails closed for explicit
+reconciliation. GCS remains required in `b2_primary` mode for small private
+admission records and resumable staging until a coordination database is
+provisioned for plain `b2` mode. Re-enabling `MEDIA_GCS_BACKUP_ENABLED=true`
+causes subsequent retries for B2-only keys to write and verify their missing
+GCS backups without rewriting B2.
+
 New resumable sessions stage bytes in GCS under
 `__resumable/b2_primary/<hex GCS bucket>/<hex B2 bucket>/<upload_id>/blob`.
 Completion checks the declared digest and promotes through the pinned B2-first

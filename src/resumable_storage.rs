@@ -411,10 +411,16 @@ impl ResumableBackend for MediaResumableBackend {
                     crate::storage::StorageProvider::Gcs,
                     crate::storage::StorageProvider::B2,
                 ],
-                WriteMode::B2Primary => vec![
-                    crate::storage::StorageProvider::B2,
-                    crate::storage::StorageProvider::Gcs,
-                ],
+                WriteMode::B2Primary => {
+                    if primary.requires_gcs_backup() {
+                        vec![
+                            crate::storage::StorageProvider::B2,
+                            crate::storage::StorageProvider::Gcs,
+                        ]
+                    } else {
+                        vec![crate::storage::StorageProvider::B2]
+                    }
+                }
             };
             return providers
                 .into_iter()

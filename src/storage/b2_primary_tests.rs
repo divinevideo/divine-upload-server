@@ -3698,3 +3698,167 @@ async fn b2_primary_complete_handler_keeps_legacy_scan_across_outbox_rollback() 
     assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
     detector_task.abort();
 }
+
+#[tokio::test]
+async fn b2_primary_without_gcs_backups_writes_and_reads_b2_only() {
+    let f = Fixture::new().await;
+    let storage = f.storage.clone().with_gcs_backup_enabled(false);
+    let key = hex::encode(Sha256::digest(b"original"));
+    let owner = "a".repeat(64);
+
+    let first = storage
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+    assert!(first.newly_stored);
+    assert_eq!(first.objects.len(), 1);
+    assert_eq!(first.objects[0].provider, StorageProvider::B2);
+    {
+        let objects = f.objects.lock().unwrap();
+        assert_eq!(objects.writes, ["b2"]);
+        assert!(objects.b2.is_some());
+        assert!(objects.gcs.is_none());
+    }
+
+    // Verified cache reads succeed with only the B2 copy present.
+    assert_eq!(
+        storage.read_verified(&key).await.unwrap(),
+        Bytes::from_static(b"original")
+    );
+
+    // Replay is read-only and does not rewrite B2 or create a GCS backup.
+    let replay = storage
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+    assert!(!replay.newly_stored);
+    assert_eq!(replay.objects, first.objects);
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
+
+    // Re-enabling backups later repairs the missing GCS copy without rewriting B2.
+    let reenabled = f.storage.clone().with_gcs_backup_enabled(true);
+    let repaired = reenabled
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+    assert!(repaired.newly_stored);
+    assert_eq!(repaired.objects.len(), 2);
+    assert_eq!(repaired.objects[0].provider, StorageProvider::B2);
+    assert_eq!(repaired.objects[1].provider, StorageProvider::Gcs);
+    assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+}
+
+#[tokio::test]
+async fn b2_primary_without_gcs_backups_still_blocks_uncertain_gcs_write() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().lose_gcs_put_ack = true;
+    let key = hex::encode(Sha256::digest(b"original"));
+    let owner = "a".repeat(64);
+
+    assert!(f
+        .storage
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .is_err());
+
+    // Turning backups off must not clear an uncertain earlier GCS write.
+    let no_backup = f.storage.clone().with_gcs_backup_enabled(false);
+    let err = no_backup
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("explicit reconciliation required"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn b2_primary_resumable_without_gcs_backups_finalizes_to_b2_only() {
+    use crate::resumable::{
+        ResumableBackend, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
+        SessionStore,
+    };
+    let f = Fixture::new().await;
+    let storage = f.storage.clone().with_gcs_backup_enabled(false);
+    let runtime = ResumableRuntime::new(
+        storage.clone(),
+        storage.gcs.clone(),
+        "fixture-gcs".into(),
+        None,
+    )
+    .await
+    .unwrap();
+    let manager = ResumableManager::new(
+        runtime.backend.clone(),
+        runtime.store.clone(),
+        "https://upload.invalid",
+        "https://media.invalid",
+        256 * 1024,
+        300,
+    );
+    let owner = "b".repeat(64);
+    let body = Bytes::from_static(b"resumable-b2-only");
+    let hash = hex::encode(Sha256::digest(&body));
+    let init = manager
+        .init_session(
+            &owner,
+            ResumableUploadInitRequest {
+                sha256: hash.clone(),
+                size: body.len() as u64,
+                content_type: "video/mp4".into(),
+                file_name: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .upload_chunk(
+            &init.upload_id,
+            Some(&init.required_headers["Authorization"]),
+            &format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+    let completed = manager
+        .complete_session(&init.upload_id, &owner)
+        .await
+        .unwrap();
+    assert_eq!(completed.sha256, hash);
+    {
+        let objects = f.objects.lock().unwrap();
+        assert_eq!(objects.writes, ["b2"]);
+        assert!(objects.b2.is_some());
+        assert!(objects.gcs.is_none());
+    }
+    let session = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
+    let refs = runtime.backend.final_objects(&session).await.unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].provider, StorageProvider::B2);
+}
