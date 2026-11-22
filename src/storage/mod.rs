@@ -119,8 +119,7 @@ impl MediaStorage {
         }
     }
     pub(crate) fn requires_both(&self) -> bool {
-        self.mode == WriteMode::Dual
-            || (self.mode == WriteMode::B2Primary && self.gcs_backup_enabled)
+        self.requires_gcs_backup()
     }
     pub async fn initialize_coordination(&self, database_url: Option<&str>) -> Result<()> {
         if let Some(b2) = &self.b2 {

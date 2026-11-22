@@ -148,14 +148,15 @@ fn gcs_compatibility(mode: storage::WriteMode, value: Option<&str>) -> Result<bo
 }
 
 fn gcs_backup_enabled(mode: storage::WriteMode, value: Option<&str>) -> Result<bool> {
+    let enabled = match value {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(_) => return Err(anyhow!("MEDIA_GCS_BACKUP_ENABLED must be true or false")),
+    };
     if mode != storage::WriteMode::B2Primary {
         return Ok(true);
     }
-    match value {
-        None | Some("true") => Ok(true),
-        Some("false") => Ok(false),
-        Some(_) => Err(anyhow!("MEDIA_GCS_BACKUP_ENABLED must be true or false")),
-    }
+    Ok(enabled)
 }
 
 // App state shared across handlers
@@ -2254,8 +2255,11 @@ mod tests {
         assert!(!super::gcs_backup_enabled(WriteMode::B2Primary, Some("false")).unwrap());
         assert!(super::gcs_backup_enabled(WriteMode::B2Primary, Some("invalid")).is_err());
         assert!(super::gcs_backup_enabled(WriteMode::Gcs, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::Gcs, Some("invalid")).is_err());
         assert!(super::gcs_backup_enabled(WriteMode::Dual, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::Dual, Some("invalid")).is_err());
         assert!(super::gcs_backup_enabled(WriteMode::B2, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::B2, Some("invalid")).is_err());
     }
 
     pub(crate) fn test_state(

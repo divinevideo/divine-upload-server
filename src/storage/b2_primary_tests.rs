@@ -3761,6 +3761,25 @@ async fn b2_primary_without_gcs_backups_writes_and_reads_b2_only() {
     assert_eq!(repaired.objects[0].provider, StorageProvider::B2);
     assert_eq!(repaired.objects[1].provider, StorageProvider::Gcs);
     assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
+
+    // Disabling backups again on a previously dual-verified key returns only the
+    // verified B2 receipt without reading GCS media bytes.
+    f.objects.lock().unwrap().gcs = None;
+    let replay_no_backup = storage
+        .put(
+            &key,
+            Bytes::from_static(b"original"),
+            "video/mp4",
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+    assert!(!replay_no_backup.newly_stored);
+    assert_eq!(replay_no_backup.objects, first.objects);
+    assert_eq!(
+        storage.primary_receipts(&key, 8).await.unwrap(),
+        first.objects
+    );
 }
 
 #[tokio::test]

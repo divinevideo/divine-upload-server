@@ -410,11 +410,13 @@ pub(super) async fn receipts(
     .await?;
     let state = admission.state.lock().await;
     match (&state.record.b2, &state.record.gcs) {
+        (Slot::Verified { object: primary }, Slot::NotIssued | Slot::Verified { .. })
+            if !storage.requires_gcs_backup() =>
+        {
+            Ok(vec![primary.clone()])
+        }
         (Slot::Verified { object: primary }, Slot::Verified { object: backup }) => {
             Ok(vec![primary.clone(), backup.clone()])
-        }
-        (Slot::Verified { object: primary }, Slot::NotIssued) if !storage.requires_gcs_backup() => {
-            Ok(vec![primary.clone()])
         }
         _ => bail!("Primary session receipts are not complete"),
     }
@@ -486,12 +488,8 @@ pub(super) async fn put_file(
     }
     let slot = admission.slot(StorageProvider::Gcs).await;
     if !storage.requires_gcs_backup() && matches!(slot, Slot::NotIssued | Slot::Verified { .. }) {
-        let mut objects = vec![primary];
-        if let Slot::Verified { object: backup } = slot {
-            objects.push(backup);
-        }
         return Ok(WriteResult {
-            objects,
+            objects: vec![primary],
             newly_stored,
         });
     }
