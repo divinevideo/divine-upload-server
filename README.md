@@ -50,6 +50,32 @@ The service runs a single axum router over HTTP/1 and HTTP/2. Endpoints that mut
 
 The client then `PUT`s chunks to `/sessions/:upload_id` with a `Content-Range` header. Chunks must arrive in order at the expected offset and — except for the final chunk — be a multiple of 256 KiB. `HEAD /sessions/:upload_id` returns the next offset so an interrupted transfer can resume. `POST /upload/:upload_id/complete` requires the whole declared size to be committed, re-hashes the stored bytes, rejects a mismatch, and copies the temporary object to the canonical `<sha256>` blob (skipping the copy if that blob already exists) before deleting the temp object. `DELETE /upload/:upload_id` aborts and cleans up.
 
+### Restricting eager video processing
+
+Send exactly one `X-Divine-Video-Processing: copy-only` header on direct
+`PUT /upload` (or `PUT /`) to store the original without submitting eager HLS
+work. This also applies to duplicate uploads of already stored bytes, preventing
+an eager dispatch before the control plane commits its copy-only policy. The
+header only reduces work; it neither grants encoding permission nor persists or
+replaces authoritative media policy. Subsequent on-demand delivery must resolve
+that policy through the control plane.
+
+For resumable uploads, send the header on `POST /upload/:upload_id/complete`.
+Completion preserves its existing on-demand HLS behavior. `POST /upload/init`
+rejects the header with HTTP 400 because sessions do not persist this directive.
+Unrecognized, empty, combined, or repeated values return HTTP 400. Original
+storage, thumbnails, probing, transcription, and moderation retain their
+existing behavior; this is not a switch disabling all media processing.
+
+Copy-only requests are supported only without a configured processing outbox,
+retained coordination database, or original-write journal runtime. In these
+unsupported durable modes, direct uploads and completion return HTTP 400 before
+body consumption, admission, storage writes, or session changes. Existing durable
+contracts cannot carry this restriction, and historical intents could otherwise
+submit processing before the control plane records it. Ordinary requests and
+mirror processing retain their existing contracts. No outbox or journal schema
+is changed by this header.
+
 ### Storage
 
 GCS is the default backend (bucket default `divine-blossom-media`); B2 and dual-write modes use the same public object keys:
