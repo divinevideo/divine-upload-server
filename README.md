@@ -121,12 +121,22 @@ All configuration comes from environment variables. The table below lists the co
 | `METRICS_PORT` | — | Optional internal Prometheus listener. Exposes `/metrics` on a separate port. |
 | `MAX_CONCURRENT_UPLOADS` | `4` | Active upload requests per process. The same number can wait for a slot. |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
-| `TRANSCODER_URL` | — | Transcoder endpoint for HLS generation; unset disables transcoding. |
+| `TRANSCODER_URL` | — | Legacy direct HLS admission when `TRANSCODE_ADMISSION_SECRET` is unset. Also the default transcription origin. |
+| `TRANSCODE_ADMISSION_SECRET` | — | Dedicated credential that opts direct HLS into the Hetzner worker's authenticated queue endpoint. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
 | `AI_DETECTOR_BASE_URL` | — | Self-hosted detector base URL. Newly stored videos request the `nsfw` signal asynchronously; unset disables the hook. |
 | `RESUMABLE_SESSION_TTL_SECS` | `86400` | Resumable session lifetime (24h). |
 | `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE`. |
 | `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Upper bound on the *advertised* chunk size (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
+
+Before setting `TRANSCODE_ADMISSION_SECRET`, verify the worker accepts authenticated
+requests at `https://transcoder-worker.divine.video/transcode/queue` and the
+synthetic job reaches playback. Keep the current `TRANSCODER_URL` or explicitly
+configure `TRANSCRIBER_URL` to preserve transcription. To roll back HLS admission,
+remove the secret binding, redeploy, and verify Cloud Run accepts new HLS jobs
+before closing the Hetzner endpoint. This setting only affects the direct
+upload dispatch path. Copy-only suppression and configured outbox routes retain
+their existing behavior.
 
 `RESUMABLE_CHUNK_SIZE` is capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE` before it is advertised in `/upload/init`.
 
