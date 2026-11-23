@@ -657,7 +657,14 @@ async fn original_write_records_each_mode_without_outbox_dispatch_or_provider_io
             .await
             .unwrap();
         let count:i64=one.database.lock().await.query_one("SELECT count(*) FROM upload_write_operations WHERE attempt_id=$1 AND state='prepared'",&[&result.attempt_id]).await.unwrap().get(0);
-        assert_eq!(count, if mode.requires_both() { 4 } else { 2 });
+        assert_eq!(
+            count,
+            if mode.recorded_requires_two_copies() {
+                4
+            } else {
+                2
+            }
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }

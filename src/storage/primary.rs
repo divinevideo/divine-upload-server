@@ -31,6 +31,23 @@ struct Record {
     b2: Slot,
     gcs: Slot,
 }
+// Keep the v1 JSON shape readable by old strict Record/Slot deserializers.
+// `attempt` remains an opaque fence token with 128 bits of fresh nonce entropy.
+// Only this exact grammar records a verified B2-only completion; old hex tokens
+// and malformed markers conservatively remain incomplete.
+const B2_ONLY_COMPLETE: &str = "b2-only-complete-v1:";
+impl Record {
+    fn b2_only_completed(&self) -> bool {
+        self.attempt
+            .strip_prefix(B2_ONLY_COMPLETE)
+            .is_some_and(|nonce| {
+                nonce.len() == 32
+                    && nonce
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }
+}
 /// Backoff base for control-record write retries; tests keep the schedule shape
 /// without spending wall-clock seconds.
 const CONTROL_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 1000 };
@@ -69,6 +86,9 @@ async fn read_record(storage: &MediaStorage, key: &str) -> Result<Option<Version
         || Some(old.b2_bucket.as_str()) != storage.b2_bucket()
     {
         bail!("B2-primary admission identity or provider mapping changed");
+    }
+    if old.b2_only_completed() && !matches!(old.b2, Slot::Verified { .. }) {
+        bail!("Completed B2-only admission has no verified primary");
     }
     for (provider, slot, bucket) in [
         (StorageProvider::B2, &old.b2, &old.b2_bucket),
@@ -259,10 +279,12 @@ impl Admission {
             }),
         };
         {
-            let backup_required = storage.requires_gcs_backup();
+            let backup_required = storage.requires_second_copy();
             let mut state = admission.state.lock().await;
             let gcs_settled = matches!(state.record.gcs, Slot::Verified { .. })
-                || (!backup_required && matches!(state.record.gcs, Slot::NotIssued));
+                || (!backup_required
+                    && matches!(state.record.gcs, Slot::NotIssued)
+                    && state.record.b2_only_completed());
             if completed_only {
                 if !matches!(state.record.b2, Slot::Verified { .. }) || !gcs_settled {
                     bail!("Primary session receipts are not complete");
@@ -282,13 +304,32 @@ impl Admission {
                 // issue that effect, and its readback cannot match this attempt's
                 // final receipt.
                 let mut next = state.record.clone();
-                next.attempt = attempt;
+                next.attempt = if next.b2_only_completed() {
+                    format!("{B2_ONLY_COMPLETE}{attempt}")
+                } else {
+                    attempt
+                };
                 admission.persist(&mut state, next).await?;
             } else {
                 bail!("B2-primary write outcome pending; explicit reconciliation required");
             }
         }
         Ok(admission)
+    }
+    async fn complete_b2_only(&self) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        if state.record.b2_only_completed() {
+            return Ok(false);
+        }
+        if !matches!(state.record.b2, Slot::Verified { .. })
+            || !matches!(state.record.gcs, Slot::NotIssued)
+        {
+            bail!("B2-only completion requires verified primary and unissued backup");
+        }
+        let mut next = state.record.clone();
+        next.attempt = format!("{B2_ONLY_COMPLETE}{}", next.attempt);
+        self.persist(&mut state, next).await?;
+        Ok(true)
     }
     pub(super) async fn issued(&self, provider: StorageProvider) -> Result<()> {
         let mut state = self.state.lock().await;
@@ -411,7 +452,7 @@ pub(super) async fn receipts(
     let state = admission.state.lock().await;
     match (&state.record.b2, &state.record.gcs) {
         (Slot::Verified { object: primary }, Slot::NotIssued | Slot::Verified { .. })
-            if !storage.requires_gcs_backup() =>
+            if !storage.requires_second_copy() =>
         {
             Ok(vec![primary.clone()])
         }
@@ -420,6 +461,43 @@ pub(super) async fn receipts(
         }
         _ => bail!("Primary session receipts are not complete"),
     }
+}
+
+/// A historically completed B2-only cache entry remains usable after backup
+/// re-enablement. This does not relax explicit session/outbox copy obligations.
+/// Derivative keys are not content hashes, so verify against the recorded digest.
+pub(super) async fn read_completed_b2_only(
+    storage: &MediaStorage,
+    key: &str,
+) -> Result<Option<Bytes>> {
+    let Some(state) = read_record(storage, key).await? else {
+        return Ok(None);
+    };
+    if !state.record.b2_only_completed() || !matches!(state.record.gcs, Slot::NotIssued) {
+        return Ok(None);
+    }
+    let Slot::Verified { object } = &state.record.b2 else {
+        bail!("Completed B2-only cache has no verified primary");
+    };
+    let stored = storage
+        .stat_ref(object)
+        .await?
+        .ok_or_else(|| anyhow!("Recorded B2 cache version missing"))?;
+    if !matches_provenance(
+        &stored,
+        state.record.size,
+        &state.record.content_type,
+        state.record.owner.as_deref(),
+    ) {
+        bail!("Recorded B2 cache provenance mismatch");
+    }
+    let bytes = storage.read_ref(object).await?;
+    if bytes.len() as u64 != state.record.size
+        || hex::encode(Sha256::digest(&bytes)) != state.record.sha256
+    {
+        bail!("Recorded B2 cache integrity mismatch");
+    }
+    Ok(Some(bytes))
 }
 
 pub(super) async fn put_file(
@@ -456,11 +534,12 @@ pub(super) async fn put_file(
         false,
     )
     .await?;
-    let (mime, owner) = {
+    let (mime, owner, previously_completed) = {
         let state = admission.state.lock().await;
         (
             state.record.content_type.clone(),
             state.record.owner.clone(),
+            state.record.b2_only_completed(),
         )
     };
     let mut newly_stored = false;
@@ -487,7 +566,12 @@ pub(super) async fn put_file(
         bail!("B2 pinned canonical metadata does not match admitted provenance");
     }
     let slot = admission.slot(StorageProvider::Gcs).await;
-    if !storage.requires_gcs_backup() && matches!(slot, Slot::NotIssued | Slot::Verified { .. }) {
+    if !storage.requires_second_copy() && matches!(slot, Slot::NotIssued | Slot::Verified { .. }) {
+        if matches!(slot, Slot::NotIssued) {
+            // A failure before this fenced transition remains retryable as new.
+            // Hooks still run after storage returns and remain best-effort.
+            newly_stored |= admission.complete_b2_only().await?;
+        }
         return Ok(WriteResult {
             objects: vec![primary],
             newly_stored,
@@ -510,7 +594,7 @@ pub(super) async fn put_file(
             // `open` lets only one request finish it. A backup adopted from an
             // earlier storage mode looks the same here, so this is at-least-once:
             // that rare retry repeats a best-effort hook rather than skipping one.
-            newly_stored = true;
+            newly_stored |= !previously_completed;
             reference
         } else if let Some(existing) = storage.gcs_stat(key).await? {
             if !matches_provenance(&existing, size, &mime, owner.as_deref()) {
@@ -554,7 +638,7 @@ pub(super) async fn put_file(
                 version: Some(object.generation.to_string()),
             };
             admission.acknowledged(&reference).await?;
-            newly_stored = true;
+            newly_stored |= !previously_completed;
             reference
         };
         verify_stream(storage.stream_ref(&reference).await?, path).await?;
@@ -562,7 +646,7 @@ pub(super) async fn put_file(
         reference
     };
     let mut objects = vec![primary];
-    if storage.requires_gcs_backup() {
+    if storage.requires_second_copy() {
         objects.push(backup);
     }
     Ok(WriteResult {

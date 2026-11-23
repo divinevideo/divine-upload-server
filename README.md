@@ -150,13 +150,14 @@ grace period above that drain timeout.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
 
-## B2 primary with synchronous GCS backup
+## B2 primary with optional synchronous GCS backup
 
 `MEDIA_WRITE_PROVIDER=b2_primary` selects a separate staged migration policy:
-B2 is authoritative and is written and fully verified first; the canonical GCS
-backup must then be stored and independently verified before upload success.
-Both immutable references are retained in the private admission record and
-in-process write result in B2, GCS order. Public hash URLs remain
+B2 is authoritative and is written and fully verified first. By default, the
+canonical GCS backup must then be stored and independently verified before
+upload success; both immutable references are returned in B2, GCS order. With
+media backups disabled, success records a verified B2-only completion and
+returns only that immutable reference. Public hash URLs remain
 unchanged. `dual` retains its historical GCS-first policy.
 
 Admission-record updates retry GCS HTTP 429 responses at most twice with backoff,
@@ -186,8 +187,10 @@ its preparation-only API is not used as an upload prerequisite.
 Set `MEDIA_GCS_BACKUP_ENABLED=false` alongside `MEDIA_WRITE_PROVIDER=b2_primary`
 to store new canonical originals and thumbnails only in B2 without uploading or
 verifying GCS media backups. Omission or `true` retains verified GCS backups;
-any other value fails startup. The switch has no effect in `gcs`, `dual`, or
-plain `b2` mode.
+any other value fails startup. The switch does not change new admissions in
+`gcs`, `dual`, or plain `b2` mode. Switching new admissions back to `gcs` also
+restores backup requirements for retries of previously accepted B2-primary keys;
+it does not retarget those keys to a new GCS-first write.
 
 Before disabling backups, verify that playback and all follow-up processors can
 read a new original stored only in B2. This includes the transcoder used for HLS
@@ -202,12 +205,43 @@ B2-primary retries. A retry of a previously acknowledged GCS backup still
 finishes its pinned readback; an uncertain `issued` write still fails closed
 for explicit reconciliation. Existing GCS objects are not deleted or modified.
 Resumable sessions admitted under a non-`b2_primary` mode retain their original
-copy requirements and cannot reuse a B2-only result in place of a required GCS
-copy. GCS remains required in `b2_primary` mode for small private admission
+copy requirements: GCS and dual sessions repair a missing required backup
+through the original admission fence using verified staged bytes, while plain
+B2 sessions do not require GCS. Recorded B2-primary outbox contracts, including
+historical recovery and sessions admitted through an outbox, still require both
+copies regardless of the current switch. The bounded outbox reconciler only
+verifies existing copies; it does not create missing backups. GCS remains
+required in `b2_primary` mode for small private admission
 records and resumable staging until a coordination database is
 provisioned for plain `b2` mode. Re-enabling `MEDIA_GCS_BACKUP_ENABLED=true`
 causes subsequent retries for B2-only keys to write and verify their missing
-GCS backups without rewriting B2.
+GCS backups without rewriting B2 or treating a completed original as newly
+stored. A completed B2-only thumbnail remains a valid read-only cache hit after
+re-enabling backups or switching new admissions back to GCS: its recorded B2
+version, admitted digest, size and provenance are verified. An eligible direct
+video retry can also repair that thumbnail's backup using the existing JPEG
+bytes; a read-only thumbnail request does not issue this repair.
+
+The v1 admission JSON shape and slot variants remain unchanged. Its opaque
+`attempt` token records B2-only completion as
+`b2-only-complete-v1:<32 lowercase hex nonce>`, only after the pinned B2 bytes and
+metadata pass verification. Every takeover replaces the nonce through the same
+generation precondition; backup repair preserves the completion marker. An
+unmarked verified-B2/unissued-GCS record is treated as interrupted, so a fenced
+retry can report a new completion and offer its best-effort hooks again. A
+marked replay or backup-only repair does not report a new original. This is
+storage completion tracking, not a durable hook receipt: a crash after the
+marker commits but before a hook is submitted can still lose that best-effort
+hook. Neither exactly-once nor eventual moderation delivery is promised.
+
+Older strict v1 JSON readers can deserialize these records, but that is not an
+older-image serving guarantee. They do not understand completed B2-only cache
+entries and can still return missing-backup errors until those objects are
+repaired. Older writers may replace the opaque token and conservatively repeat
+a hook. To roll back the setting, keep a release with these completion/cache
+read semantics and re-enable backups. Before downgrading to an older image,
+restore the copies its read paths require; re-enabling the flag alone does not
+backfill all old keys. See the [candidate validation plan](docs/b2-backup-validation.md).
 
 New resumable sessions stage bytes in GCS under
 `__resumable/b2_primary/<hex GCS bucket>/<hex B2 bucket>/<upload_id>/blob`.

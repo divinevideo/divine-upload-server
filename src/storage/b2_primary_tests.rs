@@ -275,6 +275,11 @@ struct Objects {
     null_b2_head: bool,
     wrong_pinned_b2_head: bool,
     fail_b2_write: bool,
+    fail_verified_b2_head_once: bool,
+    fail_completion_once: bool,
+    lose_completion_ack_once: bool,
+    land_stale_completion_before_fence: bool,
+    completion_requests: Vec<(i64, Bytes)>,
 }
 struct Fixture {
     storage: MediaStorage,
@@ -444,6 +449,17 @@ async fn origin(
                     .parse::<i64>()
                     .unwrap();
                 let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let completion = value["attempt"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with("b2-only-complete-v1:"))
+                    && value["gcs"]["state"] == "not_issued";
+                if completion {
+                    f.completion_requests.push((expected, body.clone()));
+                    if f.fail_completion_once {
+                        f.fail_completion_once = false;
+                        return error(503);
+                    }
+                }
                 if value["gcs"]["state"] == "verified" {
                     f.final_admission_requests.push((expected, body.clone()));
                     if f.throttle_final_admission {
@@ -458,6 +474,16 @@ async fn origin(
                     return error(503);
                 }
                 let current = f.records.get(&name).map(|r| r.0).unwrap_or(0);
+                if f.land_stale_completion_before_fence
+                    && expected == current
+                    && value["b2"]["state"] == "verified"
+                    && !completion
+                {
+                    f.land_stale_completion_before_fence = false;
+                    let landed = f.completion_requests[0].1.clone();
+                    f.records.insert(name.clone(), (current + 1, landed));
+                    return error(412);
+                }
                 if f.land_stale_final_before_fence
                     && expected == current
                     && value["b2"]["state"] == "verified"
@@ -476,6 +502,10 @@ async fn origin(
                     return error(412);
                 }
                 f.records.insert(name.clone(), (current + 1, body));
+                if completion && f.lose_completion_ack_once {
+                    f.lose_completion_ack_once = false;
+                    return error(503);
+                }
                 if value["gcs"]["state"] == "verified" && f.lose_final_admission_ack_once {
                     f.lose_final_admission_ack_once = false;
                     return error(503);
@@ -513,7 +543,12 @@ async fn origin(
             };
             if query.get("alt").is_some_and(|v| v == "media") {
                 if let Some(expected) = query.get("generation") {
-                    assert_eq!(expected, &generation.to_string());
+                    // A concurrent CAS may replace the generation between HEAD
+                    // and this pinned GET. This fixture retains only the latest
+                    // version, so model GCS's missing-version response.
+                    if expected != &generation.to_string() {
+                        return error(404);
+                    }
                 }
                 return bytes.clone().into_response();
             }
@@ -605,6 +640,16 @@ async fn origin(
         return StatusCode::NOT_FOUND.into_response();
     };
     if method == Method::HEAD {
+        if f.fail_verified_b2_head_once && !query.is_empty() {
+            let verified = f.records.values().any(|(_, bytes)| {
+                serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["b2"]["state"]
+                    == "verified"
+            });
+            if verified {
+                f.fail_verified_b2_head_once = false;
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
         let version = if f.null_b2_head {
             "null"
         } else if f.wrong_pinned_b2_head && !query.is_empty() {
@@ -2643,11 +2688,8 @@ async fn b2_primary_policy_precedence_matrix_covers_resumable_completion_and_rep
 }
 
 #[tokio::test]
-async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_exact_copies() {
-    use crate::resumable::{
-        ResumableBackend, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
-        SessionStore,
-    };
+async fn b2_primary_historical_session_repairs_unissued_backup_through_primary_fence() {
+    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
     for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
         for global in [false, true] {
             let Some(url) = crate::outbox::tests::isolated_database_url().await else {
@@ -2728,8 +2770,6 @@ async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_
             )
             .await
             .unwrap();
-            let session = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
-            let backend = runtime.backend.clone();
             let manager = ResumableManager::new(
                 runtime.backend,
                 runtime.store,
@@ -2739,40 +2779,23 @@ async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_
                 300,
             )
             .with_outbox(global.then_some(old));
-            assert!(
-                manager
-                    .complete_session(&init.upload_id, &owner)
-                    .await
-                    .is_err(),
-                "old GCS writes cannot bypass a partial new primary admission"
-            );
-            assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
-            if mode == WriteMode::B2Primary {
-                f.storage
-                    .clone()
-                    .with_gcs_backup_enabled(false)
-                    .put(
-                        &hash,
-                        Bytes::from_static(b"original"),
-                        "application/octet-stream",
-                        Some(&new_owner),
-                    )
-                    .await
-                    .unwrap();
-                assert!(
-                    backend.finalize(&session).await.is_err(),
-                    "a B2-only receipt must not complete a legacy GCS session"
-                );
-            }
-            f.storage
-                .put(
-                    &hash,
-                    Bytes::from_static(b"original"),
-                    "application/octet-stream",
-                    Some(&new_owner),
-                )
+            let first = manager
+                .complete_session(&init.upload_id, &owner)
                 .await
                 .unwrap();
+            assert!(first.processing_via_outbox);
+            assert!(
+                first.newly_stored,
+                "unmarked incomplete primary gets its completion opportunity"
+            );
+            {
+                let objects = f.objects.lock().unwrap();
+                assert_eq!(objects.writes, ["b2", "gcs"]);
+                assert_eq!(
+                    objects.gcs.as_ref().unwrap().owner.as_deref(),
+                    Some(new_owner.as_str())
+                );
+            }
             let result = manager
                 .complete_session(&init.upload_id, &owner)
                 .await
@@ -3787,7 +3810,10 @@ async fn b2_primary_without_gcs_backups_writes_and_reads_b2_only() {
         )
         .await
         .unwrap();
-    assert!(repaired.newly_stored);
+    assert!(
+        !repaired.newly_stored,
+        "backup repair must not resubmit original hooks"
+    );
     assert_eq!(repaired.objects.len(), 2);
     assert_eq!(repaired.objects[0].provider, StorageProvider::B2);
     assert_eq!(repaired.objects[1].provider, StorageProvider::Gcs);
@@ -3912,3 +3938,6 @@ async fn b2_primary_resumable_without_gcs_backups_finalizes_to_b2_only() {
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].provider, StorageProvider::B2);
 }
+
+#[path = "b2_backup_recovery_tests.rs"]
+mod backup_recovery_tests;
