@@ -414,7 +414,7 @@ impl ProcessingOutbox {
         }
         let required = row.get::<_, bool>(5)
             || (admission.is_direct()
-                && recorded_mode.requires_both()
+                && recorded_mode.recorded_requires_two_copies()
                 && size > 0
                 && size <= crate::thumbnail::MAX_SYNC_VIDEO_BYTES as i64
                 && crate::thumbnail::is_video_type(&row.get::<_, String>(1)));
@@ -431,7 +431,10 @@ impl ProcessingOutbox {
         .map_err(|_| anyhow!("upload intent scheduling failed"))?;
         let storage = storage
             .with_mode(recorded_mode)
-            .map_err(|_| IntentConflict)?;
+            .map_err(|_| IntentConflict)?
+            // Durable b2_primary contracts predate optional media backups and
+            // always promise both providers, regardless of current admissions.
+            .with_gcs_backup_enabled(true);
         tx.commit()
             .await
             .map_err(|_| anyhow!("upload intent commit failed"))?;
@@ -694,6 +697,9 @@ impl ProcessingOutbox {
                 let Some(primary) = primary else {
                     continue;
                 };
+                // Resolve the recorded intent, not current admission defaults.
+                // This bounded reconciler verifies copies; it never creates them.
+                let primary = primary.with_gcs_backup_enabled(mode != WriteMode::B2);
                 let Ok(receipts) = primary.primary_receipts(&intent.sha256, intent.size).await
                 else {
                     continue;

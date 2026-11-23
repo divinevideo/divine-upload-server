@@ -33,7 +33,7 @@ pub enum WriteMode {
     B2Primary,
 }
 impl WriteMode {
-    pub(crate) fn requires_both(self) -> bool {
+    pub(crate) fn recorded_requires_two_copies(self) -> bool {
         matches!(self, Self::Dual | Self::B2Primary)
     }
 }
@@ -79,6 +79,7 @@ pub struct WriteResult {
 #[derive(Clone)]
 pub struct MediaStorage {
     pub mode: WriteMode,
+    gcs_backup_enabled: bool,
     gcs: Option<GcsClient>,
     gcs_bucket: String,
     b2: Option<B2Store>,
@@ -99,11 +100,23 @@ impl MediaStorage {
         }
         Ok(Self {
             mode,
+            gcs_backup_enabled: true,
             gcs,
             gcs_bucket,
             b2,
             database_url: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+    pub fn with_gcs_backup_enabled(mut self, enabled: bool) -> Self {
+        self.gcs_backup_enabled = enabled;
+        self
+    }
+    pub fn requires_second_copy(&self) -> bool {
+        match self.mode {
+            WriteMode::Dual => true,
+            WriteMode::B2Primary => self.gcs_backup_enabled,
+            WriteMode::Gcs | WriteMode::B2 => false,
+        }
     }
     pub async fn initialize_coordination(&self, database_url: Option<&str>) -> Result<()> {
         if let Some(b2) = &self.b2 {
@@ -153,6 +166,7 @@ impl MediaStorage {
             self.gcs_bucket.clone(),
             self.b2.clone(),
         )?;
+        storage.gcs_backup_enabled = self.gcs_backup_enabled;
         storage.database_url = self.database_url.clone();
         Ok(storage)
     }
@@ -271,8 +285,13 @@ impl MediaStorage {
     /// independently contain the same bytes. Reads never repair storage.
     pub async fn read_verified(&self, key: &str) -> Result<Bytes> {
         use futures::StreamExt;
+        if self.mode == WriteMode::B2Primary {
+            if let Some(bytes) = primary::read_completed_cache(self, key).await? {
+                return Ok(bytes);
+            }
+        }
         let bytes = self.read(key).await?;
-        if !self.mode.requires_both() {
+        if !self.requires_second_copy() {
             return Ok(bytes);
         }
         let backup = if self.mode == WriteMode::B2Primary {

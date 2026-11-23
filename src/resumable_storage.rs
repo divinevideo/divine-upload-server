@@ -269,7 +269,12 @@ impl MediaResumableBackend {
             {
                 bail!("Upload session bucket mapping changed");
             }
-            self.storage.with_mode(WriteMode::B2Primary)
+            let storage = self.storage.with_mode(WriteMode::B2Primary)?;
+            Ok(if session.processing_outbox_required == Some(true) {
+                storage.with_gcs_backup_enabled(true)
+            } else {
+                storage
+            })
         } else if session.session_url == "staged-v1" {
             self.staged_store(&session.temp_object)
         } else {
@@ -300,6 +305,33 @@ impl MediaResumableBackend {
             bail!("Upload session bucket mapping changed");
         }
         self.storage.with_mode(mode)
+    }
+    async fn verified_session_file(
+        &self,
+        session: &UploadSession,
+    ) -> Result<tempfile::NamedTempFile> {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new()?;
+        let mut stream = self.stream_object(&session.temp_object).await?;
+        let mut size = 0u64;
+        let mut hash = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow!("Upload size overflow"))?;
+            crate::resources::check_size(size)?;
+            if size > session.declared_size {
+                bail!("Upload staging size changed");
+            }
+            hash.update(&chunk);
+            file.write_all(&chunk)?;
+        }
+        if size != session.declared_size || hex::encode(hash.finalize()) != session.final_sha256 {
+            bail!("Upload staging integrity changed");
+        }
+        file.flush()?;
+        Ok(file)
     }
     async fn assemble_file(&self, key: &str) -> Result<tempfile::NamedTempFile> {
         use std::io::Write;
@@ -399,11 +431,16 @@ impl ResumableBackend for MediaResumableBackend {
             .await
     }
     async fn final_objects(&self, session: &UploadSession) -> Result<Vec<ObjectRef>> {
-        if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+        if let Some(mut primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+            let mode = self.finalization_storage(session)?.mode;
+            primary = primary.with_gcs_backup_enabled(match mode {
+                WriteMode::Gcs | WriteMode::Dual => true,
+                WriteMode::B2 => false,
+                WriteMode::B2Primary => self.finalization_storage(session)?.requires_second_copy(),
+            });
             let refs = primary
                 .primary_receipts(&session.final_sha256, session.declared_size)
                 .await?;
-            let mode = self.finalization_storage(session)?.mode;
             let providers = match mode {
                 WriteMode::Gcs => vec![crate::storage::StorageProvider::Gcs],
                 WriteMode::B2 => vec![crate::storage::StorageProvider::B2],
@@ -411,10 +448,16 @@ impl ResumableBackend for MediaResumableBackend {
                     crate::storage::StorageProvider::Gcs,
                     crate::storage::StorageProvider::B2,
                 ],
-                WriteMode::B2Primary => vec![
-                    crate::storage::StorageProvider::B2,
-                    crate::storage::StorageProvider::Gcs,
-                ],
+                WriteMode::B2Primary => {
+                    if primary.requires_second_copy() {
+                        vec![
+                            crate::storage::StorageProvider::B2,
+                            crate::storage::StorageProvider::Gcs,
+                        ]
+                    } else {
+                        vec![crate::storage::StorageProvider::B2]
+                    }
+                }
             };
             return providers
                 .into_iter()
@@ -457,42 +500,40 @@ impl ResumableBackend for MediaResumableBackend {
     async fn finalize(&self, session: &UploadSession) -> Result<bool> {
         if !primary_session(&session.temp_object) {
             if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
-                // A historical session may reuse settled, exact copies; it must
-                // not bypass a partial primary admission with a legacy write.
-                for object in primary
+                let mode = self.finalization_storage(session)?.mode;
+                let primary = primary.with_gcs_backup_enabled(mode != WriteMode::B2);
+                if let Ok(receipts) = primary
                     .primary_receipts(&session.final_sha256, session.declared_size)
-                    .await?
+                    .await
                 {
-                    primary
-                        .verify_ref_identity(&object, &session.final_sha256, session.declared_size)
-                        .await?;
+                    for object in receipts {
+                        primary
+                            .verify_ref_identity(
+                                &object,
+                                &session.final_sha256,
+                                session.declared_size,
+                            )
+                            .await?;
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
+                // Repair through the original admission fence, never a legacy
+                // write around an unknown effect. Recheck staged byte identity
+                // before this may issue the session's required missing backup.
+                let file = self.verified_session_file(session).await?;
+                return Ok(primary
+                    .put_file(
+                        &session.final_sha256,
+                        file.path(),
+                        &session.content_type,
+                        Some(&session.owner),
+                    )
+                    .await?
+                    .newly_stored);
             }
         }
         if primary_session(&session.temp_object) {
-            use std::io::Write;
-            let mut file = tempfile::NamedTempFile::new()?;
-            let mut stream = self.legacy()?.stream_object(&session.temp_object).await?;
-            let mut size = 0u64;
-            let mut hash = Sha256::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                size = size
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| anyhow!("Upload size overflow"))?;
-                crate::resources::check_size(size)?;
-                if size > session.declared_size {
-                    bail!("Upload staging size changed");
-                }
-                hash.update(&chunk);
-                file.write_all(&chunk)?;
-            }
-            if size != session.declared_size || hex::encode(hash.finalize()) != session.final_sha256
-            {
-                bail!("Upload staging integrity changed");
-            }
-            file.flush()?;
+            let file = self.verified_session_file(session).await?;
             let result = self
                 .finalization_storage(session)?
                 .put_file(
@@ -504,6 +545,7 @@ impl ResumableBackend for MediaResumableBackend {
                 .await?;
             return Ok(result.newly_stored);
         }
+
         if session.session_url != "staged-v1" {
             let exists = self.legacy()?.object_exists(&session.final_sha256).await?;
             if !exists {
