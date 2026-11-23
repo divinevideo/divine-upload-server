@@ -1340,8 +1340,8 @@ fn media_source_candidates(hash: &str) -> [String; 3] {
     ]
 }
 
-// This staged mode deliberately keeps the existing processing handoff, whose
-// consumers read the verified GCS backup. Intake-only outboxes would suppress it.
+// Intake-only outboxes would suppress the existing processing hooks. Those hooks
+// still run without GCS backups, so their consumers must be able to read B2.
 fn validate_processing_policy(
     mode: storage::WriteMode,
     has_url: bool,

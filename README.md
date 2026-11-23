@@ -145,9 +145,9 @@ This mode uses the existing GCS bucket for small private admission records and
 resumable session state; it requires **no coordination database or new worker**.
 Keep `MEDIA_FINALIZED_URL` and `MEDIA_FINALIZED_TOKEN` unset: startup rejects
 those settings in this mode so an intake-only outbox cannot suppress the existing
-HLS, transcription and NSFW hooks. Those processors can continue reading the
-verified canonical GCS backup. Their existing best-effort/retry limitations are
-unchanged. Resumable completion retains its existing NSFW/Core publication and
+HLS, transcription and NSFW hooks. With backups enabled, those processors can
+continue reading the verified canonical GCS copy. Their existing best-effort
+and retry limitations are unchanged. Resumable completion retains its existing NSFW/Core publication and
 on-demand HLS behavior; it does not promise eager HLS or a thumbnail.
 
 Required configuration is the existing GCS bucket/credentials and
@@ -163,14 +163,22 @@ verifying GCS media backups. Omission or `true` retains verified GCS backups;
 any other value fails startup. The switch has no effect in `gcs`, `dual`, or
 plain `b2` mode.
 
+Before disabling backups, verify that playback and all follow-up processors can
+read a new original stored only in B2. This includes the transcoder used for HLS
+and transcription, and the CDN URL fetched by the NSFW scanner. Keep backups
+enabled until those paths work end to end on a candidate deployment. The
+[companion transcoder change](https://github.com/divinevideo/divine-blossom/pull/391)
+supports B2 reads while retaining legacy GCS input fallback, but does not verify
+the deployed read paths. This switch changes storage writes, not hook routing.
+
 Disabling backups skips new GCS backup uploads and verifies only B2 on ordinary
 B2-primary retries. A retry of a previously acknowledged GCS backup still
 finishes its pinned readback; an uncertain `issued` write still fails closed
-for explicit reconciliation. Existing GCS objects are not deleted or
-modified. Older resumable sessions retain their original copy requirements and
-cannot reuse a B2-only result in place of a required GCS copy. GCS remains
-required in `b2_primary` mode for small private
-admission records and resumable staging until a coordination database is
+for explicit reconciliation. Existing GCS objects are not deleted or modified.
+Resumable sessions admitted under a non-`b2_primary` mode retain their original
+copy requirements and cannot reuse a B2-only result in place of a required GCS
+copy. GCS remains required in `b2_primary` mode for small private admission
+records and resumable staging until a coordination database is
 provisioned for plain `b2` mode. Re-enabling `MEDIA_GCS_BACKUP_ENABLED=true`
 causes subsequent retries for B2-only keys to write and verify their missing
 GCS backups without rewriting B2.
