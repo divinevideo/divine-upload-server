@@ -286,7 +286,7 @@ impl MediaStorage {
     pub async fn read_verified(&self, key: &str) -> Result<Bytes> {
         use futures::StreamExt;
         if self.mode == WriteMode::B2Primary {
-            if let Some(bytes) = primary::read_completed_b2_only(self, key).await? {
+            if let Some(bytes) = primary::read_completed_cache(self, key).await? {
                 return Ok(bytes);
             }
         }

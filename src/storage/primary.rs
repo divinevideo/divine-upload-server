@@ -463,21 +463,24 @@ pub(super) async fn receipts(
     }
 }
 
-/// A historically completed B2-only cache entry remains usable after backup
-/// re-enablement. This does not relax explicit session/outbox copy obligations.
-/// Derivative keys are not content hashes, so verify against the recorded digest.
-pub(super) async fn read_completed_b2_only(
+/// Existing admissions never fall through to latest-version cache reads. A
+/// completion pins the primary, and any required backup, to recorded versions.
+/// The historical B2-only cache exception does not relax session/outbox receipts.
+/// Derivative keys are not content hashes, so use the admitted digest.
+pub(super) async fn read_completed_cache(
     storage: &MediaStorage,
     key: &str,
 ) -> Result<Option<Bytes>> {
     let Some(state) = read_record(storage, key).await? else {
         return Ok(None);
     };
-    if !state.record.b2_only_completed() || !matches!(state.record.gcs, Slot::NotIssued) {
-        return Ok(None);
-    }
     let Slot::Verified { object } = &state.record.b2 else {
-        bail!("Completed B2-only cache has no verified primary");
+        bail!("Primary cache admission is not complete");
+    };
+    let backup = match &state.record.gcs {
+        Slot::Verified { object } => Some(object),
+        Slot::NotIssued if state.record.b2_only_completed() => None,
+        _ => bail!("Primary cache admission is not complete"),
     };
     let stored = storage
         .stat_ref(object)
@@ -496,6 +499,25 @@ pub(super) async fn read_completed_b2_only(
         || hex::encode(Sha256::digest(&bytes)) != state.record.sha256
     {
         bail!("Recorded B2 cache integrity mismatch");
+    }
+    if storage.requires_second_copy() {
+        if let Some(backup) = backup {
+            let stored = storage
+                .stat_ref(backup)
+                .await?
+                .ok_or_else(|| anyhow!("Recorded GCS cache version missing"))?;
+            if !matches_provenance(
+                &stored,
+                state.record.size,
+                &state.record.content_type,
+                state.record.owner.as_deref(),
+            ) {
+                bail!("Recorded GCS cache provenance mismatch");
+            }
+            storage
+                .verify_ref_identity(backup, &state.record.sha256, state.record.size)
+                .await?;
+        }
     }
     Ok(Some(bytes))
 }

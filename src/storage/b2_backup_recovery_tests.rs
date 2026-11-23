@@ -809,3 +809,156 @@ async fn backup_recovery_only_exact_marker_grammar_counts_as_completed() {
         assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
     }
 }
+
+async fn assert_recorded_completed_cache(marked: bool) {
+    for backups_enabled in [false, true] {
+        for change in [
+            "same-size-bytes",
+            "owner",
+            "mime",
+            "wrong-version",
+            "latest-changed",
+            "backup-missing",
+            "backup-corrupt",
+            "backup-owner",
+            "backup-mime",
+        ] {
+            let f = Fixture::new().await;
+            let key = format!("{}.jpg", "a".repeat(64));
+            if marked {
+                f.storage
+                    .clone()
+                    .with_gcs_backup_enabled(false)
+                    .put(
+                        &key,
+                        Bytes::from_static(b"original"),
+                        "image/jpeg",
+                        Some("fixture-owner"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            f.storage
+                .put(
+                    &key,
+                    Bytes::from_static(b"original"),
+                    "image/jpeg",
+                    Some("fixture-owner"),
+                )
+                .await
+                .unwrap();
+            let storage = f.storage.clone().with_gcs_backup_enabled(backups_enabled);
+            assert_eq!(storage.read_verified(&key).await.unwrap(), "original");
+            {
+                let mut objects = f.objects.lock().unwrap();
+                objects.read_versions.clear();
+                match change {
+                    "same-size-bytes" => {
+                        objects.b2.as_mut().unwrap().bytes = Bytes::from_static(b"tampered")
+                    }
+                    "owner" => objects.b2.as_mut().unwrap().owner = Some("different-owner".into()),
+                    "mime" => objects.b2.as_mut().unwrap().mime = "video/mp4".into(),
+                    "wrong-version" => objects.wrong_pinned_b2_head = true,
+                    "backup-missing" => objects.gcs = None,
+                    "backup-corrupt" => objects.corrupt_gcs = true,
+                    "backup-owner" => {
+                        objects.gcs.as_mut().unwrap().owner = Some("different-owner".into())
+                    }
+                    "backup-mime" => objects.gcs.as_mut().unwrap().mime = "video/mp4".into(),
+                    _ => objects.latest_b2_version = Some("b2-version-2".into()),
+                }
+            }
+            let result = storage.read_verified(&key).await;
+            let expected_ok =
+                change == "latest-changed" || (change.starts_with("backup-") && !backups_enabled);
+            assert_eq!(
+                result.is_ok(),
+                expected_ok,
+                "marked={marked}, backups={backups_enabled}, change={change}"
+            );
+            let objects = f.objects.lock().unwrap();
+            assert!(
+                objects.read_versions.iter().all(|v| v == "b2-version-1"),
+                "cache must read admitted version: {change}"
+            );
+            assert_eq!(objects.writes, ["b2", "gcs"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn recorded_cache_two_copy_completion_verifies_pinned_primary_with_backups_off() {
+    assert_recorded_completed_cache(false).await;
+}
+
+#[tokio::test]
+async fn recorded_cache_repaired_completion_verifies_pinned_primary_with_backups_off() {
+    assert_recorded_completed_cache(true).await;
+}
+
+#[tokio::test]
+async fn recorded_cache_incomplete_admission_cannot_fall_through_to_latest_b2() {
+    for incomplete in [
+        "b2-verified-unmarked",
+        "gcs-issued",
+        "gcs-acknowledged",
+        "marked-gcs-issued",
+        "marked-gcs-acknowledged",
+    ] {
+        let f = Fixture::new().await;
+        let key = format!("{}.jpg", "a".repeat(64));
+        let no_backup = f.storage.clone().with_gcs_backup_enabled(false);
+        if incomplete.starts_with("marked-") {
+            no_backup
+                .put(&key, Bytes::from_static(b"original"), "image/jpeg", None)
+                .await
+                .unwrap();
+        }
+        {
+            let mut objects = f.objects.lock().unwrap();
+            objects.fail_verified_b2_head_once = incomplete == "b2-verified-unmarked";
+            objects.lose_gcs_put_ack = incomplete.ends_with("issued");
+            objects.fail_final_admission_once = incomplete.ends_with("acknowledged").then_some(503);
+        }
+        let writer = if incomplete == "b2-verified-unmarked" {
+            no_backup.clone()
+        } else {
+            f.storage.clone()
+        };
+        assert!(writer
+            .put(&key, Bytes::from_static(b"original"), "image/jpeg", None)
+            .await
+            .is_err());
+        let before = {
+            let objects = f.objects.lock().unwrap();
+            (admission_record(&objects).clone(), objects.writes.clone())
+        };
+        for reader in [no_backup, f.storage.clone()] {
+            assert!(reader.read_verified(&key).await.is_err(), "{incomplete}");
+        }
+        let objects = f.objects.lock().unwrap();
+        assert_eq!(admission_record(&objects), &before.0);
+        assert_eq!(objects.writes, before.1);
+    }
+}
+
+#[tokio::test]
+async fn recorded_cache_without_admission_retains_legacy_read_behavior() {
+    let f = Fixture::new().await;
+    f.objects.lock().unwrap().b2 = Some(Copy {
+        bytes: Bytes::from_static(b"legacy"),
+        owner: None,
+        mime: "image/jpeg".into(),
+    });
+    assert_eq!(
+        f.storage
+            .clone()
+            .with_gcs_backup_enabled(false)
+            .read_verified("legacy.jpg")
+            .await
+            .unwrap(),
+        "legacy"
+    );
+    assert!(f.objects.lock().unwrap().records.is_empty());
+    assert!(f.objects.lock().unwrap().writes.is_empty());
+}

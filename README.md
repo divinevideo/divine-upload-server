@@ -218,7 +218,10 @@ causes subsequent retries for B2-only keys to write and verify their missing
 GCS backups without rewriting B2 or treating a completed original as newly
 stored. A completed B2-only thumbnail remains a valid read-only cache hit after
 re-enabling backups or switching new admissions back to GCS: its recorded B2
-version, admitted digest, size and provenance are verified. An eligible direct
+version, admitted digest, size and provenance are verified. Completed two-copy
+records also retain pinned primary verification with backups off; with backups
+on, their recorded GCS copy is verified too. An incomplete admission cannot
+fall through to an unpinned cache read. An eligible direct
 video retry can also repair that thumbnail's backup using the existing JPEG
 bytes; a read-only thumbnail request does not issue this repair.
 
