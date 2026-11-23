@@ -151,6 +151,18 @@ fn gcs_compatibility(mode: storage::WriteMode, value: Option<&str>) -> Result<bo
     Ok(enabled)
 }
 
+fn gcs_backup_enabled(mode: storage::WriteMode, value: Option<&str>) -> Result<bool> {
+    let enabled = match value {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(_) => return Err(anyhow!("MEDIA_GCS_BACKUP_ENABLED must be true or false")),
+    };
+    if mode != storage::WriteMode::B2Primary {
+        return Ok(true);
+    }
+    Ok(enabled)
+}
+
 // App state shared across handlers
 struct AppState {
     original_write: Option<original_write::Runtime>,
@@ -403,6 +415,8 @@ async fn main() -> Result<()> {
     // Initialize GCS client
     let mode: storage::WriteMode = config.media_write_provider.parse()?;
     let compatibility = gcs_compatibility(mode, env::var("GCS_COMPAT_ENABLED").ok().as_deref())?;
+    let backup_enabled =
+        gcs_backup_enabled(mode, env::var("MEDIA_GCS_BACKUP_ENABLED").ok().as_deref())?;
     let gcs_client = if !compatibility {
         None
     } else {
@@ -414,7 +428,8 @@ async fn main() -> Result<()> {
         Some(storage::B2Store::from_env()?)
     };
     let media_storage =
-        storage::MediaStorage::new(mode, gcs_client.clone(), config.gcs_bucket.clone(), b2)?;
+        storage::MediaStorage::new(mode, gcs_client.clone(), config.gcs_bucket.clone(), b2)?
+            .with_gcs_backup_enabled(backup_enabled);
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1342,8 +1357,8 @@ fn media_source_candidates(hash: &str) -> [String; 3] {
     ]
 }
 
-// This staged mode deliberately keeps the existing processing handoff, whose
-// consumers read the verified GCS backup. Intake-only outboxes would suppress it.
+// Intake-only outboxes would suppress the existing processing hooks. Those hooks
+// still run without GCS backups, so their consumers must be able to read B2.
 fn validate_processing_policy(
     mode: storage::WriteMode,
     has_url: bool,
@@ -2247,6 +2262,21 @@ mod tests {
         assert!(super::gcs_compatibility(WriteMode::B2Primary, None).unwrap());
         assert!(super::gcs_compatibility(WriteMode::B2Primary, Some("false")).is_err());
         assert!(super::gcs_compatibility(WriteMode::B2, Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn b2_primary_gcs_backup_toggle_defaults_on_and_rejects_invalid_values() {
+        use crate::storage::WriteMode;
+        assert!(super::gcs_backup_enabled(WriteMode::B2Primary, None).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::B2Primary, Some("true")).unwrap());
+        assert!(!super::gcs_backup_enabled(WriteMode::B2Primary, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::B2Primary, Some("invalid")).is_err());
+        assert!(super::gcs_backup_enabled(WriteMode::Gcs, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::Gcs, Some("invalid")).is_err());
+        assert!(super::gcs_backup_enabled(WriteMode::Dual, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::Dual, Some("invalid")).is_err());
+        assert!(super::gcs_backup_enabled(WriteMode::B2, Some("false")).unwrap());
+        assert!(super::gcs_backup_enabled(WriteMode::B2, Some("invalid")).is_err());
     }
 
     pub(crate) fn test_state(

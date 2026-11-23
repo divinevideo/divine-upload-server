@@ -399,11 +399,15 @@ impl ResumableBackend for MediaResumableBackend {
             .await
     }
     async fn final_objects(&self, session: &UploadSession) -> Result<Vec<ObjectRef>> {
-        if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+        if let Some(mut primary) = self.storage.accepted_primary(&session.final_sha256).await? {
+            let mode = self.finalization_storage(session)?.mode;
+            if mode != WriteMode::B2Primary {
+                // The switch must not weaken an older session's copy contract.
+                primary = primary.with_gcs_backup_enabled(true);
+            }
             let refs = primary
                 .primary_receipts(&session.final_sha256, session.declared_size)
                 .await?;
-            let mode = self.finalization_storage(session)?.mode;
             let providers = match mode {
                 WriteMode::Gcs => vec![crate::storage::StorageProvider::Gcs],
                 WriteMode::B2 => vec![crate::storage::StorageProvider::B2],
@@ -411,10 +415,16 @@ impl ResumableBackend for MediaResumableBackend {
                     crate::storage::StorageProvider::Gcs,
                     crate::storage::StorageProvider::B2,
                 ],
-                WriteMode::B2Primary => vec![
-                    crate::storage::StorageProvider::B2,
-                    crate::storage::StorageProvider::Gcs,
-                ],
+                WriteMode::B2Primary => {
+                    if primary.requires_gcs_backup() {
+                        vec![
+                            crate::storage::StorageProvider::B2,
+                            crate::storage::StorageProvider::Gcs,
+                        ]
+                    } else {
+                        vec![crate::storage::StorageProvider::B2]
+                    }
+                }
             };
             return providers
                 .into_iter()
@@ -459,6 +469,7 @@ impl ResumableBackend for MediaResumableBackend {
             if let Some(primary) = self.storage.accepted_primary(&session.final_sha256).await? {
                 // A historical session may reuse settled, exact copies; it must
                 // not bypass a partial primary admission with a legacy write.
+                let primary = primary.with_gcs_backup_enabled(true);
                 for object in primary
                     .primary_receipts(&session.final_sha256, session.declared_size)
                     .await?
