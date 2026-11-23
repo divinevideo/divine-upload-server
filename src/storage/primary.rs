@@ -561,8 +561,12 @@ pub(super) async fn put_file(
         admission.verified(&reference).await?;
         reference
     };
+    let mut objects = vec![primary];
+    if storage.requires_gcs_backup() {
+        objects.push(backup);
+    }
     Ok(WriteResult {
-        objects: vec![primary, backup],
+        objects,
         newly_stored,
     })
 }

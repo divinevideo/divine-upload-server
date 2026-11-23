@@ -163,12 +163,13 @@ verifying GCS media backups. Omission or `true` retains verified GCS backups;
 any other value fails startup. The switch has no effect in `gcs`, `dual`, or
 plain `b2` mode.
 
-Disabling backups eliminates GCS backup uploads, GCS backup readback
-verifications, and the GCS backup admission state transitions, while keeping
-full pinned B2 version and byte verification. Existing GCS objects are not
-deleted or modified, and an earlier admission whose GCS backup slot was already
-left in an uncertain `issued` state still fails closed for explicit
-reconciliation. GCS remains required in `b2_primary` mode for small private
+Disabling backups skips new GCS backup uploads and verifies only B2 on ordinary
+B2-primary retries. A retry of a previously acknowledged GCS backup still
+finishes its pinned readback; an uncertain `issued` write still fails closed
+for explicit reconciliation. Existing GCS objects are not deleted or
+modified. Older resumable sessions retain their original copy requirements and
+cannot reuse a B2-only result in place of a required GCS copy. GCS remains
+required in `b2_primary` mode for small private
 admission records and resumable staging until a coordination database is
 provisioned for plain `b2` mode. Re-enabling `MEDIA_GCS_BACKUP_ENABLED=true`
 causes subsequent retries for B2-only keys to write and verify their missing

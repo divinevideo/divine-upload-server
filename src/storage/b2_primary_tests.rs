@@ -1706,7 +1706,9 @@ async fn primary_unreadable_control_ack_stays_pending_then_resumes_unissued() {
 
 #[tokio::test]
 async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
-    for corrupt_backup in [false, true] {
+    for (backups_enabled, corrupt_backup) in
+        [(true, false), (true, true), (false, false), (false, true)]
+    {
         let f = Fixture::new().await;
         f.objects.lock().unwrap().fail_final_admission_once = Some(503);
         assert!(f
@@ -1717,6 +1719,8 @@ async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
         f.objects.lock().unwrap().corrupt_gcs = corrupt_backup;
         let resumed = f
             .storage
+            .clone()
+            .with_gcs_backup_enabled(backups_enabled)
             .put("media", Bytes::from_static(b"original"), "video/mp4", None)
             .await;
         assert_eq!(resumed.is_ok(), !corrupt_backup);
@@ -1724,6 +1728,8 @@ async fn primary_acknowledged_backup_can_resume_without_new_provider_writes() {
             // The failed attempt never returned, so hooks gated on this flag
             // have not run for the upload yet.
             assert!(result.newly_stored);
+            assert_eq!(result.objects[0].provider, StorageProvider::B2);
+            assert_eq!(result.objects.len(), if backups_enabled { 2 } else { 1 });
         }
         assert_eq!(f.objects.lock().unwrap().writes, ["b2", "gcs"]);
     }
@@ -2638,7 +2644,10 @@ async fn b2_primary_policy_precedence_matrix_covers_resumable_completion_and_rep
 
 #[tokio::test]
 async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_exact_copies() {
-    use crate::resumable::{ResumableManager, ResumableRuntime, ResumableUploadInitRequest};
+    use crate::resumable::{
+        ResumableBackend, ResumableManager, ResumableRuntime, ResumableUploadInitRequest,
+        SessionStore,
+    };
     for mode in [WriteMode::Gcs, WriteMode::B2Primary] {
         for global in [false, true] {
             let Some(url) = crate::outbox::tests::isolated_database_url().await else {
@@ -2709,13 +2718,18 @@ async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_
                 .await
                 .is_err());
             let runtime = ResumableRuntime::new(
-                f.storage.with_mode(mode).unwrap(),
+                f.storage
+                    .with_mode(mode)
+                    .unwrap()
+                    .with_gcs_backup_enabled(mode != WriteMode::B2Primary),
                 f.storage.gcs.clone(),
                 "fixture-gcs".into(),
                 Some(&url),
             )
             .await
             .unwrap();
+            let session = runtime.store.load(&init.upload_id).await.unwrap().unwrap();
+            let backend = runtime.backend.clone();
             let manager = ResumableManager::new(
                 runtime.backend,
                 runtime.store,
@@ -2733,6 +2747,23 @@ async fn b2_primary_historical_session_waits_for_primary_settlement_then_reuses_
                 "old GCS writes cannot bypass a partial new primary admission"
             );
             assert_eq!(f.objects.lock().unwrap().writes, ["b2"]);
+            if mode == WriteMode::B2Primary {
+                f.storage
+                    .clone()
+                    .with_gcs_backup_enabled(false)
+                    .put(
+                        &hash,
+                        Bytes::from_static(b"original"),
+                        "application/octet-stream",
+                        Some(&new_owner),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    backend.finalize(&session).await.is_err(),
+                    "a B2-only receipt must not complete a legacy GCS session"
+                );
+            }
             f.storage
                 .put(
                     &hash,
