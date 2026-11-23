@@ -48,6 +48,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::filter::Directive;
 
 const DEFAULT_UPLOAD_ROUTE_MAX_BODY_SIZE: u64 = 1024 * 1024;
+const HETZNER_TRANSCODE_ORIGIN: &str = "https://transcoder-worker.divine.video";
+const TRANSCODE_ADMISSION_HEADER: &str = "x-divine-transcode-admission";
 
 // Configuration
 #[derive(Clone)]
@@ -59,6 +61,7 @@ struct Config {
     port: u16,
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
+    transcode_admission_credential: Option<reqwest::header::HeaderValue>,
     transcriber_url: Option<String>,
     /// Self-hosted detector invoked for every newly stored video. The request
     /// is best-effort and runs off the upload response path.
@@ -72,8 +75,22 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        let transcode_admission_credential = match env::var("TRANSCODE_ADMISSION_SECRET") {
+            Ok(secret) => {
+                let secret = secret.trim();
+                if secret.is_empty() {
+                    return Err(anyhow!("TRANSCODE_ADMISSION_SECRET is empty"));
+                }
+                let mut header = reqwest::header::HeaderValue::from_str(secret)
+                    .map_err(|_| anyhow!("TRANSCODE_ADMISSION_SECRET is invalid"))?;
+                header.set_sensitive(true);
+                Some(header)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(_) => return Err(anyhow!("TRANSCODE_ADMISSION_SECRET is invalid")),
+        };
+        Ok(Self {
             media_write_provider: env::var("MEDIA_WRITE_PROVIDER").unwrap_or_else(|_| "gcs".into()),
             gcs_bucket: env::var("GCS_BUCKET")
                 .unwrap_or_else(|_| "divine-blossom-media".to_string()),
@@ -88,6 +105,7 @@ impl Config {
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
             // URL of the divine-transcoder service for HLS generation
             transcoder_url: env::var("TRANSCODER_URL").ok(),
+            transcode_admission_credential,
             // URL of the transcription service (defaults to TRANSCODER_URL when not explicitly set)
             transcriber_url: env::var("TRANSCRIBER_URL")
                 .ok()
@@ -112,7 +130,7 @@ impl Config {
                     .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
                 load_resumable_max_request_body_size(),
             ),
-        }
+        })
     }
 }
 
@@ -409,7 +427,7 @@ async fn main() -> Result<()> {
         .init();
 
     resources::validate()?;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     let port = config.port;
 
     // Initialize GCS client
@@ -1057,13 +1075,21 @@ async fn process_upload(
         && processing_outbox.is_none()
         && thumbnail::is_video_type(&content_type)
     {
-        if let Some(ref transcoder_url) = state.config.transcoder_url {
+        let admission_credential = state.config.transcode_admission_credential.clone();
+        let transcoder_url = if admission_credential.is_some() {
+            Some(HETZNER_TRANSCODE_ORIGIN)
+        } else {
+            state.config.transcoder_url.as_deref()
+        };
+        if let Some(transcoder_url) = transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
-            let transcoder_url = transcoder_url.clone();
+            let transcoder_url = transcoder_url.to_owned();
             let hash = sha256_hash.clone();
             let owner = auth_event.pubkey.clone();
             tokio::spawn(async move {
-                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                if let Err(e) =
+                    trigger_transcoding(&transcoder_url, &hash, &owner, admission_credential).await
+                {
                     error!("Failed to trigger transcoding for {}: {}", hash, e);
                 }
             });
@@ -2302,6 +2328,7 @@ mod tests {
                 port: 0,
                 migration_nsec: None,
                 transcoder_url: None,
+                transcode_admission_credential: None,
                 transcriber_url: transcriber_url.map(str::to_string),
                 ai_detector_base_url: None,
                 transcribe_shared_secret: Some("secret".to_string()),
@@ -3144,26 +3171,51 @@ fn is_transcribable_type(content_type: &str) -> bool {
 
 /// Trigger HLS transcoding for a video (fire-and-forget)
 /// Sends a POST request to the divine-transcoder service
-async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> Result<()> {
+async fn trigger_transcoding(
+    transcoder_url: &str,
+    hash: &str,
+    owner: &str,
+    admission_credential: Option<reqwest::header::HeaderValue>,
+) -> Result<()> {
     info!(
         "Triggering HLS transcoding for {} via {}",
         hash, transcoder_url
     );
 
-    let client = reqwest::Client::new();
+    let authenticated = admission_credential.is_some();
+    let (client, path) = if authenticated {
+        (
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(12))
+                .build()?,
+            "/transcode/queue",
+        )
+    } else {
+        (reqwest::Client::new(), "/transcode")
+    };
     let transcode_request = serde_json::json!({
         "hash": hash,
         "owner": owner
     });
 
-    let response = client
-        .post(format!("{}/transcode", transcoder_url))
-        .header("Content-Type", "application/json")
-        .json(&transcode_request)
+    let mut request = client
+        .post(format!("{transcoder_url}{path}"))
+        .json(&transcode_request);
+    if let Some(credential) = admission_credential {
+        request = request.header(TRANSCODE_ADMISSION_HEADER, credential);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| anyhow!("Failed to call transcoder: {}", e))?;
 
+    if authenticated && response.status() != reqwest::StatusCode::ACCEPTED {
+        return Err(anyhow!(
+            "Transcode admission rejected ({})",
+            response.status()
+        ));
+    }
     if response.status().is_success() {
         info!("Transcoding triggered successfully for {}", hash);
         Ok(())
