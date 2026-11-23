@@ -14,6 +14,10 @@ mod resumable;
 mod server;
 mod storage;
 mod thumbnail;
+mod video_processing;
+
+#[cfg(test)]
+mod video_processing_tests;
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -244,6 +248,7 @@ fn cors_allowed_request_headers() -> Vec<HeaderName> {
         header::CONTENT_TYPE,
         header::CONTENT_RANGE,
         HeaderName::from_static("x-sha256"),
+        HeaderName::from_static(video_processing::HEADER),
         HeaderName::from_static("x-request-id"),
     ]
 }
@@ -679,7 +684,9 @@ async fn handle_upload(
                 return response;
             }
             error!("Upload error: {}", e);
-            let status = if e.is::<outbox::ThumbnailPending>() {
+            let status = if e.is::<video_processing::Error>() {
+                StatusCode::BAD_REQUEST
+            } else if e.is::<outbox::ThumbnailPending>() {
                 StatusCode::SERVICE_UNAVAILABLE
             } else if e.is::<outbox::IntentConflict>() {
                 StatusCode::CONFLICT
@@ -734,6 +741,9 @@ async fn handle_resumable_init(
     headers: axum::http::HeaderMap,
     Json(request): Json<resumable::ResumableUploadInitRequest>,
 ) -> Response {
+    if let Err(error) = video_processing::VideoProcessing::for_init(&headers) {
+        return resumable_error_response(resumable::ResumableError::BadRequest(error.to_string()));
+    }
     let auth_event = match validate_auth(&headers, "upload") {
         Ok(event) => event,
         Err(error) => return auth_error_response(error),
@@ -861,6 +871,9 @@ async fn handle_resumable_complete(
     Path(upload_id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if let Err(error) = video_processing::VideoProcessing::for_upload(&headers, &state).await {
+        return resumable_error_response(resumable::ResumableError::BadRequest(error.to_string()));
+    }
     let auth_event = match validate_auth(&headers, "upload") {
         Ok(event) => event,
         Err(error) => return auth_error_response(error),
@@ -918,6 +931,7 @@ async fn process_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<UploadResponse> {
+    let video_processing = video_processing::VideoProcessing::for_upload(&headers, &state).await?;
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
     let _permit = resources::acquire().await?;
@@ -1024,7 +1038,10 @@ async fn process_upload(
     };
 
     // Trigger HLS transcoding for videos (fire-and-forget)
-    if processing_outbox.is_none() && thumbnail::is_video_type(&content_type) {
+    if video_processing != video_processing::VideoProcessing::CopyOnly
+        && processing_outbox.is_none()
+        && thumbnail::is_video_type(&content_type)
+    {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
