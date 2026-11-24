@@ -1620,13 +1620,14 @@ async fn thumbnail_response(
     // missing video, before any cache read or generation (issue #52).
     match state.config.thumbnail_auth.decide(&headers) {
         thumbnail_auth::Decision::Allow => {}
-        thumbnail_auth::Decision::AllowUnauthenticated => {
+        thumbnail_auth::Decision::AllowUnauthenticated(reason) => {
             info!(
                 request_id = %request_log::correlation_id(&headers),
-                "Thumbnail served without the service token (not yet required)"
+                reason = reason.label(),
+                "Thumbnail served without a valid service token (not yet required)"
             );
         }
-        thumbnail_auth::Decision::Reject => return thumbnail_not_found(),
+        thumbnail_auth::Decision::Reject(_) => return thumbnail_not_found(),
     }
 
     // Validate hash format (64 hex characters)
@@ -2124,6 +2125,7 @@ mod tests {
     async fn required_thumbnail_token_serves_the_cache_hit_with_the_token() {
         use axum::response::IntoResponse;
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let authenticated_before = crate::thumbnail_auth::counts().authenticated;
         let (endpoint, _hits, server) = counting_thumbnail_storage().await;
         let state = thumbnail_state(
             endpoint,
@@ -2141,6 +2143,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"prior-jpeg");
+        assert!(crate::thumbnail_auth::counts().authenticated > authenticated_before);
         server.abort();
     }
 
@@ -2153,7 +2156,7 @@ mod tests {
             endpoint,
             crate::thumbnail_auth::Policy::Observe("svc-token".into()),
         );
-        let (before, _) = crate::thumbnail_auth::counts();
+        let before = crate::thumbnail_auth::counts().unauthenticated_missing;
         let response = super::handle_thumbnail_generate(
             State(state),
             axum::extract::Path("a".repeat(64)),
@@ -2162,7 +2165,7 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let (after, _) = crate::thumbnail_auth::counts();
+        let after = crate::thumbnail_auth::counts().unauthenticated_missing;
         assert!(after > before);
         server.abort();
     }
@@ -2321,6 +2324,7 @@ mod tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("# TYPE divine_thumbnail_unauthenticated_total counter\n"));
         assert!(body.contains("# TYPE divine_thumbnail_rejected_total counter\n"));
+        assert!(body.contains("# TYPE divine_thumbnail_authenticated_total counter\n"));
     }
 
     #[tokio::test]

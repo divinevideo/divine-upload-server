@@ -174,29 +174,67 @@ gate, admin) before it asks this service for one, then calls
 `GET /thumbnail/:hash` on the public upload host. This service cannot read that
 moderation state, so without a credential anyone holding a banned or
 age-restricted video's hash could fetch its frame here. Blossom therefore sends
-a shared token in `X-Divine-Thumbnail-Token`, and this service can require it.
+a shared token in `X-Divine-Thumbnail-Token`, and this service can require it
+(issue #52).
 
 | `THUMBNAIL_SERVICE_TOKEN` | `THUMBNAIL_TOKEN_REQUIRED` | Behavior |
 | --- | --- | --- |
 | unset | unset or `false` | Unchanged: every request is served. Startup logs a warning that the route is unauthenticated. |
-| set | unset or `false` | Every request is served. Requests without a valid token are logged and counted in `divine_thumbnail_unauthenticated_total`. |
-| set | `true` | Requests without a valid token get the same `404` as a missing video, before any cache read or generation, and are counted in `divine_thumbnail_rejected_total`. |
+| set | unset or `false` | Every request is served. Requests without a valid token are logged with their reason and request id. |
+| set | `true` | Requests without a valid token get the same `404` as a missing video, before any cache read or generation. |
 | unset | `true` | The server refuses to start. |
 
-Whenever a token is configured, every `/thumbnail/:hash` response (served,
-refused or failed) carries `Cache-Control: private, no-store` and
-`Vary: X-Divine-Thumbnail-Token`, so no shared cache can hand an authorized
-response to an unauthenticated caller or keep serving a refusal.
+The token must be visible ASCII with no spaces, or the server refuses to start.
+It is compared in constant time and never logged. Whenever a token is
+configured, every `/thumbnail/:hash` response (served, refused or failed)
+carries `Cache-Control: private, no-store` and `Vary: X-Divine-Thumbnail-Token`,
+so no shared cache can hand an authorized response to an unauthenticated caller
+or keep serving a refusal.
 
-The token is compared in constant time and never logged. `backfill-thumbnails.py`
-sends it when `THUMBNAIL_SERVICE_TOKEN` is set in its environment.
+The internal metrics listener counts every request once a token is configured:
 
-Rollout: deploy with the token and the flag off, configure the same token in
-Blossom's `blossom_secrets` store as `thumbnail_service_token`, deploy Blossom,
-wait for `divine_thumbnail_unauthenticated_total` to stop increasing, then set
-`THUMBNAIL_TOKEN_REQUIRED=true`. In production the token comes from GCP Secret
-Manager through an External Secrets binding in the `divine-upload-server`
-manifests in `divine-iac-coreconfig`, like the service's other secrets.
+| Counter | Meaning |
+| --- | --- |
+| `divine_thumbnail_authenticated_total` | Carried the valid token. This is Blossom's traffic once it sends the token. |
+| `divine_thumbnail_unauthenticated_total{reason="missing"}` | Served without any token (observe mode). |
+| `divine_thumbnail_unauthenticated_total{reason="invalid"}` | Served with a wrong token (observe mode). Nonzero means a copy of the secret doesn't match. |
+| `divine_thumbnail_rejected_total{reason="missing"\|"invalid"}` | Refused (required mode). |
+
+`backfill-thumbnails.py` sends the token when `THUMBNAIL_SERVICE_TOKEN` is set
+in its environment. It warns at start when the token is unset (after the flip,
+each regeneration would fail as `regenerate:404`) and when the token would go to
+a non-default `--upload-url`.
+
+### Rollout
+
+The token comes from GCP Secret Manager, which holds the authoritative copy,
+through an External Secrets binding in the `divine-upload-server` manifests in
+`divine-iac-coreconfig`. The same value goes into Blossom's Fastly
+`blossom_secrets` store as `thumbnail_service_token`.
+
+1. Deploy with the token set and the flag off (observe).
+2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
+   change that sends it.
+3. Flip only when `divine_thumbnail_authenticated_total` rises with Blossom's
+   on-demand thumbnail generation, `reason="invalid"` stays at zero, and any
+   remaining `reason="missing"` hits are traced to callers other than Blossom
+   (Blossom's calls carry `x-request-id: blossom-thumbnail`; other callers log their own id or `-`).
+   `missing` may never reach zero on a public route, so it is not the criterion.
+4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
+
+Rolling back means setting `THUMBNAIL_TOKEN_REQUIRED=false` in
+`divine-iac-coreconfig` and a manual ArgoCD sync, so it is not instant. While a
+wrong flip is live, only thumbnails not yet in storage fail: Blossom serves
+stored thumbnails directly and edge-caches the resulting 404s for about a minute.
+
+### Rotating the token
+
+The token is read once at startup and there is a single accepted value, so
+rotation goes through observe mode: set `THUMBNAIL_TOKEN_REQUIRED=false` and
+roll the pods, update the value in GCP Secret Manager and Fastly
+`blossom_secrets`, roll the pods again once External Secrets has refreshed (up
+to an hour, or force a refresh), check that `authenticated_total` rises with
+`reason="invalid"` at zero, then set the flag back to `true`.
 
 ## B2 primary with optional synchronous GCS backup
 
