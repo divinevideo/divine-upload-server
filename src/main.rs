@@ -1520,6 +1520,30 @@ async fn download_best_available_media_bytes(
     ))
 }
 
+async fn read_cached_thumbnail_response(
+    media_storage: &storage::MediaStorage,
+    thumb_path: &str,
+) -> Option<Response> {
+    match media_storage.stat(thumb_path).await {
+        Ok(Some(_)) => match media_storage.read_verified(thumb_path).await {
+            Ok(data) => {
+                Some((StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data).into_response())
+            }
+            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+                warn!("Thumbnail cache read failed; attempting regeneration");
+                None
+            }
+            Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+        },
+        Ok(None) => None,
+        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+            warn!("Thumbnail cache lookup failed; attempting regeneration");
+            None
+        }
+        Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+    }
+}
+
 /// On-demand thumbnail generation endpoint
 /// Resolves the recorded original, generates a thumbnail, and preserves its storage policy.
 async fn handle_thumbnail_generate(
@@ -1546,22 +1570,8 @@ async fn handle_thumbnail_generate(
     };
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
-    match media_storage.stat(&thumb_path).await {
-        Ok(Some(_)) => match media_storage.read_verified(&thumb_path).await {
-            Ok(data) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
-                    .into_response()
-            }
-            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-                warn!("Thumbnail cache read failed; attempting regeneration");
-            }
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-        },
-        Ok(None) => {}
-        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-            warn!("Thumbnail cache lookup failed; attempting regeneration");
-        }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    if let Some(response) = read_cached_thumbnail_response(&media_storage, &thumb_path).await {
+        return response;
     }
 
     // Cache hits do not occupy expensive thumbnail generation admission.
@@ -1575,6 +1585,12 @@ async fn handle_thumbnail_generate(
                 .into_response()
         }
     };
+    // Re-check after waiting so a burst for the same hash reuses the generated
+    // thumbnail written by an earlier request instead of re-running ffmpeg.
+    if let Some(response) = read_cached_thumbnail_response(&media_storage, &thumb_path).await {
+        drop(permit);
+        return response;
+    }
     // Download the original blob, or fall back to the best available HLS transport stream.
     let (video_data, source_object) = match download_best_available_media_bytes(
         &media_storage,
@@ -1948,6 +1964,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"prior-jpeg");
+        server.abort();
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn queued_thumbnail_request_uses_cache_hit_after_waiting() {
+        use axum::{http::Uri, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut permits = Vec::new();
+        while let Ok(permit) = crate::resources::try_acquire_thumbnail() {
+            permits.push(permit);
+        }
+
+        let cache_ready = Arc::new(AtomicBool::new(false));
+        let video_fetched = Arc::new(AtomicBool::new(false));
+        let first_miss = Arc::new(tokio::sync::Notify::new());
+
+        let app = Router::new().route(
+            "/*path",
+            get({
+                let cache_ready = cache_ready.clone();
+                let video_fetched = video_fetched.clone();
+                let first_miss = first_miss.clone();
+                move |uri: Uri| {
+                    let cache_ready = cache_ready.clone();
+                    let video_fetched = video_fetched.clone();
+                    let first_miss = first_miss.clone();
+                    async move {
+                        if uri.path().contains("b2-primary-writes") {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                            )
+                                .into_response();
+                        }
+                        if uri.path().ends_with(".jpg") {
+                            if !cache_ready.load(Ordering::SeqCst) {
+                                first_miss.notify_one();
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                                )
+                                    .into_response();
+                            }
+                            if uri.query().unwrap_or_default().contains("alt=media") {
+                                return "cached-after-wait".into_response();
+                            }
+                            return Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"17","contentType":"image/jpeg"}))
+                                .into_response();
+                        }
+                        video_fetched.store(true, Ordering::SeqCst);
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+
+        let request_task = tokio::spawn(async move {
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("b".repeat(64)))
+                .await
+                .into_response()
+        });
+
+        first_miss.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while crate::resources::thumbnail_waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued request should enter thumbnail wait queue");
+
+        cache_ready.store(true, Ordering::SeqCst);
+        drop(permits.pop());
+
+        let response = request_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"cached-after-wait");
+        assert!(!video_fetched.load(Ordering::SeqCst));
         server.abort();
         drop(permits);
     }

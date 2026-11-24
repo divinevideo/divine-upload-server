@@ -281,7 +281,7 @@ impl ThumbnailAdmission {
 
     fn metrics(&self) -> String {
         let active = self.capacity - self.active.available_permits();
-        let waiting = self.wait_capacity - self.waiting.available_permits();
+        let waiting = self.waiting_count();
         format!(
             "# HELP divine_thumbnail_active Thumbnail requests holding an extraction slot.\n\
              # TYPE divine_thumbnail_active gauge\n\
@@ -294,6 +294,10 @@ impl ThumbnailAdmission {
              divine_thumbnail_capacity {}\n",
             self.capacity
         )
+    }
+
+    fn waiting_count(&self) -> usize {
+        self.wait_capacity - self.waiting.available_permits()
     }
 
     #[cfg(test)]
@@ -377,6 +381,10 @@ pub async fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
 #[cfg(test)]
 pub fn try_acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
     THUMBNAIL_ADMISSION.try_acquire()
+}
+#[cfg(test)]
+pub fn thumbnail_waiting_count() -> usize {
+    THUMBNAIL_ADMISSION.waiting_count()
 }
 pub fn acquire_mirror() -> Result<OwnedSemaphorePermit> {
     acquire_from(MIRROR_SLOTS.clone())
