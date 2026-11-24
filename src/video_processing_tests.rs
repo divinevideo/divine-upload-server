@@ -459,3 +459,65 @@ async fn copy_only_non_ascii_header_fails_without_echoing_input() {
     assert!(f.requests.lock().unwrap().is_empty());
     server.abort();
 }
+
+#[tokio::test]
+async fn authenticated_hls_admission_requires_202_and_never_follows_redirects() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let unexpected = Arc::new(AtomicUsize::new(0));
+    let routes = Router::new()
+        .route(
+            "/transcode/queue",
+            post({
+                let calls = calls.clone();
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(headers["x-divine-transcode-admission"], "test-admission");
+                        assert_eq!(
+                            body,
+                            serde_json::json!({"hash": "synthetic", "owner": "owner"})
+                        );
+                        match calls.fetch_add(1, Ordering::Relaxed) {
+                            0 => StatusCode::ACCEPTED.into_response(),
+                            1 => (
+                                StatusCode::TEMPORARY_REDIRECT,
+                                [(header::LOCATION, "/redirect-target")],
+                            )
+                                .into_response(),
+                            _ => StatusCode::OK.into_response(),
+                        }
+                    }
+                }
+            }),
+        )
+        .fallback({
+            let unexpected = unexpected.clone();
+            move || {
+                let unexpected = unexpected.clone();
+                async move {
+                    unexpected.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::NOT_FOUND
+                }
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let submit = || {
+        trigger_transcoding(
+            &endpoint,
+            "synthetic",
+            "owner",
+            Some(reqwest::header::HeaderValue::from_static("test-admission")),
+        )
+    };
+
+    assert!(submit().await.is_ok());
+    assert!(submit().await.is_err());
+    assert!(submit().await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+    server.abort();
+}
