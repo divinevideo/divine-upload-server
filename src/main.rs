@@ -2359,6 +2359,55 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn thumbnail_route_checks_token_before_hash_validation() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+        let uri = "/thumbnail/not-a-hash";
+        let cases = [
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                Some("wrong"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                Some("svc-token"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Open,
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (policy, token, expected) in cases {
+            let mode = policy.mode();
+            let app = super::build_router(thumbnail_state(endpoint.clone(), policy));
+            let mut request = Request::get(uri);
+            if let Some(token) = token {
+                request = request.header(crate::thumbnail_auth::HEADER, token);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{mode} {token:?}");
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
     fn assert_not_shared_cacheable(response: &axum::response::Response, case: &str) {
         assert_eq!(
             response

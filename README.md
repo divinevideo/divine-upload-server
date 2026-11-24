@@ -234,28 +234,29 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
 1. Deploy with the token set and the flag off (observe).
 2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
    change that sends it.
-3. Flip only after confirming both upload receivers are authenticating verified
-   Blossom requests:
-   - On `divine-upload-server` (GKE): corroborate Blossom edge logs for on-demand
-     thumbnail fetches against `divine_thumbnail_authenticated_total` and the
-     origin request logs carrying `blossom-thumbnail` or
-     `blossom-thumbnail-<id>`, and confirm no known Blossom request appears in
-     this service's observe-mode unauthenticated logs (`"Thumbnail served
-     without a valid service token (not yet required)"`, logging `request_id`
-     and `reason`).
+3. Flip each receiver only after confirming known Blossom requests are
+   authenticated on it, rather than gating on global counters that include
+   every caller of the public route:
+   - On `divine-upload-server` (GKE): start from thumbnail generations in
+     Blossom's own edge logs, find their ids in this service's access log
+     (matching on the truncated prefix) alongside
+     `divine_thumbnail_authenticated_total`, and confirm none of them appears on
+     a `"Thumbnail served without a valid service token (not yet required)"`
+     line (which logs `request_id` and `reason`).
    - On `blossom-upload-rust` (Cloud Run): confirm authenticated Blossom
      requests using its own observe-mode logging/metrics as documented in
      `divinevideo/divine-blossom#417`.
 
-   Treat aggregate
+   Blossom pins an id on every request before routing, and its viewer `GET` and
+   `HEAD` calls (its only callers of this route) send
+   `x-request-id: blossom-thumbnail-<Blossom request id>` (truncated to 64
+   characters in upload logs; a bare `blossom-thumbnail` means the id had no
+   usable characters). Any caller can send any `x-request-id`, so always start
+   from Blossom's edge logs before counting a hit as Blossom's. Treat aggregate
    `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
-   `reason="missing"` rates as diagnostic signals rather than sole gates (any
-   caller on the public route can send an invalid or missing header). Blossom's
-   viewer `GET` and `HEAD` calls carry
-   `x-request-id: blossom-thumbnail-<Blossom request id>` when an edge request
-   id is present (truncated to 64 characters in upload logs), while
-   archive-import calls and viewer calls without a request id send bare
-   `blossom-thumbnail`; other callers log their own caller-supplied id or `-`.
+   `reason="missing"` rates as diagnostic signals rather than sole gates: new
+   `reason="invalid"` increments point to a mismatched secret copy, and
+   `reason="missing"` may never reach zero on a public route.
 4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
 
 Rolling back means setting `THUMBNAIL_TOKEN_REQUIRED=false` in
@@ -274,8 +275,12 @@ token is required again:
    Cloud Run `blossom-upload-rust`, which serves the same route.
 3. Fastly `blossom_secrets` (`thumbnail_service_token`), which Blossom sends.
 
-The token is read once at startup and a single value is accepted, so rotate
-through observe mode, changing the receivers before the sender:
+The token is read once at startup and a single value is accepted, so rotation
+as documented here goes through observe mode, which temporarily reopens the
+route to callers without the token while it lasts. Whether that window is
+acceptable, or whether rotation requires overlapping tokens so enforcement never
+lapses, is a Platform decision. With the window, change the receivers before the
+sender:
 
 1. Set `THUMBNAIL_TOKEN_REQUIRED=false` on both upload services and roll them.
    From here no copy can break a request.
@@ -285,14 +290,11 @@ through observe mode, changing the receivers before the sender:
    shows as `reason="invalid"` but is served.
 3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
    `authenticated` rises.
-4. Set the flag back to `true` only after verifying both upload receivers
-   authenticate known Blossom requests (on `divine-upload-server`, corroborate
-   Blossom edge logs against `divine_thumbnail_authenticated_total`,
-   `blossom-thumbnail` / `blossom-thumbnail-<id>` origin request logs, and
-   zero Blossom-originated hits in `"Thumbnail served without a valid service
-   token (not yet required)"`; on `blossom-upload-rust`, verify via its own
-   signals per `divinevideo/divine-blossom#417`, rather than relying solely on
-   the public `reason="invalid"` aggregate counter).
+4. Set the flag back to `true` on each service only after confirming Blossom's
+   requests authenticate on it as in [Rollout](#rollout) step 3, and recheck
+   every other supported caller (such as `backfill-thumbnails.py`): a caller
+   that sends no token shows only as `reason="missing"`, never `invalid`, so
+   `reason="invalid"` stopping is not proof by itself.
 
 ## B2 primary with optional synchronous GCS backup
 

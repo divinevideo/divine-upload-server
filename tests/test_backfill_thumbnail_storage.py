@@ -1,3 +1,4 @@
+import email.message
 import importlib.util
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -96,9 +97,13 @@ class ThumbnailHttpHelperTests(unittest.TestCase):
         class StubHTTPSHandler(urllib.request.HTTPSHandler):
             def https_open(self, req):
                 seen_urls.append(req.full_url)
+                # Use a real header object so urllib's redirect handler can look
+                # up "location" and the test fails if follow_redirects=False is dropped.
+                headers = email.message.Message()
+                headers['Location'] = 'https://evil.example/steal'
                 resp = urllib.request.addinfourl(
                     BytesIO(b''),
-                    {'Location': 'https://evil.example/steal'},
+                    headers,
                     req.full_url,
                     302,
                 )
@@ -129,9 +134,11 @@ class ThumbnailHttpHelperTests(unittest.TestCase):
     def test_request_with_headers_returns_lowercased_response_headers(self):
         class StubHTTPSHandler(urllib.request.HTTPSHandler):
             def https_open(self, req):
+                headers = email.message.Message()
+                headers['X-Divine-Thumbnail-Auth'] = ' verified '
                 resp = urllib.request.addinfourl(
                     BytesIO(b''),
-                    {'X-Divine-Thumbnail-Auth': ' verified '},
+                    headers,
                     req.full_url,
                     204,
                 )
@@ -248,6 +255,27 @@ class ThumbnailPreflightTests(unittest.TestCase):
         req_headers_mock.assert_not_called()
         req_mock.assert_not_called()
         process_mock.assert_not_called()
+
+    def test_workers_get_the_resolved_headers(self):
+        with (
+            patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': ' svc-token '}, clear=True),
+            patch('sys.argv', ['backfill-thumbnails.py', 'a' * 64]),
+            patch.object(
+                helper,
+                'request_with_headers',
+                return_value=(204, {'x-divine-thumbnail-auth': 'verified'}),
+            ),
+            patch.object(
+                helper,
+                'process_hash',
+                return_value=('a' * 64, None),
+            ) as process_mock,
+        ):
+            helper.main()
+        self.assertEqual(
+            process_mock.call_args.kwargs['headers'],
+            {'X-Divine-Thumbnail-Token': 'svc-token'},
+        )
 
 
 class ThumbnailServiceTokenTests(unittest.TestCase):
