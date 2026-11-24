@@ -1360,7 +1360,12 @@ async fn extract_and_upload_thumbnail(
         // This explicit upload retry can still repair a missing dual replica.
         client.read(&thumb_path).await?
     } else {
-        Bytes::from(thumbnail::extract_thumbnail(video_data)?.data)
+        let video_bytes = video_data.to_vec();
+        let extracted =
+            tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_bytes))
+                .await
+                .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))??;
+        Bytes::from(extracted.data)
     };
     let sha256 = hex::encode(Sha256::digest(&bytes));
     let size = bytes.len() as u64;
@@ -1555,7 +1560,7 @@ async fn handle_thumbnail_generate(
     }
 
     // Cache hits do not occupy expensive thumbnail generation admission.
-    let _permit = match resources::acquire_thumbnail() {
+    let _permit = match resources::acquire_thumbnail().await {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1595,22 +1600,28 @@ async fn handle_thumbnail_generate(
         );
     }
 
-    // Generate thumbnail
-    let thumb_result = match thumbnail::extract_thumbnail(&video_data) {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Failed to generate thumbnail for {}: {}", hash, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Failed to generate thumbnail".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
-        }
-    };
+    // Generate thumbnail off the Tokio async worker pool so synchronous ffmpeg
+    // execution never stalls concurrent uploads or health checks.
+    let thumb_result =
+        match tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
+            .await
+            .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+            .and_then(|res| res)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to generate thumbnail for {}: {}", hash, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(ErrorResponse {
+                        error: "Failed to generate thumbnail".to_string(),
+                    })
+                    .into_response(),
+                )
+                    .into_response();
+            }
+        };
 
     // Store the thumbnail using the original upload policy.
     let thumb_path = format!("{}.jpg", hash);
@@ -1850,8 +1861,8 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let thumbnail =
-            crate::resources::acquire_thumbnail().expect("mirrors cannot take thumbnail admission");
+        let thumbnail = crate::resources::try_acquire_thumbnail()
+            .expect("mirrors cannot take thumbnail admission");
         drop(thumbnail);
         drop(mirrors);
     }
@@ -1895,7 +1906,7 @@ mod tests {
         use axum::{http::Uri, response::IntoResponse};
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let mut permits = Vec::new();
-        while let Ok(permit) = crate::resources::acquire_thumbnail() {
+        while let Ok(permit) = crate::resources::try_acquire_thumbnail() {
             permits.push(permit);
         }
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
