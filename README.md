@@ -246,6 +246,7 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
    - On `blossom-upload-rust` (Cloud Run): confirm authenticated Blossom
      requests using its own observe-mode logging/metrics as documented in
      `divinevideo/divine-blossom#417`.
+
    Treat aggregate
    `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
    `reason="missing"` rates as diagnostic signals rather than sole gates (any
