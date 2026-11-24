@@ -389,6 +389,7 @@ pub fn metrics_router() -> axum::Router {
         axum::routing::get(|| async {
             let mut body = UPLOAD_ADMISSION.metrics();
             body.push_str(&THUMBNAIL_ADMISSION.metrics());
+            body.push_str(&crate::thumbnail_auth::metrics());
             (
                 [(
                     axum::http::header::CONTENT_TYPE,
