@@ -247,12 +247,13 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
      requests using its own observe-mode logging/metrics as documented in
      `divinevideo/divine-blossom#417`.
 
-   Blossom pins an id on every request before routing, and its viewer `GET` and
-   `HEAD` calls (its only callers of this route) send
+   Blossom pins an id on every viewer request before routing, so its viewer
+   `GET` and `HEAD` calls send
    `x-request-id: blossom-thumbnail-<Blossom request id>` (truncated to 64
-   characters in upload logs; a bare `blossom-thumbnail` means the id had no
-   usable characters). Any caller can send any `x-request-id`, so always start
-   from Blossom's edge logs before counting a hit as Blossom's. Treat aggregate
+   characters in upload logs), while archive-import calls and ids with no usable
+   characters send bare `blossom-thumbnail`. Any caller can send any
+   `x-request-id`, so always start from Blossom's edge logs before counting a
+   hit as Blossom's. Treat aggregate
    `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
    `reason="missing"` rates as diagnostic signals rather than sole gates: new
    `reason="invalid"` increments point to a mismatched secret copy, and
