@@ -208,10 +208,13 @@ a non-default `--upload-url`.
 
 ### Rollout
 
-The token comes from GCP Secret Manager, which holds the authoritative copy,
-through an External Secrets binding in the `divine-upload-server` manifests in
-`divine-iac-coreconfig`. The same value goes into Blossom's Fastly
-`blossom_secrets` store as `thumbnail_service_token`.
+The token comes from GCP Secret Manager in `dv-platform-prod`, through an
+External Secrets binding in the `divine-upload-server` manifests in
+`divine-iac-coreconfig`. The same value goes into GCP Secret Manager in
+`rich-compiler-479518-d2` for divine-blossom's Cloud Run `blossom-upload-rust`,
+which serves the same route, and into Blossom's Fastly `blossom_secrets` store as
+`thumbnail_service_token`. All three copies are listed under
+[Rotating the token](#rotating-the-token).
 
 1. Deploy with the token set and the flag off (observe).
 2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
