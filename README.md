@@ -234,14 +234,19 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
 1. Deploy with the token set and the flag off (observe).
 2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
    change that sends it.
-3. Flip only after confirming both upload receivers (`divine-upload-server` on
-   GKE and `blossom-upload-rust` on Cloud Run) are authenticating verified Blossom
-   requests: corroborate Blossom edge logs for on-demand thumbnail fetches
-   against `divine_thumbnail_authenticated_total` and the origin request logs
-   carrying `blossom-thumbnail` or `blossom-thumbnail-<id>`, and confirm no
-   known Blossom request appears in observe-mode unauthenticated logs
-   (`"Thumbnail served without a valid service token (not yet required)"` on
-   `divine-upload-server`, logging `request_id` and `reason`). Treat aggregate
+3. Flip only after confirming both upload receivers are authenticating verified
+   Blossom requests:
+   - On `divine-upload-server` (GKE): corroborate Blossom edge logs for on-demand
+     thumbnail fetches against `divine_thumbnail_authenticated_total` and the
+     origin request logs carrying `blossom-thumbnail` or
+     `blossom-thumbnail-<id>`, and confirm no known Blossom request appears in
+     this service's observe-mode unauthenticated logs (`"Thumbnail served
+     without a valid service token (not yet required)"`, logging `request_id`
+     and `reason`).
+   - On `blossom-upload-rust` (Cloud Run): confirm authenticated Blossom
+     requests using its own observe-mode logging/metrics as documented in
+     `divinevideo/divine-blossom#417`.
+   Treat aggregate
    `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
    `reason="missing"` rates as diagnostic signals rather than sole gates (any
    caller on the public route can send an invalid or missing header). Blossom's
@@ -280,12 +285,13 @@ through observe mode, changing the receivers before the sender:
 3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
    `authenticated` rises.
 4. Set the flag back to `true` only after verifying both upload receivers
-   authenticate known Blossom requests (corroborating Blossom edge logs against
-   `divine_thumbnail_authenticated_total`, `blossom-thumbnail` /
-   `blossom-thumbnail-<id>` origin request logs, and zero Blossom-originated
-   hits in `"Thumbnail served without a valid service token (not yet required)"`,
-   rather than relying solely on the public `reason="invalid"` aggregate
-   counter).
+   authenticate known Blossom requests (on `divine-upload-server`, corroborate
+   Blossom edge logs against `divine_thumbnail_authenticated_total`,
+   `blossom-thumbnail` / `blossom-thumbnail-<id>` origin request logs, and
+   zero Blossom-originated hits in `"Thumbnail served without a valid service
+   token (not yet required)"`; on `blossom-upload-rust`, verify via its own
+   signals per `divinevideo/divine-blossom#417`, rather than relying solely on
+   the public `reason="invalid"` aggregate counter).
 
 ## B2 primary with optional synchronous GCS backup
 
