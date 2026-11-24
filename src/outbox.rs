@@ -1342,7 +1342,8 @@ pub(crate) mod tests {
                 &storage,
                 "https://media.example",
                 &hash,
-                &bytes
+                bytes.clone(),
+                None,
             )
             .await
             .is_err(),
@@ -1364,7 +1365,8 @@ pub(crate) mod tests {
             &storage,
             "https://media.example",
             &hash,
-            &bytes,
+            bytes.clone(),
+            None,
         )
         .await
         .unwrap();

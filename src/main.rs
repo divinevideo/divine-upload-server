@@ -967,7 +967,7 @@ async fn process_upload(
     let video_processing = video_processing::VideoProcessing::for_upload(&headers, &state).await?;
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
-    let _permit = resources::acquire().await?;
+    let permit = Arc::new(resources::acquire().await?);
 
     // Get content type
     let content_type = headers
@@ -999,6 +999,8 @@ async fn process_upload(
     )
     .await?;
 
+    let all_bytes = Bytes::from(all_bytes);
+
     // GCS retains best-effort thumbnails. Protected dual requests cannot
     // finalize until their exact original and thumbnail copies are recorded.
     let thumbnail_url = if (thumbnail::is_video_type(&content_type)
@@ -1009,7 +1011,8 @@ async fn process_upload(
             &upload_storage,
             &state.config.cdn_base_url,
             &sha256_hash,
-            &all_bytes,
+            all_bytes.clone(),
+            Some(permit.clone()),
         )
         .await
         {
@@ -1351,7 +1354,8 @@ async fn extract_and_upload_thumbnail(
     client: &storage::MediaStorage,
     cdn_base_url: &str,
     hash: &str,
-    video_data: &[u8],
+    video_data: Bytes,
+    upload_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Result<StoredThumbnail> {
     let thumb_path = format!("{}.jpg", hash);
     let bytes = if client.stat(&thumb_path).await?.is_some() {
@@ -1360,11 +1364,12 @@ async fn extract_and_upload_thumbnail(
         // This explicit upload retry can still repair a missing dual replica.
         client.read(&thumb_path).await?
     } else {
-        let video_bytes = video_data.to_vec();
-        let extracted =
-            tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_bytes))
-                .await
-                .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))??;
+        let extracted = tokio::task::spawn_blocking(move || {
+            let _permit = upload_permit;
+            thumbnail::extract_thumbnail(&video_data)
+        })
+        .await
+        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))??;
         Bytes::from(extracted.data)
     };
     let sha256 = hex::encode(Sha256::digest(&bytes));
@@ -1560,7 +1565,7 @@ async fn handle_thumbnail_generate(
     }
 
     // Cache hits do not occupy expensive thumbnail generation admission.
-    let _permit = match resources::acquire_thumbnail().await {
+    let permit = match resources::acquire_thumbnail().await {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1602,26 +1607,28 @@ async fn handle_thumbnail_generate(
 
     // Generate thumbnail off the Tokio async worker pool so synchronous ffmpeg
     // execution never stalls concurrent uploads or health checks.
-    let thumb_result =
-        match tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
-            .await
-            .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
-            .and_then(|res| res)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to generate thumbnail for {}: {}", hash, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    Json(ErrorResponse {
-                        error: "Failed to generate thumbnail".to_string(),
-                    })
-                    .into_response(),
-                )
-                    .into_response();
-            }
-        };
+    // Return the permit to the handler on success so it also covers storage.
+    let (thumb_result, _permit) = match tokio::task::spawn_blocking(move || {
+        thumbnail::extract_thumbnail(&video_data).map(|thumbnail| (thumbnail, permit))
+    })
+    .await
+    .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+    .and_then(|res| res)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to generate thumbnail for {}: {}", hash, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(ErrorResponse {
+                    error: "Failed to generate thumbnail".to_string(),
+                })
+                .into_response(),
+            )
+                .into_response();
+        }
+    };
 
     // Store the thumbnail using the original upload policy.
     let thumb_path = format!("{}.jpg", hash);
@@ -2202,7 +2209,8 @@ mod tests {
             &storage,
             "https://media.example",
             "hash",
-            b"not a decodable video",
+            bytes::Bytes::from_static(b"not a decodable video"),
+            None,
         )
         .await
         .unwrap();
