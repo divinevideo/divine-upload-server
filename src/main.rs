@@ -1586,6 +1586,33 @@ async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
     headers: axum::http::HeaderMap,
+) -> Response {
+    let guarded = !matches!(state.config.thumbnail_auth, thumbnail_auth::Policy::Open);
+    let mut response = thumbnail_response(state, hash, headers)
+        .await
+        .into_response();
+    if guarded {
+        // Once a token decides who gets a thumbnail, no shared cache in front of
+        // this host may store any answer (an authorized 200 must not reach an
+        // unauthenticated caller, and a refusal must not stick), so every
+        // response is private and varies on the token header.
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        headers.append(
+            header::VARY,
+            HeaderValue::from_static(thumbnail_auth::HEADER),
+        );
+    }
+    response
+}
+
+async fn thumbnail_response(
+    state: Arc<AppState>,
+    hash: String,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Blossom decides who may see a thumbnail before it calls this route, so
     // the only caller that should reach storage is the one holding Blossom's
@@ -2167,6 +2194,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(served.status(), StatusCode::OK);
+        server.abort();
+    }
+
+    fn assert_not_shared_cacheable(response: &axum::response::Response, case: &str) {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "{case}"
+        );
+        let vary = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            vary.contains(crate::thumbnail_auth::HEADER),
+            "{case}: vary={vary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_guarded_thumbnail_responses_are_never_shared_cacheable() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let a = "a".repeat(64);
+        for policy in [
+            crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        ] {
+            let mode = policy.mode();
+            let state = thumbnail_state(endpoint.clone(), policy);
+            let mut cases = vec![
+                ("cache hit with token", a.clone(), Some("svc-token")),
+                (
+                    "invalid hash with token",
+                    "zz".to_string(),
+                    Some("svc-token"),
+                ),
+            ];
+            cases.push(if mode == "required" {
+                ("refused without token", a.clone(), None)
+            } else {
+                ("served without token", a.clone(), None)
+            });
+            for (case, hash, token) in cases {
+                let response = super::handle_thumbnail_generate(
+                    State(state.clone()),
+                    axum::extract::Path(hash),
+                    token_headers(token),
+                )
+                .await
+                .into_response();
+                assert_not_shared_cacheable(&response, &format!("{mode}: {case}"));
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn token_guarded_generation_errors_are_never_shared_cacheable() {
+        use axum::{http::Uri, response::IntoResponse};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+            if uri.query().unwrap_or_default().contains("alt=media") {
+                if uri.path().ends_with(".jpg") { return StatusCode::NOT_FOUND.into_response(); }
+                return "not-video".into_response();
+            }
+            if uri.path().ends_with(".jpg") { return StatusCode::NOT_FOUND.into_response(); }
+            Json(serde_json::json!({"name":"fixture","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"9","contentType":"video/mp4"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        );
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(Some("svc-token")),
+        )
+        .await
+        .into_response();
+        assert!(response.status().is_server_error(), "{}", response.status());
+        assert_not_shared_cacheable(&response, "generation failure");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn open_thumbnail_responses_keep_their_existing_headers() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(endpoint, crate::thumbnail_auth::Policy::Open);
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+        assert!(response.headers().get(header::VARY).is_none());
         server.abort();
     }
 

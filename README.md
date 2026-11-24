@@ -183,6 +183,11 @@ a shared token in `X-Divine-Thumbnail-Token`, and this service can require it.
 | set | `true` | Requests without a valid token get the same `404` as a missing video, before any cache read or generation, and are counted in `divine_thumbnail_rejected_total`. |
 | unset | `true` | The server refuses to start. |
 
+Whenever a token is configured, every `/thumbnail/:hash` response (served,
+refused or failed) carries `Cache-Control: private, no-store` and
+`Vary: X-Divine-Thumbnail-Token`, so no shared cache can hand an authorized
+response to an unauthenticated caller or keep serving a refusal.
+
 The token is compared in constant time and never logged. `backfill-thumbnails.py`
 sends it when `THUMBNAIL_SERVICE_TOKEN` is set in its environment.
 
