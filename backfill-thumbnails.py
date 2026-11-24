@@ -173,6 +173,19 @@ def thumbnail_service_headers() -> dict[str, str]:
     return {"X-Divine-Thumbnail-Token": token} if token else {}
 
 
+def thumbnail_token_warnings(upload_url: str) -> list[str]:
+    """Operator warnings about the /thumbnail service token for this run."""
+    if not os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip():
+        return [
+            "warning: THUMBNAIL_SERVICE_TOKEN is not set; once the upload server "
+            "requires it, every regeneration fails as regenerate:404"
+        ]
+    if upload_url.rstrip("/") != DEFAULT_UPLOAD_URL:
+        host = urllib.parse.urlparse(upload_url).netloc or upload_url
+        return [f"warning: sending THUMBNAIL_SERVICE_TOKEN to a non-default upload host: {host}"]
+    return []
+
+
 def process_hash(
     hash_: str, bucket: str, upload_url: str, media_url: str
 ) -> tuple[str, str | None]:
@@ -201,6 +214,8 @@ def process_hash(
 
 def main() -> None:
     args = parse_args()
+    for warning in thumbnail_token_warnings(args.upload_url):
+        print(warning, file=sys.stderr)
     hashes = load_hashes(args)
     total = len(hashes)
 

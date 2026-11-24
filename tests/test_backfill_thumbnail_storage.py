@@ -42,3 +42,23 @@ class ThumbnailServiceTokenTests(unittest.TestCase):
     def test_sends_no_token_header_when_unset(self):
         headers = self.regenerate_headers({})
         self.assertNotIn('X-Divine-Thumbnail-Token', headers)
+
+
+class ThumbnailServiceTokenWarningTests(unittest.TestCase):
+    def test_warns_when_no_token_is_set(self):
+        with patch.dict('os.environ', {}, clear=True):
+            warnings = helper.thumbnail_token_warnings(helper.DEFAULT_UPLOAD_URL)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('THUMBNAIL_SERVICE_TOKEN', warnings[0])
+        self.assertIn('404', warnings[0])
+
+    def test_quiet_with_a_token_for_the_default_host(self):
+        with patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'svc'}, clear=True):
+            self.assertEqual(helper.thumbnail_token_warnings(helper.DEFAULT_UPLOAD_URL), [])
+
+    def test_warns_before_sending_the_token_to_another_host(self):
+        with patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'svc'}, clear=True):
+            warnings = helper.thumbnail_token_warnings('https://elsewhere.example')
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('elsewhere.example', warnings[0])
+        self.assertNotIn('svc', warnings[0])
