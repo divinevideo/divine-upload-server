@@ -218,7 +218,9 @@ through an External Secrets binding in the `divine-upload-server` manifests in
 3. Flip only when `divine_thumbnail_authenticated_total` rises with Blossom's
    on-demand thumbnail generation, `reason="invalid"` stays at zero, and any
    remaining `reason="missing"` hits are traced to callers other than Blossom
-   (Blossom's calls carry `x-request-id: blossom-thumbnail`; other callers log their own id or `-`).
+   (Blossom's calls carry `x-request-id: blossom-thumbnail-<Blossom request id>`,
+   so a hit can be matched to the Blossom request that caused it; other callers
+   log their own id or `-`).
    `missing` may never reach zero on a public route, so it is not the criterion.
 4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
 
@@ -229,12 +231,27 @@ stored thumbnails directly and edge-caches the resulting 404s for about a minute
 
 ### Rotating the token
 
-The token is read once at startup and there is a single accepted value, so
-rotation goes through observe mode: set `THUMBNAIL_TOKEN_REQUIRED=false` and
-roll the pods, update the value in GCP Secret Manager and Fastly
-`blossom_secrets`, roll the pods again once External Secrets has refreshed (up
-to an hour, or force a refresh), check that `authenticated_total` rises with
-`reason="invalid"` at zero, then set the flag back to `true`.
+There are three copies of the one token, and every copy must change before the
+token is required again:
+
+1. GCP Secret Manager in `dv-platform-prod`, read by this service on GKE
+   through External Secrets.
+2. GCP Secret Manager in `rich-compiler-479518-d2`, bound to divine-blossom's
+   Cloud Run `blossom-upload-rust`, which serves the same route.
+3. Fastly `blossom_secrets` (`thumbnail_service_token`), which Blossom sends.
+
+The token is read once at startup and a single value is accepted, so rotate
+through observe mode, changing the receivers before the sender:
+
+1. Set `THUMBNAIL_TOKEN_REQUIRED=false` on both upload services and roll them.
+   From here no copy can break a request.
+2. Update both GCP secrets, then roll this service once External Secrets has
+   refreshed (up to an hour, or force a refresh) and deploy a new
+   `blossom-upload-rust` revision. Blossom still sends the old token, which
+   shows as `reason="invalid"` but is served.
+3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
+   `authenticated` rises and `invalid` stops.
+4. Once `invalid` stays at zero on both services, set the flag back to `true`.
 
 ## B2 primary with optional synchronous GCS backup
 
