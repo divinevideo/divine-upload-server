@@ -1364,12 +1364,11 @@ async fn extract_and_upload_thumbnail(
         // This explicit upload retry can still repair a missing dual replica.
         client.read(&thumb_path).await?
     } else {
-        let extracted = tokio::task::spawn_blocking(move || {
-            let _permit = upload_permit;
+        let extracted = run_blocking_with_permit(upload_permit, move || {
             thumbnail::extract_thumbnail(&video_data)
         })
-        .await
-        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))??;
+        .await?
+        .0;
         Bytes::from(extracted.data)
     };
     let sha256 = hex::encode(Sha256::digest(&bytes));
@@ -1520,6 +1519,18 @@ async fn download_best_available_media_bytes(
     ))
 }
 
+async fn run_blocking_with_permit<P, T, F>(permit: P, work: F) -> Result<(T, P)>
+where
+    P: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || work().map(|value| (value, permit)))
+        .await
+        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+        .and_then(|res| res)
+}
+
 async fn read_cached_thumbnail_response(
     media_storage: &storage::MediaStorage,
     thumb_path: &str,
@@ -1624,27 +1635,24 @@ async fn handle_thumbnail_generate(
     // Generate thumbnail off the Tokio async worker pool so synchronous ffmpeg
     // execution never stalls concurrent uploads or health checks.
     // Return the permit to the handler on success so it also covers storage.
-    let (thumb_result, _permit) = match tokio::task::spawn_blocking(move || {
-        thumbnail::extract_thumbnail(&video_data).map(|thumbnail| (thumbnail, permit))
-    })
-    .await
-    .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
-    .and_then(|res| res)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Failed to generate thumbnail for {}: {}", hash, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Failed to generate thumbnail".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
-        }
-    };
+    let (thumb_result, _permit) =
+        match run_blocking_with_permit(permit, move || thumbnail::extract_thumbnail(&video_data))
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to generate thumbnail for {}: {}", hash, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(ErrorResponse {
+                        error: "Failed to generate thumbnail".to_string(),
+                    })
+                    .into_response(),
+                )
+                    .into_response();
+            }
+        };
 
     // Store the thumbnail using the original upload policy.
     let thumb_path = format!("{}.jpg", hash);
@@ -2071,6 +2079,50 @@ mod tests {
         assert!(!video_fetched.load(Ordering::SeqCst));
         server.abort();
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocking_thumbnail_keeps_permit_until_worker_finishes() {
+        for use_arc_permit in [false, true] {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+            if use_arc_permit {
+                let shared_permit = Arc::new(permit);
+                let future =
+                    super::run_blocking_with_permit(Some(shared_permit.clone()), move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok(())
+                    });
+                let mut future = std::pin::pin!(future);
+                tokio::select! {
+                    _ = &mut future => panic!("blocking work finished before release"),
+                    res = started_rx => res.unwrap(),
+                }
+                drop(shared_permit);
+            } else {
+                let future = super::run_blocking_with_permit(permit, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                });
+                let mut future = std::pin::pin!(future);
+                tokio::select! {
+                    _ = &mut future => panic!("blocking work finished before release"),
+                    res = started_rx => res.unwrap(),
+                }
+            }
+
+            assert_eq!(semaphore.available_permits(), 0);
+            release_tx.send(()).unwrap();
+            let reacquired =
+                tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire_owned())
+                    .await;
+            assert!(matches!(reacquired, Ok(Ok(_))));
+        }
     }
 
     #[test]

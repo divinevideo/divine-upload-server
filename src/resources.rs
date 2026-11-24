@@ -91,6 +91,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_thumbnail_waiter_releases_its_queue_slot_and_metric() {
+        let admission = super::ThumbnailAdmission::new(1, 2, std::time::Duration::from_secs(5));
+        let active = admission.acquire().await.unwrap();
+        {
+            let mut queued = std::pin::pin!(admission.acquire());
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            assert!(admission.metrics().contains("divine_thumbnail_waiting 1\n"));
+        }
+        assert_eq!(admission.waiting.available_permits(), 2);
+        assert!(admission.metrics().contains("divine_thumbnail_waiting 0\n"));
+        drop(active);
+        assert!(admission.metrics().contains("divine_thumbnail_active 0\n"));
+    }
+
+    #[tokio::test]
+    async fn expired_thumbnail_waiters_release_their_queue_slots() {
+        let admission = super::ThumbnailAdmission::new(1, 2, std::time::Duration::ZERO);
+        let active = admission.acquire().await.unwrap();
+        assert!(admission.acquire().await.is_err());
+        assert_eq!(admission.waiting.available_permits(), 2);
+        assert!(admission.metrics().contains("divine_thumbnail_waiting 0\n"));
+
+        drop(active);
+        assert!(admission.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
     async fn pending_session_verification_is_bounded_independently() {
         let admission = super::UploadAdmission::new(1, std::time::Duration::from_secs(5));
         let verification = admission.verify_session().unwrap();
