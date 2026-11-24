@@ -4,14 +4,14 @@ mod tests {
     fn maintenance_and_upload_admission_use_distinct_pools() {
         assert!(!std::sync::Arc::ptr_eq(
             &super::UPLOAD_ADMISSION.active,
-            &super::THUMBNAIL_SLOTS
+            &super::THUMBNAIL_ADMISSION.active
         ));
         assert!(!std::sync::Arc::ptr_eq(
             &super::UPLOAD_ADMISSION.active,
             &super::MIRROR_SLOTS
         ));
         assert!(!std::sync::Arc::ptr_eq(
-            &super::THUMBNAIL_SLOTS,
+            &super::THUMBNAIL_ADMISSION.active,
             &super::MIRROR_SLOTS
         ));
     }
@@ -30,7 +30,7 @@ mod tests {
 
         let mut excess = std::pin::pin!(admission.acquire());
         assert!(matches!(
-            futures::poll!(excess.as_mut()),
+            futures::poll!(excess.as_mut()).map(|res| res.map(|_| ())),
             std::task::Poll::Ready(Err(error)) if error.is::<super::ResourceError>()
         ));
 
@@ -56,6 +56,62 @@ mod tests {
         let active = admission.acquire().await.unwrap();
         assert!(admission.acquire().await.is_err());
         assert_eq!(admission.waiting.available_permits(), 1);
+
+        drop(active);
+        assert!(admission.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn thumbnail_burst_waits_for_capacity_and_excess_requests_shed() {
+        let admission = super::ThumbnailAdmission::new(1, 2, std::time::Duration::from_secs(5));
+        let active = admission.acquire().await.unwrap();
+        let mut queued1 = std::pin::pin!(admission.acquire());
+        let mut queued2 = std::pin::pin!(admission.acquire());
+        assert!(futures::poll!(queued1.as_mut()).is_pending());
+        assert!(futures::poll!(queued2.as_mut()).is_pending());
+
+        let mut excess = std::pin::pin!(admission.acquire());
+        assert!(matches!(
+            futures::poll!(excess.as_mut()),
+            std::task::Poll::Ready(Err(error)) if error.is::<super::ResourceError>()
+        ));
+
+        assert!(admission.metrics().contains("divine_thumbnail_active 1\n"));
+        assert!(admission.metrics().contains("divine_thumbnail_waiting 2\n"));
+        assert!(admission
+            .metrics()
+            .contains("divine_thumbnail_capacity 1\n"));
+
+        drop(active);
+        let admitted1 = queued1.await.unwrap();
+        assert_eq!(admission.waiting.available_permits(), 1);
+        drop(admitted1);
+        let _admitted2 = queued2.await.unwrap();
+        assert_eq!(admission.waiting.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_thumbnail_waiter_releases_its_queue_slot_and_metric() {
+        let admission = super::ThumbnailAdmission::new(1, 2, std::time::Duration::from_secs(5));
+        let active = admission.acquire().await.unwrap();
+        {
+            let mut queued = std::pin::pin!(admission.acquire());
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            assert!(admission.metrics().contains("divine_thumbnail_waiting 1\n"));
+        }
+        assert_eq!(admission.waiting.available_permits(), 2);
+        assert!(admission.metrics().contains("divine_thumbnail_waiting 0\n"));
+        drop(active);
+        assert!(admission.metrics().contains("divine_thumbnail_active 0\n"));
+    }
+
+    #[tokio::test]
+    async fn expired_thumbnail_waiters_release_their_queue_slots() {
+        let admission = super::ThumbnailAdmission::new(1, 2, std::time::Duration::ZERO);
+        let active = admission.acquire().await.unwrap();
+        assert!(admission.acquire().await.is_err());
+        assert_eq!(admission.waiting.available_permits(), 2);
+        assert!(admission.metrics().contains("divine_thumbnail_waiting 0\n"));
 
         drop(active);
         assert!(admission.acquire().await.is_ok());
@@ -111,6 +167,9 @@ mod tests {
             "divine_upload_active",
             "divine_upload_waiting",
             "divine_upload_capacity",
+            "divine_thumbnail_active",
+            "divine_thumbnail_waiting",
+            "divine_thumbnail_capacity",
         ] {
             assert!(body.contains(&format!("# TYPE {metric} gauge\n")));
         }
@@ -156,6 +215,9 @@ pub fn validate() -> Result<()> {
     }
     if positive_setting("MIRROR_FETCH_TIMEOUT_SECS", 120)? > 3600 {
         return Err(anyhow!("MIRROR_FETCH_TIMEOUT_SECS must not exceed 3600"));
+    }
+    if positive_setting("THUMBNAIL_WAIT_SECS", 6)? > 60 {
+        return Err(anyhow!("THUMBNAIL_WAIT_SECS must not exceed 60"));
     }
     Ok(())
 }
@@ -225,6 +287,64 @@ impl UploadAdmission {
     }
 }
 
+struct ThumbnailAdmission {
+    capacity: usize,
+    wait_capacity: usize,
+    active: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+    wait: Duration,
+}
+
+impl ThumbnailAdmission {
+    fn new(concurrency: usize, wait_capacity: usize, wait: Duration) -> Self {
+        Self {
+            capacity: concurrency,
+            wait_capacity,
+            active: Arc::new(Semaphore::new(concurrency)),
+            waiting: Arc::new(Semaphore::new(wait_capacity)),
+            wait,
+        }
+    }
+
+    fn metrics(&self) -> String {
+        let active = self.capacity - self.active.available_permits();
+        let waiting = self.waiting_count();
+        format!(
+            "# HELP divine_thumbnail_active Thumbnail requests holding an extraction slot.\n\
+             # TYPE divine_thumbnail_active gauge\n\
+             divine_thumbnail_active {active}\n\
+             # HELP divine_thumbnail_waiting Thumbnail requests waiting for an extraction slot.\n\
+             # TYPE divine_thumbnail_waiting gauge\n\
+             divine_thumbnail_waiting {waiting}\n\
+             # HELP divine_thumbnail_capacity Active thumbnail extraction slots per process.\n\
+             # TYPE divine_thumbnail_capacity gauge\n\
+             divine_thumbnail_capacity {}\n",
+            self.capacity
+        )
+    }
+
+    fn waiting_count(&self) -> usize {
+        self.wait_capacity - self.waiting.available_permits()
+    }
+
+    #[cfg(test)]
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit> {
+        acquire_from(self.active.clone())
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = self.active.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+
+        let _waiting = acquire_from(self.waiting.clone())?;
+        let permit = tokio::time::timeout(self.wait, self.active.clone().acquire_owned())
+            .await
+            .map_err(|_| ResourceError::Busy)?;
+        permit.map_err(|_| ResourceError::Busy.into())
+    }
+}
+
 static UPLOAD_ADMISSION: LazyLock<UploadAdmission> = LazyLock::new(|| {
     UploadAdmission::new(
         positive_setting("MAX_CONCURRENT_UPLOADS", 4)
@@ -234,12 +354,18 @@ static UPLOAD_ADMISSION: LazyLock<UploadAdmission> = LazyLock::new(|| {
     )
 });
 // Public mirrors and thumbnail generation cannot starve each other or uploads.
-static THUMBNAIL_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-        positive_setting("MAX_CONCURRENT_THUMBNAILS", 2)
-            .unwrap_or(2)
-            .min(1024) as usize,
-    ))
+static THUMBNAIL_ADMISSION: LazyLock<ThumbnailAdmission> = LazyLock::new(|| {
+    let concurrency = positive_setting("MAX_CONCURRENT_THUMBNAILS", 2)
+        .unwrap_or(2)
+        .min(1024) as usize;
+    let wait_secs = positive_setting("THUMBNAIL_WAIT_SECS", 6)
+        .unwrap_or(6)
+        .min(60);
+    ThumbnailAdmission::new(
+        concurrency,
+        concurrency.saturating_mul(2),
+        Duration::from_secs(wait_secs),
+    )
 });
 static MIRROR_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(
@@ -261,12 +387,14 @@ pub fn metrics_router() -> axum::Router {
     axum::Router::new().route(
         "/metrics",
         axum::routing::get(|| async {
+            let mut body = UPLOAD_ADMISSION.metrics();
+            body.push_str(&THUMBNAIL_ADMISSION.metrics());
             (
                 [(
                     axum::http::header::CONTENT_TYPE,
                     "text/plain; version=0.0.4",
                 )],
-                UPLOAD_ADMISSION.metrics(),
+                body,
             )
         }),
     )
@@ -274,8 +402,16 @@ pub fn metrics_router() -> axum::Router {
 pub fn acquire_session_verification() -> Result<OwnedSemaphorePermit> {
     UPLOAD_ADMISSION.verify_session()
 }
-pub fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
-    acquire_from(THUMBNAIL_SLOTS.clone())
+pub async fn acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
+    THUMBNAIL_ADMISSION.acquire().await
+}
+#[cfg(test)]
+pub fn try_acquire_thumbnail() -> Result<OwnedSemaphorePermit> {
+    THUMBNAIL_ADMISSION.try_acquire()
+}
+#[cfg(test)]
+pub fn thumbnail_waiting_count() -> usize {
+    THUMBNAIL_ADMISSION.waiting_count()
 }
 pub fn acquire_mirror() -> Result<OwnedSemaphorePermit> {
     acquire_from(MIRROR_SLOTS.clone())

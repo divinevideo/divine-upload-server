@@ -120,6 +120,8 @@ All configuration comes from environment variables. The table below lists the co
 | `PORT` | `8080` | Listen port. |
 | `METRICS_PORT` | — | Optional internal Prometheus listener. Exposes `/metrics` on a separate port. |
 | `MAX_CONCURRENT_UPLOADS` | `4` | Active upload requests per process. The same number can wait for a slot. |
+| `MAX_CONCURRENT_THUMBNAILS` | `2` | Active on-demand thumbnail extraction slots per process (1–1024). Up to `2x` as many requests can wait for a slot. |
+| `THUMBNAIL_WAIT_SECS` | `6` | Maximum wait in seconds for a thumbnail extraction slot before returning `503` (1–60). |
 | `MIGRATION_NSEC` | — | Nostr secret key used to sign Blossom auth when mirroring via `/migrate`. |
 | `TRANSCODER_URL` | — | Legacy direct HLS admission when `TRANSCODE_ADMISSION_SECRET` is unset. Also the default transcription origin. |
 | `TRANSCODE_ADMISSION_SECRET` | — | Dedicated credential that opts direct HLS into the Hetzner worker's authenticated queue endpoint. |
@@ -152,7 +154,8 @@ queue, exhausted session-check limit, or expired wait returns HTTP 503 with
 `Retry-After: 5`.
 
 The internal metrics listener reports `divine_upload_active`,
-`divine_upload_waiting`, and `divine_upload_capacity` from the admission
+`divine_upload_waiting`, `divine_upload_capacity`, `divine_thumbnail_active`,
+`divine_thumbnail_waiting`, and `divine_thumbnail_capacity` from the admission
 semaphores. Scale on active and waiting requests to include storage I/O pressure.
 On SIGTERM or Ctrl-C the HTTP server stops accepting connections and allows
 existing requests up to 300 seconds to finish. Configure the pod termination
@@ -406,10 +409,12 @@ mappings. With the outbox enabled, unauthenticated `/migrate`
 events always have a null owner instead of trusting the request's declaration.
 Thumbnail generation and mirroring have independent configurable admission pools
 (`MAX_CONCURRENT_THUMBNAILS`, default 2; `MAX_CONCURRENT_MIRRORS`, default 1), separate
-from uploads. Thumbnail cache hits bypass generation admission. Mirror fetches use
-HTTPS allowlisted hosts without redirects and are bounded by
-`MIRROR_FETCH_TIMEOUT_SECS` (default 120). Busy session locks return 503 with
-`Retry-After`.
+from uploads. Thumbnail cache hits bypass generation admission; when all extraction
+slots are busy, up to twice `MAX_CONCURRENT_THUMBNAILS` requests wait up to
+`THUMBNAIL_WAIT_SECS` (default 6, range 1–60) before returning 503 with
+`Retry-After: 5`. Mirror fetches use HTTPS allowlisted hosts without redirects
+and are bounded by `MIRROR_FETCH_TIMEOUT_SECS` (default 120). Busy session locks
+return 503 with `Retry-After`.
 
 ## Deployment
 

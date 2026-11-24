@@ -135,9 +135,11 @@ When every upload slot is busy, up to the same number of authenticated direct
 uploads, chunks, and resumable completions wait up to five seconds for one
 without reading their bodies. A full queue or an expired wait returns 503 with
 `Retry-After: 5`. Chunk session checks have a separate limit of the same size
-that does not wait, and return the same 503 when it is exhausted. Exhausted
-thumbnail and mirror admission still return 503 at once; oversized uploads
-return 413. Provision scratch
+that does not wait, and return the same 503 when it is exhausted. When every
+thumbnail slot is busy, up to twice `MAX_CONCURRENT_THUMBNAILS` requests wait
+up to `THUMBNAIL_WAIT_SECS` seconds (default 6, range 1–60) for a slot; a full
+queue or expired wait returns 503 with `Retry-After: 5`. Exhausted mirror
+admission still returns 503 at once; oversized uploads return 413. Provision scratch
 disk for at least the configured maximum times the upload and mirror slot counts,
 plus thumbnail scratch files and operational
 reserve; disk-full errors fail the request and remove local temporary files.
@@ -150,8 +152,9 @@ Set measured limits before expanding concurrency; these defaults are bounds,
 not a capacity estimate.
 
 Setting `METRICS_PORT` starts an internal Prometheus listener on that port that
-serves `divine_upload_active`, `divine_upload_waiting`, and
-`divine_upload_capacity` at `/metrics`. On SIGTERM or Ctrl-C the server stops
+serves `divine_upload_active`, `divine_upload_waiting`,
+`divine_upload_capacity`, `divine_thumbnail_active`,
+`divine_thumbnail_waiting`, and `divine_thumbnail_capacity` at `/metrics`. On SIGTERM or Ctrl-C the server stops
 accepting connections and gives existing requests up to 300 seconds to finish.
 Requests still running at that deadline are cut off and the process exits with
 an error. Set the pod's `terminationGracePeriodSeconds` above 300: with the

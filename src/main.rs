@@ -967,7 +967,7 @@ async fn process_upload(
     let video_processing = video_processing::VideoProcessing::for_upload(&headers, &state).await?;
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
-    let _permit = resources::acquire().await?;
+    let permit = Arc::new(resources::acquire().await?);
 
     // Get content type
     let content_type = headers
@@ -999,6 +999,8 @@ async fn process_upload(
     )
     .await?;
 
+    let all_bytes = Bytes::from(all_bytes);
+
     // GCS retains best-effort thumbnails. Protected dual requests cannot
     // finalize until their exact original and thumbnail copies are recorded.
     let thumbnail_url = if (thumbnail::is_video_type(&content_type)
@@ -1009,7 +1011,8 @@ async fn process_upload(
             &upload_storage,
             &state.config.cdn_base_url,
             &sha256_hash,
-            &all_bytes,
+            all_bytes.clone(),
+            Some(permit.clone()),
         )
         .await
         {
@@ -1351,7 +1354,8 @@ async fn extract_and_upload_thumbnail(
     client: &storage::MediaStorage,
     cdn_base_url: &str,
     hash: &str,
-    video_data: &[u8],
+    video_data: Bytes,
+    upload_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Result<StoredThumbnail> {
     let thumb_path = format!("{}.jpg", hash);
     let bytes = if client.stat(&thumb_path).await?.is_some() {
@@ -1360,7 +1364,12 @@ async fn extract_and_upload_thumbnail(
         // This explicit upload retry can still repair a missing dual replica.
         client.read(&thumb_path).await?
     } else {
-        Bytes::from(thumbnail::extract_thumbnail(video_data)?.data)
+        let extracted = run_blocking_with_permit(upload_permit, move || {
+            thumbnail::extract_thumbnail(&video_data)
+        })
+        .await?
+        .0;
+        Bytes::from(extracted.data)
     };
     let sha256 = hex::encode(Sha256::digest(&bytes));
     let size = bytes.len() as u64;
@@ -1510,6 +1519,42 @@ async fn download_best_available_media_bytes(
     ))
 }
 
+async fn run_blocking_with_permit<P, T, F>(permit: P, work: F) -> Result<(T, P)>
+where
+    P: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || work().map(|value| (value, permit)))
+        .await
+        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+        .and_then(|res| res)
+}
+
+async fn read_cached_thumbnail_response(
+    media_storage: &storage::MediaStorage,
+    thumb_path: &str,
+) -> Option<Response> {
+    match media_storage.stat(thumb_path).await {
+        Ok(Some(_)) => match media_storage.read_verified(thumb_path).await {
+            Ok(data) => {
+                Some((StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data).into_response())
+            }
+            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+                warn!("Thumbnail cache read failed; attempting regeneration");
+                None
+            }
+            Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+        },
+        Ok(None) => None,
+        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
+            warn!("Thumbnail cache lookup failed; attempting regeneration");
+            None
+        }
+        Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+    }
+}
+
 /// On-demand thumbnail generation endpoint
 /// Resolves the recorded original, generates a thumbnail, and preserves its storage policy.
 async fn handle_thumbnail_generate(
@@ -1536,26 +1581,12 @@ async fn handle_thumbnail_generate(
     };
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
-    match media_storage.stat(&thumb_path).await {
-        Ok(Some(_)) => match media_storage.read_verified(&thumb_path).await {
-            Ok(data) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
-                    .into_response()
-            }
-            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-                warn!("Thumbnail cache read failed; attempting regeneration");
-            }
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-        },
-        Ok(None) => {}
-        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-            warn!("Thumbnail cache lookup failed; attempting regeneration");
-        }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    if let Some(response) = read_cached_thumbnail_response(&media_storage, &thumb_path).await {
+        return response;
     }
 
     // Cache hits do not occupy expensive thumbnail generation admission.
-    let _permit = match resources::acquire_thumbnail() {
+    let permit = match resources::acquire_thumbnail().await {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1565,6 +1596,12 @@ async fn handle_thumbnail_generate(
                 .into_response()
         }
     };
+    // Re-check after waiting so a burst for the same hash reuses the generated
+    // thumbnail written by an earlier request instead of re-running ffmpeg.
+    if let Some(response) = read_cached_thumbnail_response(&media_storage, &thumb_path).await {
+        drop(permit);
+        return response;
+    }
     // Download the original blob, or fall back to the best available HLS transport stream.
     let (video_data, source_object) = match download_best_available_media_bytes(
         &media_storage,
@@ -1595,22 +1632,27 @@ async fn handle_thumbnail_generate(
         );
     }
 
-    // Generate thumbnail
-    let thumb_result = match thumbnail::extract_thumbnail(&video_data) {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Failed to generate thumbnail for {}: {}", hash, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Failed to generate thumbnail".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
-        }
-    };
+    // Generate thumbnail off the Tokio async worker pool so synchronous ffmpeg
+    // execution never stalls concurrent uploads or health checks.
+    // Return the permit to the handler on success so it also covers storage.
+    let (thumb_result, _permit) =
+        match run_blocking_with_permit(permit, move || thumbnail::extract_thumbnail(&video_data))
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to generate thumbnail for {}: {}", hash, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(ErrorResponse {
+                        error: "Failed to generate thumbnail".to_string(),
+                    })
+                    .into_response(),
+                )
+                    .into_response();
+            }
+        };
 
     // Store the thumbnail using the original upload policy.
     let thumb_path = format!("{}.jpg", hash);
@@ -1850,8 +1892,8 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let thumbnail =
-            crate::resources::acquire_thumbnail().expect("mirrors cannot take thumbnail admission");
+        let thumbnail = crate::resources::try_acquire_thumbnail()
+            .expect("mirrors cannot take thumbnail admission");
         drop(thumbnail);
         drop(mirrors);
     }
@@ -1895,7 +1937,7 @@ mod tests {
         use axum::{http::Uri, response::IntoResponse};
         let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let mut permits = Vec::new();
-        while let Ok(permit) = crate::resources::acquire_thumbnail() {
+        while let Ok(permit) = crate::resources::try_acquire_thumbnail() {
             permits.push(permit);
         }
         let app = Router::new().route("/*path", get(|uri: Uri| async move {
@@ -1932,6 +1974,155 @@ mod tests {
         assert_eq!(&bytes[..], b"prior-jpeg");
         server.abort();
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn queued_thumbnail_request_uses_cache_hit_after_waiting() {
+        use axum::{http::Uri, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let mut permits = Vec::new();
+        while let Ok(permit) = crate::resources::try_acquire_thumbnail() {
+            permits.push(permit);
+        }
+
+        let cache_ready = Arc::new(AtomicBool::new(false));
+        let video_fetched = Arc::new(AtomicBool::new(false));
+        let first_miss = Arc::new(tokio::sync::Notify::new());
+
+        let app = Router::new().route(
+            "/*path",
+            get({
+                let cache_ready = cache_ready.clone();
+                let video_fetched = video_fetched.clone();
+                let first_miss = first_miss.clone();
+                move |uri: Uri| {
+                    let cache_ready = cache_ready.clone();
+                    let video_fetched = video_fetched.clone();
+                    let first_miss = first_miss.clone();
+                    async move {
+                        if uri.path().contains("b2-primary-writes") {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                            )
+                                .into_response();
+                        }
+                        if uri.path().ends_with(".jpg") {
+                            if !cache_ready.load(Ordering::SeqCst) {
+                                first_miss.notify_one();
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                                )
+                                    .into_response();
+                            }
+                            if uri.query().unwrap_or_default().contains("alt=media") {
+                                return "cached-after-wait".into_response();
+                            }
+                            return Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"17","contentType":"image/jpeg"}))
+                                .into_response();
+                        }
+                        video_fetched.store(true, Ordering::SeqCst);
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_state(None, 1);
+        Arc::get_mut(&mut state).unwrap().media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+
+        let request_task = tokio::spawn(async move {
+            super::handle_thumbnail_generate(State(state), axum::extract::Path("b".repeat(64)))
+                .await
+                .into_response()
+        });
+
+        first_miss.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while crate::resources::thumbnail_waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued request should enter thumbnail wait queue");
+
+        cache_ready.store(true, Ordering::SeqCst);
+        drop(permits.pop());
+
+        let response = request_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"cached-after-wait");
+        assert!(!video_fetched.load(Ordering::SeqCst));
+        server.abort();
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocking_thumbnail_keeps_permit_until_worker_finishes() {
+        for use_arc_permit in [false, true] {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+            if use_arc_permit {
+                let shared_permit = Arc::new(permit);
+                let future =
+                    super::run_blocking_with_permit(Some(shared_permit.clone()), move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok(())
+                    });
+                let mut future = std::pin::pin!(future);
+                tokio::select! {
+                    _ = &mut future => panic!("blocking work finished before release"),
+                    res = started_rx => res.unwrap(),
+                }
+                drop(shared_permit);
+            } else {
+                let future = super::run_blocking_with_permit(permit, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                });
+                let mut future = std::pin::pin!(future);
+                tokio::select! {
+                    _ = &mut future => panic!("blocking work finished before release"),
+                    res = started_rx => res.unwrap(),
+                }
+            }
+
+            assert_eq!(semaphore.available_permits(), 0);
+            release_tx.send(()).unwrap();
+            let reacquired =
+                tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire_owned())
+                    .await;
+            assert!(matches!(reacquired, Ok(Ok(_))));
+        }
     }
 
     #[test]
@@ -2191,7 +2382,8 @@ mod tests {
             &storage,
             "https://media.example",
             "hash",
-            b"not a decodable video",
+            bytes::Bytes::from_static(b"not a decodable video"),
+            None,
         )
         .await
         .unwrap();
