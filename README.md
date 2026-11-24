@@ -158,8 +158,9 @@ queue, exhausted session-check limit, or expired wait returns HTTP 503 with
 The internal metrics listener reports `divine_upload_active`,
 `divine_upload_waiting`, `divine_upload_capacity`, `divine_thumbnail_active`,
 `divine_thumbnail_waiting`, and `divine_thumbnail_capacity` from the admission
-semaphores, plus the `divine_thumbnail_unauthenticated_total` and
-`divine_thumbnail_rejected_total` counters described under
+semaphores, plus the `divine_thumbnail_authenticated_total`,
+`divine_thumbnail_unauthenticated_total`, and `divine_thumbnail_rejected_total`
+counters described under
 [Thumbnail service token](#thumbnail-service-token). Scale on active and waiting requests to include storage I/O pressure.
 On SIGTERM or Ctrl-C the HTTP server stops accepting connections and allows
 existing requests up to 300 seconds to finish. Configure the pod termination

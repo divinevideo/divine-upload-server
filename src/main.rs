@@ -2186,6 +2186,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        assert_not_shared_cacheable(&refused, "router refused");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         let served = app
             .oneshot(
@@ -2197,6 +2198,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(served.status(), StatusCode::OK);
+        assert_not_shared_cacheable(&served, "router served");
         server.abort();
     }
 

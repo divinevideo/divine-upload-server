@@ -73,11 +73,29 @@ static REJECTED_INVALID: AtomicU64 = AtomicU64::new(0);
 
 impl Policy {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        Self::from_var_lookup(|key| std::env::var(key))
     }
 
+    #[cfg(test)]
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
-        let token = match lookup(TOKEN_ENV) {
+        Self::from_values(lookup(TOKEN_ENV), lookup(REQUIRED_ENV))
+    }
+
+    fn from_var_lookup(
+        lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Self> {
+        let read = |key: &str| match lookup(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{key} must be valid UTF-8")
+            }
+        };
+        Self::from_values(read(TOKEN_ENV)?, read(REQUIRED_ENV)?)
+    }
+
+    fn from_values(token: Option<String>, required: Option<String>) -> anyhow::Result<Self> {
+        let token = match token {
             None => None,
             Some(raw) => {
                 let token = raw.trim().to_string();
@@ -92,7 +110,7 @@ impl Policy {
                 Some(token)
             }
         };
-        let required = match lookup(REQUIRED_ENV).as_deref().map(str::trim) {
+        let required = match required.as_deref().map(str::trim) {
             None | Some("") | Some("false") => false,
             Some("true") => true,
             Some(_) => anyhow::bail!("{REQUIRED_ENV} must be true or false"),
@@ -118,13 +136,14 @@ impl Policy {
             Policy::Open => return Decision::Allow,
             Policy::Observe(token) | Policy::Required(token) => token,
         };
-        let reason = match headers.get(HEADER) {
-            None => Reason::Missing,
-            Some(_) if presented_matches(headers, expected) => {
+        let mut values = headers.get_all(HEADER).iter();
+        let reason = match (values.next(), values.next()) {
+            (None, None) => Reason::Missing,
+            (Some(value), None) if presented_matches(value, expected) => {
                 AUTHENTICATED.fetch_add(1, Ordering::Relaxed);
                 return Decision::Allow;
             }
-            Some(_) => Reason::Invalid,
+            _ => Reason::Invalid,
         };
         let required = matches!(self, Policy::Required(_));
         let counter = match (required, reason) {
@@ -154,8 +173,8 @@ impl Policy {
     }
 }
 
-fn presented_matches(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(candidate) = headers.get(HEADER).and_then(|v| v.to_str().ok()) else {
+fn presented_matches(value: &axum::http::HeaderValue, expected: &str) -> bool {
+    let Ok(candidate) = value.to_str() else {
         return false;
     };
     // Compare fixed-size MACs rather than the strings, so neither the content
@@ -309,6 +328,57 @@ mod tests {
                 "{wrong:?}"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_token_headers_are_rejected_as_invalid() {
+        let mut mixed = headers(Some("s3cret"));
+        mixed.append(HEADER, "wrong".parse().unwrap());
+        assert_eq!(
+            Policy::Required("s3cret".into()).decide(&mixed),
+            Decision::Reject(Reason::Invalid)
+        );
+        assert_eq!(
+            Policy::Observe("s3cret".into()).decide(&mixed),
+            Decision::AllowUnauthenticated(Reason::Invalid)
+        );
+
+        let mut repeated = headers(Some("s3cret"));
+        repeated.append(HEADER, "s3cret".parse().unwrap());
+        assert_eq!(
+            Policy::Required("s3cret".into()).decide(&repeated),
+            Decision::Reject(Reason::Invalid)
+        );
+        assert_eq!(
+            Policy::Observe("s3cret".into()).decide(&repeated),
+            Decision::AllowUnauthenticated(Reason::Invalid)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_vars_refuse_to_start() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad_token = std::ffi::OsString::from_vec(vec![b's', b'3', b'c', 0xff]);
+        let err = Policy::from_var_lookup(|key| match key {
+            TOKEN_ENV => Err(std::env::VarError::NotUnicode(bad_token.clone())),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(TOKEN_ENV), "{msg}");
+        assert!(!msg.contains("s3c"), "{msg}");
+
+        let bad_flag = std::ffi::OsString::from_vec(vec![b'f', b'l', b'g', 0xff]);
+        let err = Policy::from_var_lookup(|key| match key {
+            TOKEN_ENV => Ok("s3cret".into()),
+            REQUIRED_ENV => Err(std::env::VarError::NotUnicode(bad_flag.clone())),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(REQUIRED_ENV), "{msg}");
+        assert!(!msg.contains("flg"), "{msg}");
     }
 
     #[test]
