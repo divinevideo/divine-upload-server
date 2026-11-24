@@ -167,6 +167,12 @@ def request(
     return 599
 
 
+def thumbnail_service_headers() -> dict[str, str]:
+    """Blossom's service token, which the upload server can require on /thumbnail."""
+    token = os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip()
+    return {"X-Divine-Thumbnail-Token": token} if token else {}
+
+
 def process_hash(
     hash_: str, bucket: str, upload_url: str, media_url: str
 ) -> tuple[str, str | None]:
@@ -175,7 +181,9 @@ def process_hash(
     delete_status = request(delete_url, method="DELETE", auth=True)
     delete_error = None if delete_status in (200, 204, 404) else f"delete:{delete_status}"
 
-    regenerate_status = request(f"{upload_url}/thumbnail/{hash_}")
+    regenerate_status = request(
+        f"{upload_url}/thumbnail/{hash_}", headers=thumbnail_service_headers()
+    )
     if regenerate_status != 200:
         errors = [err for err in (delete_error, f"regenerate:{regenerate_status}") if err]
         return hash_, ",".join(errors)
