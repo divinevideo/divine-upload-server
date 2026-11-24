@@ -236,14 +236,19 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
    change that sends it.
 3. Flip only after confirming both upload receivers (`divine-upload-server` on
    GKE and `blossom-upload-rust` on Cloud Run) are authenticating verified Blossom
-   requests: corroborate `divine_thumbnail_authenticated_total` and
-   `blossom-thumbnail-*` requests in upload logs against Blossom edge logs, and
-   treat aggregate `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
+   requests: corroborate Blossom edge logs for on-demand thumbnail fetches
+   against `divine_thumbnail_authenticated_total` and the origin request logs
+   carrying `blossom-thumbnail` or `blossom-thumbnail-<id>`, and confirm no
+   known Blossom request appears in observe-mode unauthenticated logs
+   (`"Thumbnail served without a valid service token (not yet required)"` on
+   `divine-upload-server`, logging `request_id` and `reason`). Treat aggregate
+   `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
    `reason="missing"` rates as diagnostic signals rather than sole gates (any
    caller on the public route can send an invalid or missing header). Blossom's
    viewer `GET` and `HEAD` calls carry
-   `x-request-id: blossom-thumbnail-<Blossom request id>` (truncated to 64
-   characters in upload logs), while archive-import calls send bare
+   `x-request-id: blossom-thumbnail-<Blossom request id>` when an edge request
+   id is present (truncated to 64 characters in upload logs), while
+   archive-import calls and viewer calls without a request id send bare
    `blossom-thumbnail`; other callers log their own caller-supplied id or `-`.
 4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
 
@@ -275,9 +280,12 @@ through observe mode, changing the receivers before the sender:
 3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
    `authenticated` rises.
 4. Set the flag back to `true` only after verifying both upload receivers
-   authenticate real Blossom requests (corroborating `blossom-thumbnail-*`
-   traffic against Blossom edge logs, rather than relying solely on the public
-   `reason="invalid"` aggregate counter).
+   authenticate known Blossom requests (corroborating Blossom edge logs against
+   `divine_thumbnail_authenticated_total`, `blossom-thumbnail` /
+   `blossom-thumbnail-<id>` origin request logs, and zero Blossom-originated
+   hits in `"Thumbnail served without a valid service token (not yet required)"`,
+   rather than relying solely on the public `reason="invalid"` aggregate
+   counter).
 
 ## B2 primary with optional synchronous GCS backup
 
