@@ -74,9 +74,13 @@ async fn backup_recovery_completed_thumbnail_survives_backup_reenable_and_gcs_ro
             .with_mode(mode)
             .unwrap()
             .with_gcs_backup_enabled(true);
-        let response = crate::handle_thumbnail_generate(State(state), axum::extract::Path(hash))
-            .await
-            .into_response();
+        let response = crate::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path(hash),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK, "{mode:?}");
         assert_eq!(
             axum::body::to_bytes(response.into_body(), 100)

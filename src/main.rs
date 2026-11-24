@@ -14,6 +14,7 @@ mod resumable;
 mod server;
 mod storage;
 mod thumbnail;
+mod thumbnail_auth;
 mod video_processing;
 
 #[cfg(test)]
@@ -72,6 +73,8 @@ struct Config {
     transcribe_shared_secret: Option<String>,
     resumable_session_ttl_secs: u64,
     resumable_chunk_size: u64,
+    /// Who may call `/thumbnail/<hash>`; see `thumbnail_auth`.
+    thumbnail_auth: thumbnail_auth::Policy,
 }
 
 impl Config {
@@ -130,6 +133,7 @@ impl Config {
                     .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
                 load_resumable_max_request_body_size(),
             ),
+            thumbnail_auth: thumbnail_auth::Policy::from_env()?,
         })
     }
 }
@@ -396,6 +400,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/audit", post(handle_audit_log))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route("/thumbnail/auth-check", get(handle_thumbnail_auth_check))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", get(handle_landing))
@@ -557,6 +562,13 @@ async fn main() -> Result<()> {
         http_client,
         transcribe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSCRIBE)),
     });
+
+    match state.config.thumbnail_auth {
+        thumbnail_auth::Policy::Required(_) => {
+            info!("{}", state.config.thumbnail_auth.startup_message())
+        }
+        _ => warn!("{}", state.config.thumbnail_auth.startup_message()),
+    }
 
     if state.config.transcriber_url.is_some() && state.config.transcribe_shared_secret.is_none() {
         warn!(
@@ -1555,12 +1567,102 @@ async fn read_cached_thumbnail_response(
     }
 }
 
+/// 404 for a thumbnail whose video can't be found. A request refused for a
+/// missing service token gets this same response, so a refusal reveals nothing.
+fn thumbnail_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(ErrorResponse {
+            error: "Video not found".to_string(),
+        })
+        .into_response(),
+    )
+        .into_response()
+}
+
+fn attach_thumbnail_cache_headers(response: &mut Response) {
+    // Once a token decides who gets a thumbnail (or on `/thumbnail/auth-check`),
+    // no shared cache in front of this host may store any answer, so every
+    // response is private and varies on the token header.
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static(thumbnail_auth::HEADER),
+    );
+}
+
+/// Non-destructive credential check for `backfill-thumbnails.py` before it
+/// deletes stored JPEGs. Positively distinguishes open mode vs a verified token
+/// without touching storage or mutating rollout counters.
+async fn handle_thumbnail_auth_check(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let mut response = match &state.config.thumbnail_auth {
+        thumbnail_auth::Policy::Open => (
+            StatusCode::NO_CONTENT,
+            [(thumbnail_auth::AUTH_STATUS_HEADER, "open")],
+        )
+            .into_response(),
+        thumbnail_auth::Policy::Observe(_) | thumbnail_auth::Policy::Required(_) => {
+            if state.config.thumbnail_auth.verify_presented_token(&headers) {
+                (
+                    StatusCode::NO_CONTENT,
+                    [(thumbnail_auth::AUTH_STATUS_HEADER, "verified")],
+                )
+                    .into_response()
+            } else {
+                thumbnail_not_found()
+            }
+        }
+    };
+    attach_thumbnail_cache_headers(&mut response);
+    response
+}
+
 /// On-demand thumbnail generation endpoint
 /// Resolves the recorded original, generates a thumbnail, and preserves its storage policy.
 async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let guarded = !matches!(state.config.thumbnail_auth, thumbnail_auth::Policy::Open);
+    let mut response = thumbnail_response(state, hash, headers)
+        .await
+        .into_response();
+    if guarded {
+        attach_thumbnail_cache_headers(&mut response);
+    }
+    response
+}
+
+async fn thumbnail_response(
+    state: Arc<AppState>,
+    hash: String,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Blossom decides who may see a thumbnail before it calls this route, so
+    // the only caller that should reach storage is the one holding Blossom's
+    // service token. Check it first: a refused caller gets the same 404 as a
+    // missing video, before any cache read or generation (issue #52).
+    match state.config.thumbnail_auth.decide(&headers) {
+        thumbnail_auth::Decision::Allow => {}
+        thumbnail_auth::Decision::AllowUnauthenticated(reason) => {
+            info!(
+                request_id = %request_log::correlation_id(&headers),
+                reason = reason.label(),
+                "Thumbnail served without a valid service token (not yet required)"
+            );
+        }
+        thumbnail_auth::Decision::Reject(_) => return thumbnail_not_found(),
+    }
+
     // Validate hash format (64 hex characters)
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
@@ -1613,15 +1715,7 @@ async fn handle_thumbnail_generate(
         Ok(result) => result,
         Err(e) => {
             error!("Failed to download video {}: {}", hash, e);
-            return (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Video not found".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
+            return thumbnail_not_found();
         }
     };
 
@@ -1963,10 +2057,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let response =
-            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
-                .await
-                .into_response();
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -1974,6 +2071,472 @@ mod tests {
         assert_eq!(&bytes[..], b"prior-jpeg");
         server.abort();
         drop(permits);
+    }
+
+    /// Storage stub that serves a stored `<hash>.jpg` and counts every request,
+    /// so a test can prove a refused thumbnail request never touched storage
+    /// (neither the cache read nor the original download for generation).
+    async fn counting_thumbnail_storage() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{http::Uri, response::IntoResponse};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = Router::new().route("/*path", get(move |uri: Uri| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+                if uri.query().unwrap_or_default().contains("alt=media") { return "prior-jpeg".into_response(); }
+                Json(serde_json::json!({"name":"fixture.jpg","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"10","contentType":"image/jpeg"})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, hits, server)
+    }
+
+    fn thumbnail_state(endpoint: String, policy: crate::thumbnail_auth::Policy) -> Arc<AppState> {
+        let mut state = test_state(None, 1);
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.media_storage = storage::MediaStorage::new(
+            storage::WriteMode::Gcs,
+            Some(GcsClient::new(
+                ClientConfig {
+                    storage_endpoint: endpoint,
+                    ..Default::default()
+                }
+                .anonymous(),
+            )),
+            "test-bucket".into(),
+            None,
+        )
+        .unwrap();
+        inner.config.thumbnail_auth = policy;
+        state
+    }
+
+    fn token_headers(token: Option<&str>) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(token) = token {
+            headers.insert(crate::thumbnail_auth::HEADER, token.parse().unwrap());
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn required_thumbnail_token_refuses_without_touching_storage() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        );
+        for presented in [None, Some("wrong-token"), Some("svc-token-extra")] {
+            let response = super::handle_thumbnail_generate(
+                State(state.clone()),
+                axum::extract::Path("a".repeat(64)),
+                token_headers(presented),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{presented:?}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            // Same body as a missing video, so a refusal reveals nothing.
+            assert_eq!(&body[..], br#"{"error":"Video not found"}"#);
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn required_thumbnail_token_serves_the_cache_hit_with_the_token() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let authenticated_before = crate::thumbnail_auth::counts().authenticated;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        );
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(Some("svc-token")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"prior-jpeg");
+        assert_eq!(
+            crate::thumbnail_auth::counts().authenticated,
+            authenticated_before + 1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn observed_thumbnail_token_serves_unauthenticated_requests_and_counts_them() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+        );
+        let before = crate::thumbnail_auth::counts().unauthenticated_missing;
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after = crate::thumbnail_auth::counts().unauthenticated_missing;
+        assert_eq!(after, before + 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_route_reads_the_token_header_end_to_end() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        );
+        let app = super::build_router(state);
+        let uri = format!("/thumbnail/{}", "c".repeat(64));
+        let refused = app
+            .clone()
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        assert_not_shared_cacheable(&refused, "router refused");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let served = app
+            .oneshot(
+                Request::get(&uri)
+                    .header(crate::thumbnail_auth::HEADER, "svc-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_not_shared_cacheable(&served, "router served");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_auth_check_positively_verifies_access_without_touching_storage_or_counters()
+    {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+
+        let counters_before = crate::thumbnail_auth::counts();
+
+        let open_app = super::build_router(thumbnail_state(
+            endpoint.clone(),
+            crate::thumbnail_auth::Policy::Open,
+        ));
+        let open_resp = open_app
+            .oneshot(
+                Request::get("/thumbnail/auth-check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open_resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            open_resp
+                .headers()
+                .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("open")
+        );
+        assert_not_shared_cacheable(&open_resp, "auth-check open");
+
+        for policy in [
+            crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        ] {
+            let mode = policy.mode();
+            let app = super::build_router(thumbnail_state(endpoint.clone(), policy));
+
+            let ok_resp = app
+                .clone()
+                .oneshot(
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok_resp.status(), StatusCode::NO_CONTENT, "{mode} valid");
+            assert_eq!(
+                ok_resp
+                    .headers()
+                    .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("verified"),
+                "{mode} valid"
+            );
+            assert_not_shared_cacheable(&ok_resp, &format!("{mode} auth-check valid"));
+
+            for (case, req) in [
+                (
+                    "missing",
+                    Request::get("/thumbnail/auth-check")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+                (
+                    "wrong",
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "wrong-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+                (
+                    "duplicate",
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            ] {
+                let bad_resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(bad_resp.status(), StatusCode::NOT_FOUND, "{mode} {case}");
+                assert!(
+                    bad_resp
+                        .headers()
+                        .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                        .is_none(),
+                    "{mode} {case} must not emit auth status header"
+                );
+                assert_not_shared_cacheable(&bad_resp, &format!("{mode} auth-check {case}"));
+                let body = axum::body::to_bytes(bad_resp.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(&body[..], br#"{"error":"Video not found"}"#);
+            }
+        }
+
+        let counters_after = crate::thumbnail_auth::counts();
+        assert_eq!(counters_after.authenticated, counters_before.authenticated);
+        assert_eq!(
+            counters_after.unauthenticated_missing,
+            counters_before.unauthenticated_missing
+        );
+        assert_eq!(
+            counters_after.unauthenticated_invalid,
+            counters_before.unauthenticated_invalid
+        );
+        assert_eq!(
+            counters_after.rejected_missing,
+            counters_before.rejected_missing
+        );
+        assert_eq!(
+            counters_after.rejected_invalid,
+            counters_before.rejected_invalid
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_route_checks_token_before_hash_validation() {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+        let uri = "/thumbnail/not-a-hash";
+        let cases = [
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                Some("wrong"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Required("svc-token".into()),
+                Some("svc-token"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::thumbnail_auth::Policy::Open,
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (policy, token, expected) in cases {
+            let mode = policy.mode();
+            let app = super::build_router(thumbnail_state(endpoint.clone(), policy));
+            let mut request = Request::get(uri);
+            if let Some(token) = token {
+                request = request.header(crate::thumbnail_auth::HEADER, token);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{mode} {token:?}");
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    fn assert_not_shared_cacheable(response: &axum::response::Response, case: &str) {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "{case}"
+        );
+        let vary = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            vary.contains(crate::thumbnail_auth::HEADER),
+            "{case}: vary={vary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_guarded_thumbnail_responses_are_never_shared_cacheable() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let a = "a".repeat(64);
+        for policy in [
+            crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        ] {
+            let mode = policy.mode();
+            let state = thumbnail_state(endpoint.clone(), policy);
+            let mut cases = vec![
+                ("cache hit with token", a.clone(), Some("svc-token")),
+                (
+                    "invalid hash with token",
+                    "zz".to_string(),
+                    Some("svc-token"),
+                ),
+            ];
+            cases.push(if mode == "required" {
+                ("refused without token", a.clone(), None)
+            } else {
+                ("served without token", a.clone(), None)
+            });
+            for (case, hash, token) in cases {
+                let response = super::handle_thumbnail_generate(
+                    State(state.clone()),
+                    axum::extract::Path(hash),
+                    token_headers(token),
+                )
+                .await
+                .into_response();
+                assert_not_shared_cacheable(&response, &format!("{mode}: {case}"));
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn token_guarded_generation_errors_are_never_shared_cacheable() {
+        use axum::{http::Uri, response::IntoResponse};
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let app = Router::new().route("/*path", get(|uri: Uri| async move {
+            if uri.path().contains("b2-primary-writes") {return (StatusCode::NOT_FOUND,Json(serde_json::json!({"error":{"code":404,"message":"missing","errors":[]}}))).into_response();}
+            if uri.query().unwrap_or_default().contains("alt=media") {
+                if uri.path().ends_with(".jpg") { return StatusCode::NOT_FOUND.into_response(); }
+                return "not-video".into_response();
+            }
+            if uri.path().ends_with(".jpg") { return StatusCode::NOT_FOUND.into_response(); }
+            Json(serde_json::json!({"name":"fixture","bucket":"test-bucket","generation":"1","metageneration":"1","selfLink":"test","mediaLink":"test","etag":"test","id":"test","size":"9","contentType":"video/mp4"})).into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = thumbnail_state(
+            endpoint,
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        );
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(Some("svc-token")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_not_shared_cacheable(&response, "generation failure");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"Failed to generate thumbnail"}"#);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn open_thumbnail_responses_keep_their_existing_headers() {
+        use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, _hits, server) = counting_thumbnail_storage().await;
+        let state = thumbnail_state(endpoint, crate::thumbnail_auth::Policy::Open);
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            token_headers(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+        assert!(response.headers().get(header::VARY).is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_thumbnail_token_counters() {
+        let response = crate::resources::metrics_router()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("# TYPE divine_thumbnail_unauthenticated_total counter\n"));
+        assert!(body.contains("# TYPE divine_thumbnail_rejected_total counter\n"));
+        assert!(body.contains("# TYPE divine_thumbnail_authenticated_total counter\n"));
     }
 
     #[tokio::test]
@@ -2053,9 +2616,13 @@ mod tests {
         .unwrap();
 
         let request_task = tokio::spawn(async move {
-            super::handle_thumbnail_generate(State(state), axum::extract::Path("b".repeat(64)))
-                .await
-                .into_response()
+            super::handle_thumbnail_generate(
+                State(state),
+                axum::extract::Path("b".repeat(64)),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .into_response()
         });
 
         first_miss.notified().await;
@@ -2422,10 +2989,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let response =
-            super::handle_thumbnail_generate(State(state), axum::extract::Path("a".repeat(64)))
-                .await
-                .into_response();
+        let response = super::handle_thumbnail_generate(
+            State(state),
+            axum::extract::Path("a".repeat(64)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         // Invalid source bytes reach generation (500), not the cache-read 502.
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         server.abort();
@@ -2526,6 +3096,7 @@ mod tests {
                 transcribe_shared_secret: Some("secret".to_string()),
                 resumable_session_ttl_secs: resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS,
                 resumable_chunk_size: resumable::DEFAULT_RESUMABLE_CHUNK_SIZE,
+                thumbnail_auth: crate::thumbnail_auth::Policy::Open,
             },
             http_client: reqwest::Client::new(),
             transcribe_slots: Arc::new(tokio::sync::Semaphore::new(transcribe_slots)),

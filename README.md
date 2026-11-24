@@ -32,7 +32,8 @@ The service runs a single axum router over HTTP/1 and HTTP/2. Endpoints that mut
 | `DELETE` | `/upload/:upload_id` | Bearer session token | Abort a session and discard its temporary object. |
 | `POST` | `/migrate` | none (server-side Blossom auth) | Mirror a blob from an allowlisted Blossom/CDN host. |
 | `POST` | `/audit` | none | Ingest a control-plane audit-log entry. |
-| `GET` | `/thumbnail/:hash` | none | Return (or generate on demand) the JPEG thumbnail for a stored video. |
+| `GET` | `/thumbnail/auth-check` | Blossom service token (`X-Divine-Thumbnail-Token`) when configured | Non-destructive credential verification used by `backfill-thumbnails.py` before deleting stored JPEGs (`204` with `X-Divine-Thumbnail-Auth: open\|verified`, or `404`). |
+| `GET` | `/thumbnail/:hash` | Blossom service token (`X-Divine-Thumbnail-Token`), once required | Return (or generate on demand) the JPEG thumbnail for a stored video. See [Thumbnail service token](#thumbnail-service-token). |
 | `GET` | `/` | none | Human-readable landing page describing `upload.divine.video`. |
 
 ## Architecture
@@ -127,6 +128,8 @@ All configuration comes from environment variables. The table below lists the co
 | `TRANSCODE_ADMISSION_SECRET` | — | Dedicated credential that opts direct HLS into the Hetzner worker's authenticated queue endpoint. |
 | `TRANSCRIBER_URL` | falls back to `TRANSCODER_URL` | Transcription endpoint for audio/video. |
 | `AI_DETECTOR_BASE_URL` | — | Self-hosted detector base URL. Newly stored videos request the `nsfw` signal asynchronously; unset disables the hook. |
+| `THUMBNAIL_SERVICE_TOKEN` | — | Shared token divine-blossom sends on `/thumbnail/:hash` in `X-Divine-Thumbnail-Token`. Unset leaves the route open and logs a startup warning. |
+| `THUMBNAIL_TOKEN_REQUIRED` | `false` | `true` refuses `/thumbnail/:hash` requests without a valid token with `404`. Requires `THUMBNAIL_SERVICE_TOKEN`; the server refuses to start otherwise. |
 | `RESUMABLE_SESSION_TTL_SECS` | `86400` | Resumable session lifetime (24h). |
 | `RESUMABLE_CHUNK_SIZE` | `8388608` | Advertised chunk size (8 MiB), capped to `RESUMABLE_MAX_REQUEST_BODY_SIZE`. |
 | `RESUMABLE_MAX_REQUEST_BODY_SIZE` | `1048576` | Upper bound on the *advertised* chunk size (1 MiB); `UPLOAD_ROUTE_MAX_BODY_SIZE` is accepted as an alias. |
@@ -156,12 +159,143 @@ queue, exhausted session-check limit, or expired wait returns HTTP 503 with
 The internal metrics listener reports `divine_upload_active`,
 `divine_upload_waiting`, `divine_upload_capacity`, `divine_thumbnail_active`,
 `divine_thumbnail_waiting`, and `divine_thumbnail_capacity` from the admission
-semaphores. Scale on active and waiting requests to include storage I/O pressure.
+semaphores, plus the `divine_thumbnail_authenticated_total`,
+`divine_thumbnail_unauthenticated_total`, and `divine_thumbnail_rejected_total`
+counters described under
+[Thumbnail service token](#thumbnail-service-token). Scale on active and waiting requests to include storage I/O pressure.
 On SIGTERM or Ctrl-C the HTTP server stops accepting connections and allows
 existing requests up to 300 seconds to finish. Configure the pod termination
 grace period above that drain timeout.
 
 These are code defaults. Deployed values differ per environment and live in the `divine-upload-server` manifests in `divine-iac-coreconfig`; read those rather than assuming the defaults are what production runs.
+
+## Thumbnail service token
+
+divine-blossom decides who may see a thumbnail (moderation status, owner, age
+gate, admin) before it asks this service for one, then calls
+`GET /thumbnail/:hash` on the public upload host. This service cannot read that
+moderation state, so without a credential anyone holding a banned or
+age-restricted video's hash could fetch its frame here. Blossom therefore sends
+a shared token in `X-Divine-Thumbnail-Token`, and this service can require it
+(issue #52).
+
+| `THUMBNAIL_SERVICE_TOKEN` | `THUMBNAIL_TOKEN_REQUIRED` | Behavior |
+| --- | --- | --- |
+| unset | unset or `false` | Unchanged: every request is served. Startup logs a warning that the route is unauthenticated. |
+| set | unset or `false` | Every request is served. Requests without a valid token are logged with their reason and request id. |
+| set | `true` | Requests without a valid token get the same `404` as a missing video, before any cache read or generation. |
+| unset | `true` | The server refuses to start. |
+
+The token must be visible ASCII with no spaces, or the server refuses to start.
+It is compared in constant time and never logged. Whenever a token is
+configured, every `GET` or `HEAD` `/thumbnail/:hash` response returned by the
+thumbnail handler (served, refused, or failed) carries
+`Cache-Control: private, no-store` and `Vary: X-Divine-Thumbnail-Token`, so no
+shared cache can hand an authorized response to an unauthenticated caller or
+keep serving a refusal (`OPTIONS` CORS preflight and pre-handler Axum path
+rejections run outside that handler).
+
+The internal metrics listener counts every request reaching the handler once a
+token is configured:
+
+| Counter | Meaning |
+| --- | --- |
+| `divine_thumbnail_authenticated_total` | Carried the valid token (Blossom traffic, `backfill-thumbnails.py`, and any authenticated request that later fails with 400/404/500/503). |
+| `divine_thumbnail_unauthenticated_total{reason="missing"}` | Served without any token (observe mode). |
+| `divine_thumbnail_unauthenticated_total{reason="invalid"}` | Cumulative requests served with a wrong or duplicate token (observe mode). New increments mean a caller or secret copy does not match. |
+| `divine_thumbnail_rejected_total{reason="missing"\|"invalid"}` | Refused (required mode). |
+
+`backfill-thumbnails.py` requires `THUMBNAIL_SERVICE_TOKEN` by default (pass
+`--allow-unauthenticated` only when the target server has no token configured),
+enforces an HTTPS origin (requiring `--allow-non-default-upload-url` for hosts
+other than `DEFAULT_UPLOAD_URL`), disables HTTP redirects on token-bearing
+requests, and runs a non-destructive preflight against `GET /thumbnail/auth-check`
+before deleting any stored JPEG. The preflight requires `204` with
+`X-Divine-Thumbnail-Auth: verified` (when sending a token) or
+`X-Divine-Thumbnail-Auth: open` (when using `--allow-unauthenticated` against
+an unauthenticated server), so a generic `400`, `404` (including observe mode
+with a wrong token), missing header, or redirect stops the run before any
+object is deleted, without incrementing the `/thumbnail/:hash` counters. `--dry-run`
+validates hashes and prints the planned count without needing credentials or
+making network calls. Because `backfill-thumbnails.py` deletes `<hash>.jpg` before
+regenerating, only run it against a stable deployment — never during a token
+rollout flip, token rotation, or mixed-replica rollout.
+
+### Rollout
+
+The token comes from GCP Secret Manager in `dv-platform-prod`, through an
+External Secrets binding in the `divine-upload-server` manifests in
+`divine-iac-coreconfig`. The same value goes into GCP Secret Manager in
+`rich-compiler-479518-d2` for divine-blossom's Cloud Run `blossom-upload-rust`,
+which serves the same route, and into Blossom's Fastly `blossom_secrets` store as
+`thumbnail_service_token`. All three copies are listed under
+[Rotating the token](#rotating-the-token).
+
+1. Deploy with the token set and the flag off (observe).
+2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
+   change that sends it.
+3. Flip each receiver only after confirming known Blossom requests are
+   authenticated on it, rather than gating on global counters that include
+   every caller of the public route:
+   - On `divine-upload-server` (GKE): start from thumbnail generations in
+     Blossom's own edge logs, find their ids in this service's access log
+     (matching on the truncated prefix) alongside
+     `divine_thumbnail_authenticated_total`, and confirm none of them appears on
+     a `"Thumbnail served without a valid service token (not yet required)"`
+     line (which logs `request_id` and `reason`).
+   - On `blossom-upload-rust` (Cloud Run): confirm authenticated Blossom
+     requests using its own observe-mode logging/metrics as documented in
+     `divinevideo/divine-blossom#417`.
+
+   Blossom pins an id on every viewer request before routing, so its viewer
+   `GET` and `HEAD` calls send
+   `x-request-id: blossom-thumbnail-<Blossom request id>` (truncated to 64
+   characters in upload logs), while archive-import calls and ids with no usable
+   characters send bare `blossom-thumbnail`. Any caller can send any
+   `x-request-id`, so always start from Blossom's edge logs before counting a
+   hit as Blossom's. Treat aggregate
+   `divine_thumbnail_unauthenticated_total{reason="invalid"}` /
+   `reason="missing"` rates as diagnostic signals rather than sole gates: new
+   `reason="invalid"` increments point to a mismatched secret copy, and
+   `reason="missing"` may never reach zero on a public route.
+4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
+
+Rolling back means setting `THUMBNAIL_TOKEN_REQUIRED=false` in
+`divine-iac-coreconfig` and a manual ArgoCD sync, so it is not instant. While a
+wrong flip is live, only thumbnails not yet in storage fail: Blossom serves
+stored thumbnails directly and edge-caches the resulting 404s for about a minute.
+
+### Rotating the token
+
+There are three copies of the one token, and every copy must change before the
+token is required again:
+
+1. GCP Secret Manager in `dv-platform-prod`, read by this service on GKE
+   through External Secrets.
+2. GCP Secret Manager in `rich-compiler-479518-d2`, bound to divine-blossom's
+   Cloud Run `blossom-upload-rust`, which serves the same route.
+3. Fastly `blossom_secrets` (`thumbnail_service_token`), which Blossom sends.
+
+The token is read once at startup and a single value is accepted, so rotation
+as documented here goes through observe mode, which temporarily reopens the
+route to callers without the token while it lasts. Whether that window is
+acceptable, or whether rotation requires overlapping tokens so enforcement never
+lapses, is a Platform decision. With the window, change the receivers before the
+sender:
+
+1. Set `THUMBNAIL_TOKEN_REQUIRED=false` on both upload services and roll them.
+   From here no copy can break a request.
+2. Update both GCP secrets, then roll this service once External Secrets has
+   refreshed (up to an hour, or force a refresh) and deploy a new
+   `blossom-upload-rust` revision. Blossom still sends the old token, which
+   shows as `reason="invalid"` but is served.
+3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
+   `authenticated` rises.
+4. Set the flag back to `true` on each service only after confirming Blossom's
+   requests authenticate on it as in [Rollout](#rollout) step 3, and recheck
+   every other supported caller (such as `backfill-thumbnails.py`): a caller
+   that sends no token shows only as `reason="missing"`, never `invalid`, so
+   `reason="invalid"` stopping is not proof by itself.
 
 ## B2 primary with optional synchronous GCS backup
 
