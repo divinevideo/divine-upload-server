@@ -1,11 +1,14 @@
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+import urllib.request
 
 spec = importlib.util.spec_from_file_location('thumbnail_helper', Path(__file__).parents[1] / 'backfill-thumbnails.py')
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
+
 
 class StorageModeTests(unittest.TestCase):
     def test_rejects_dual_and_b2_before_provider_operations(self):
@@ -19,10 +22,145 @@ class StorageModeTests(unittest.TestCase):
             self.assertEqual(helper.parse_args().storage_provider, 'gcs')
 
 
+class UploadUrlValidationTests(unittest.TestCase):
+    def test_rejects_non_https_and_malformed_upload_urls(self):
+        for bad in (
+            'http://upload.divine.video',
+            'https://user:pass@upload.divine.video',
+            'https://upload.divine.video/subpath',
+            'https://upload.divine.video?a=1',
+            'https://upload.divine.video#frag',
+        ):
+            with self.subTest(url=bad):
+                with self.assertRaises(ValueError):
+                    helper.validate_upload_url(bad, allow_non_default=True)
+
+    def test_non_default_https_origin_requires_explicit_opt_in(self):
+        self.assertEqual(
+            helper.validate_upload_url('https://upload.divine.video/'),
+            helper.DEFAULT_UPLOAD_URL,
+        )
+        with self.assertRaises(ValueError):
+            helper.validate_upload_url('https://staging-upload.example')
+        self.assertEqual(
+            helper.validate_upload_url(
+                'https://staging-upload.example/', allow_non_default=True
+            ),
+            'https://staging-upload.example',
+        )
+
+    def test_parse_args_rejects_non_default_without_opt_in(self):
+        with patch('sys.argv', ['backfill-thumbnails.py', '--upload-url', 'https://other.example']):
+            with self.assertRaises(SystemExit):
+                helper.parse_args()
+        with patch(
+            'sys.argv',
+            [
+                'backfill-thumbnails.py',
+                '--upload-url',
+                'https://other.example/',
+                '--allow-non-default-upload-url',
+            ],
+        ):
+            args = helper.parse_args()
+        self.assertEqual(args.upload_url, 'https://other.example')
+
+
+class TokenResolutionTests(unittest.TestCase):
+    def test_requires_token_unless_explicitly_allowed(self):
+        with patch.dict('os.environ', {}, clear=True):
+            with self.assertRaises(SystemExit):
+                helper.resolve_thumbnail_token()
+            self.assertEqual(
+                helper.resolve_thumbnail_token(allow_unauthenticated=True), ''
+            )
+
+    def test_rejects_non_visible_ascii_token_without_echoing_it(self):
+        with patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'bad token'}, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                helper.resolve_thumbnail_token()
+        self.assertNotIn('bad token', str(ctx.exception))
+
+
+class ThumbnailHttpHelperTests(unittest.TestCase):
+    def test_request_refuses_to_send_token_over_http(self):
+        with self.assertRaises(ValueError):
+            helper.request(
+                'http://upload.divine.video/thumbnail/' + ('a' * 64),
+                headers={'X-Divine-Thumbnail-Token': 'svc-token'},
+            )
+
+    def test_request_does_not_follow_redirects_with_token(self):
+        seen_urls = []
+
+        class StubHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                seen_urls.append(req.full_url)
+                resp = urllib.request.addinfourl(
+                    BytesIO(b''),
+                    {'Location': 'https://evil.example/steal'},
+                    req.full_url,
+                    302,
+                )
+                resp.msg = 'Found'
+                return resp
+
+        orig_build_opener = urllib.request.build_opener
+        helper.THREAD_LOCAL.openers = {}
+        try:
+            with patch.object(
+                urllib.request,
+                'build_opener',
+                side_effect=lambda *handlers: orig_build_opener(StubHTTPSHandler(), *handlers),
+            ):
+                status = helper.request(
+                    'https://upload.divine.video/thumbnail/' + ('a' * 64),
+                    headers={'X-Divine-Thumbnail-Token': 'svc-token'},
+                    follow_redirects=True,
+                )
+        finally:
+            helper.THREAD_LOCAL.openers = {}
+        self.assertEqual(status, 302)
+        self.assertEqual(
+            seen_urls,
+            ['https://upload.divine.video/thumbnail/' + ('a' * 64)],
+        )
+
+
+class ThumbnailPreflightTests(unittest.TestCase):
+    def test_preflight_allows_400_and_blocks_404_or_302(self):
+        with patch.object(helper, 'request', return_value=400):
+            helper.verify_thumbnail_access(
+                helper.DEFAULT_UPLOAD_URL,
+                headers={'X-Divine-Thumbnail-Token': 'svc-token'},
+            )
+        for bad_status in (404, 302, 503):
+            with self.subTest(status=bad_status), patch.object(
+                helper, 'request', return_value=bad_status
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    helper.verify_thumbnail_access(
+                        helper.DEFAULT_UPLOAD_URL,
+                        headers={'X-Divine-Thumbnail-Token': 'svc-token'},
+                    )
+                self.assertNotIn('svc-token', str(ctx.exception))
+
+    def test_main_aborts_on_preflight_404_before_deleting_anything(self):
+        with (
+            patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'svc-token'}, clear=True),
+            patch('sys.argv', ['backfill-thumbnails.py', 'a' * 64]),
+            patch.object(helper, 'request', return_value=404),
+            patch.object(helper, 'process_hash') as process_mock,
+        ):
+            with self.assertRaises(SystemExit):
+                helper.main()
+        process_mock.assert_not_called()
+
+
 class ThumbnailServiceTokenTests(unittest.TestCase):
     """The upload server can require Blossom's service token on /thumbnail (issue #52)."""
 
-    def regenerate_headers(self, env):
+    def regenerate_kwargs(self, env):
         calls = []
 
         def fake_request(url, **kwargs):
@@ -30,17 +168,24 @@ class ThumbnailServiceTokenTests(unittest.TestCase):
             return 200
 
         with patch.dict('os.environ', env, clear=True), patch.object(helper, 'request', side_effect=fake_request):
-            helper.process_hash('a' * 64, 'bucket', 'https://upload.test', 'https://media.test')
+            helper.process_hash(
+                'a' * 64,
+                'bucket',
+                'https://upload.test',
+                'https://media.test',
+                allow_non_default=True,
+            )
         regenerate = [kwargs for url, kwargs in calls if '/thumbnail/' in url]
         self.assertEqual(len(regenerate), 1)
-        return regenerate[0].get('headers') or {}
+        return regenerate[0]
 
-    def test_sends_the_service_token_when_configured(self):
-        headers = self.regenerate_headers({'THUMBNAIL_SERVICE_TOKEN': ' svc-token '})
-        self.assertEqual(headers.get('X-Divine-Thumbnail-Token'), 'svc-token')
+    def test_sends_the_service_token_when_configured_without_redirects(self):
+        kwargs = self.regenerate_kwargs({'THUMBNAIL_SERVICE_TOKEN': ' svc-token '})
+        self.assertEqual((kwargs.get('headers') or {}).get('X-Divine-Thumbnail-Token'), 'svc-token')
+        self.assertIs(kwargs.get('follow_redirects'), False)
 
     def test_sends_no_token_header_when_unset(self):
-        headers = self.regenerate_headers({})
+        headers = self.regenerate_kwargs({}).get('headers') or {}
         self.assertNotIn('X-Divine-Thumbnail-Token', headers)
 
 

@@ -65,11 +65,64 @@ pub enum Decision {
     Reject(Reason),
 }
 
-static AUTHENTICATED: AtomicU64 = AtomicU64::new(0);
-static UNAUTHENTICATED_MISSING: AtomicU64 = AtomicU64::new(0);
-static UNAUTHENTICATED_INVALID: AtomicU64 = AtomicU64::new(0);
-static REJECTED_MISSING: AtomicU64 = AtomicU64::new(0);
-static REJECTED_INVALID: AtomicU64 = AtomicU64::new(0);
+struct Counters {
+    authenticated: AtomicU64,
+    unauthenticated_missing: AtomicU64,
+    unauthenticated_invalid: AtomicU64,
+    rejected_missing: AtomicU64,
+    rejected_invalid: AtomicU64,
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            authenticated: AtomicU64::new(0),
+            unauthenticated_missing: AtomicU64::new(0),
+            unauthenticated_invalid: AtomicU64::new(0),
+            rejected_missing: AtomicU64::new(0),
+            rejected_invalid: AtomicU64::new(0),
+        }
+    }
+
+    fn render_metrics(&self) -> String {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        format!(
+            "# HELP divine_thumbnail_authenticated_total Thumbnail requests carrying a valid \
+             service token.\n\
+             # TYPE divine_thumbnail_authenticated_total counter\n\
+             divine_thumbnail_authenticated_total {}\n\
+             # HELP divine_thumbnail_unauthenticated_total Thumbnail requests served without \
+             a valid service token while the token is not required.\n\
+             # TYPE divine_thumbnail_unauthenticated_total counter\n\
+             divine_thumbnail_unauthenticated_total{{reason=\"missing\"}} {}\n\
+             divine_thumbnail_unauthenticated_total{{reason=\"invalid\"}} {}\n\
+             # HELP divine_thumbnail_rejected_total Thumbnail requests refused for a missing \
+             or invalid service token.\n\
+             # TYPE divine_thumbnail_rejected_total counter\n\
+             divine_thumbnail_rejected_total{{reason=\"missing\"}} {}\n\
+             divine_thumbnail_rejected_total{{reason=\"invalid\"}} {}\n",
+            load(&self.authenticated),
+            load(&self.unauthenticated_missing),
+            load(&self.unauthenticated_invalid),
+            load(&self.rejected_missing),
+            load(&self.rejected_invalid),
+        )
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Counts {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        Counts {
+            authenticated: load(&self.authenticated),
+            unauthenticated_missing: load(&self.unauthenticated_missing),
+            unauthenticated_invalid: load(&self.unauthenticated_invalid),
+            rejected_missing: load(&self.rejected_missing),
+            rejected_invalid: load(&self.rejected_invalid),
+        }
+    }
+}
+
+static GLOBAL_COUNTERS: Counters = Counters::new();
 
 impl Policy {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -132,6 +185,10 @@ impl Policy {
     }
 
     pub fn decide(&self, headers: &HeaderMap) -> Decision {
+        self.decide_with(&GLOBAL_COUNTERS, headers)
+    }
+
+    fn decide_with(&self, counters: &Counters, headers: &HeaderMap) -> Decision {
         let expected = match self {
             Policy::Open => return Decision::Allow,
             Policy::Observe(token) | Policy::Required(token) => token,
@@ -140,17 +197,17 @@ impl Policy {
         let reason = match (values.next(), values.next()) {
             (None, None) => Reason::Missing,
             (Some(value), None) if presented_matches(value, expected) => {
-                AUTHENTICATED.fetch_add(1, Ordering::Relaxed);
+                counters.authenticated.fetch_add(1, Ordering::Relaxed);
                 return Decision::Allow;
             }
             _ => Reason::Invalid,
         };
         let required = matches!(self, Policy::Required(_));
         let counter = match (required, reason) {
-            (true, Reason::Missing) => &REJECTED_MISSING,
-            (true, Reason::Invalid) => &REJECTED_INVALID,
-            (false, Reason::Missing) => &UNAUTHENTICATED_MISSING,
-            (false, Reason::Invalid) => &UNAUTHENTICATED_INVALID,
+            (true, Reason::Missing) => &counters.rejected_missing,
+            (true, Reason::Invalid) => &counters.rejected_invalid,
+            (false, Reason::Missing) => &counters.unauthenticated_missing,
+            (false, Reason::Invalid) => &counters.unauthenticated_invalid,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         if required {
@@ -191,28 +248,7 @@ fn presented_matches(value: &axum::http::HeaderValue, expected: &str) -> bool {
 }
 
 pub fn metrics() -> String {
-    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
-    format!(
-        "# HELP divine_thumbnail_authenticated_total Thumbnail requests carrying a valid \
-         service token.\n\
-         # TYPE divine_thumbnail_authenticated_total counter\n\
-         divine_thumbnail_authenticated_total {}\n\
-         # HELP divine_thumbnail_unauthenticated_total Thumbnail requests served without \
-         a valid service token while the token is not required.\n\
-         # TYPE divine_thumbnail_unauthenticated_total counter\n\
-         divine_thumbnail_unauthenticated_total{{reason=\"missing\"}} {}\n\
-         divine_thumbnail_unauthenticated_total{{reason=\"invalid\"}} {}\n\
-         # HELP divine_thumbnail_rejected_total Thumbnail requests refused for a missing \
-         or invalid service token.\n\
-         # TYPE divine_thumbnail_rejected_total counter\n\
-         divine_thumbnail_rejected_total{{reason=\"missing\"}} {}\n\
-         divine_thumbnail_rejected_total{{reason=\"invalid\"}} {}\n",
-        load(&AUTHENTICATED),
-        load(&UNAUTHENTICATED_MISSING),
-        load(&UNAUTHENTICATED_INVALID),
-        load(&REJECTED_MISSING),
-        load(&REJECTED_INVALID),
-    )
+    GLOBAL_COUNTERS.render_metrics()
 }
 
 #[cfg(test)]
@@ -227,14 +263,7 @@ pub struct Counts {
 
 #[cfg(test)]
 pub fn counts() -> Counts {
-    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
-    Counts {
-        authenticated: load(&AUTHENTICATED),
-        unauthenticated_missing: load(&UNAUTHENTICATED_MISSING),
-        unauthenticated_invalid: load(&UNAUTHENTICATED_INVALID),
-        rejected_missing: load(&REJECTED_MISSING),
-        rejected_invalid: load(&REJECTED_INVALID),
-    }
+    GLOBAL_COUNTERS.snapshot()
 }
 
 #[cfg(test)]
@@ -298,32 +327,50 @@ mod tests {
 
     #[test]
     fn open_allows_everything() {
-        assert_eq!(Policy::Open.decide(&headers(None)), Decision::Allow);
-        assert_eq!(Policy::Open.decide(&headers(Some("x"))), Decision::Allow);
+        let counters = Counters::new();
+        assert_eq!(
+            Policy::Open.decide_with(&counters, &headers(None)),
+            Decision::Allow
+        );
+        assert_eq!(
+            Policy::Open.decide_with(&counters, &headers(Some("x"))),
+            Decision::Allow
+        );
     }
 
     #[test]
     fn observe_allows_and_says_why_a_token_was_missing_or_wrong() {
+        let counters = Counters::new();
         let p = Policy::Observe("s3cret".into());
-        assert_eq!(p.decide(&headers(Some("s3cret"))), Decision::Allow);
         assert_eq!(
-            p.decide(&headers(None)),
+            p.decide_with(&counters, &headers(Some("s3cret"))),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide_with(&counters, &headers(None)),
             Decision::AllowUnauthenticated(Reason::Missing)
         );
         assert_eq!(
-            p.decide(&headers(Some("s3cre"))),
+            p.decide_with(&counters, &headers(Some("s3cre"))),
             Decision::AllowUnauthenticated(Reason::Invalid)
         );
     }
 
     #[test]
     fn required_rejects_missing_wrong_and_prefixed_tokens() {
+        let counters = Counters::new();
         let p = Policy::Required("s3cret".into());
-        assert_eq!(p.decide(&headers(Some("s3cret"))), Decision::Allow);
-        assert_eq!(p.decide(&headers(None)), Decision::Reject(Reason::Missing));
+        assert_eq!(
+            p.decide_with(&counters, &headers(Some("s3cret"))),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide_with(&counters, &headers(None)),
+            Decision::Reject(Reason::Missing)
+        );
         for wrong in ["s3cret2", "Bearer s3cret", ""] {
             assert_eq!(
-                p.decide(&headers(Some(wrong))),
+                p.decide_with(&counters, &headers(Some(wrong))),
                 Decision::Reject(Reason::Invalid),
                 "{wrong:?}"
             );
@@ -332,25 +379,26 @@ mod tests {
 
     #[test]
     fn duplicate_token_headers_are_rejected_as_invalid() {
+        let counters = Counters::new();
         let mut mixed = headers(Some("s3cret"));
         mixed.append(HEADER, "wrong".parse().unwrap());
         assert_eq!(
-            Policy::Required("s3cret".into()).decide(&mixed),
+            Policy::Required("s3cret".into()).decide_with(&counters, &mixed),
             Decision::Reject(Reason::Invalid)
         );
         assert_eq!(
-            Policy::Observe("s3cret".into()).decide(&mixed),
+            Policy::Observe("s3cret".into()).decide_with(&counters, &mixed),
             Decision::AllowUnauthenticated(Reason::Invalid)
         );
 
         let mut repeated = headers(Some("s3cret"));
         repeated.append(HEADER, "s3cret".parse().unwrap());
         assert_eq!(
-            Policy::Required("s3cret".into()).decide(&repeated),
+            Policy::Required("s3cret".into()).decide_with(&counters, &repeated),
             Decision::Reject(Reason::Invalid)
         );
         assert_eq!(
-            Policy::Observe("s3cret".into()).decide(&repeated),
+            Policy::Observe("s3cret".into()).decide_with(&counters, &repeated),
             Decision::AllowUnauthenticated(Reason::Invalid)
         );
     }
@@ -391,31 +439,31 @@ mod tests {
 
     #[test]
     fn counters_separate_authenticated_missing_and_invalid_requests() {
-        let before = counts();
-        Policy::Observe("t".into()).decide(&headers(Some("t")));
-        Policy::Observe("t".into()).decide(&headers(None));
-        Policy::Observe("t".into()).decide(&headers(Some("x")));
-        Policy::Required("t".into()).decide(&headers(None));
-        Policy::Required("t".into()).decide(&headers(Some("x")));
-        Policy::Open.decide(&headers(None));
-        let after = counts();
-        assert!(after.authenticated > before.authenticated);
-        assert!(after.unauthenticated_missing > before.unauthenticated_missing);
-        assert!(after.unauthenticated_invalid > before.unauthenticated_invalid);
-        assert!(after.rejected_missing > before.rejected_missing);
-        assert!(after.rejected_invalid > before.rejected_invalid);
-        let body = metrics();
+        let counters = Counters::new();
+        Policy::Observe("t".into()).decide_with(&counters, &headers(Some("t")));
+        Policy::Observe("t".into()).decide_with(&counters, &headers(None));
+        Policy::Observe("t".into()).decide_with(&counters, &headers(Some("x")));
+        Policy::Required("t".into()).decide_with(&counters, &headers(None));
+        Policy::Required("t".into()).decide_with(&counters, &headers(Some("x")));
+        Policy::Open.decide_with(&counters, &headers(None));
+        let snap = counters.snapshot();
+        assert_eq!(snap.authenticated, 1);
+        assert_eq!(snap.unauthenticated_missing, 1);
+        assert_eq!(snap.unauthenticated_invalid, 1);
+        assert_eq!(snap.rejected_missing, 1);
+        assert_eq!(snap.rejected_invalid, 1);
+        let body = counters.render_metrics();
         for line in [
             "# TYPE divine_thumbnail_authenticated_total counter\n",
             "# TYPE divine_thumbnail_unauthenticated_total counter\n",
             "# TYPE divine_thumbnail_rejected_total counter\n",
-            "\ndivine_thumbnail_authenticated_total ",
-            "divine_thumbnail_unauthenticated_total{reason=\"missing\"} ",
-            "divine_thumbnail_unauthenticated_total{reason=\"invalid\"} ",
-            "divine_thumbnail_rejected_total{reason=\"missing\"} ",
-            "divine_thumbnail_rejected_total{reason=\"invalid\"} ",
+            "\ndivine_thumbnail_authenticated_total 1\n",
+            "divine_thumbnail_unauthenticated_total{reason=\"missing\"} 1\n",
+            "divine_thumbnail_unauthenticated_total{reason=\"invalid\"} 1\n",
+            "divine_thumbnail_rejected_total{reason=\"missing\"} 1\n",
+            "divine_thumbnail_rejected_total{reason=\"invalid\"} 1\n",
         ] {
-            assert!(body.contains(line), "{line}");
+            assert!(body.contains(line), "{line}\n{body}");
         }
     }
 }

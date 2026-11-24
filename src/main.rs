@@ -2097,6 +2097,7 @@ mod tests {
     #[tokio::test]
     async fn required_thumbnail_token_refuses_without_touching_storage() {
         use axum::response::IntoResponse;
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
         let (endpoint, hits, server) = counting_thumbnail_storage().await;
         let state = thumbnail_state(
             endpoint,
@@ -2143,7 +2144,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"prior-jpeg");
-        assert!(crate::thumbnail_auth::counts().authenticated > authenticated_before);
+        assert_eq!(
+            crate::thumbnail_auth::counts().authenticated,
+            authenticated_before + 1
+        );
         server.abort();
     }
 
@@ -2166,7 +2170,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let after = crate::thumbnail_auth::counts().unauthenticated_missing;
-        assert!(after > before);
+        assert_eq!(after, before + 1);
         server.abort();
     }
 
@@ -2290,8 +2294,12 @@ mod tests {
         )
         .await
         .into_response();
-        assert!(response.status().is_server_error(), "{}", response.status());
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_not_shared_cacheable(&response, "generation failure");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"Failed to generate thumbnail"}"#);
         server.abort();
     }
 

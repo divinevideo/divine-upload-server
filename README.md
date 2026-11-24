@@ -187,24 +187,29 @@ a shared token in `X-Divine-Thumbnail-Token`, and this service can require it
 
 The token must be visible ASCII with no spaces, or the server refuses to start.
 It is compared in constant time and never logged. Whenever a token is
-configured, every `/thumbnail/:hash` response (served, refused or failed)
-carries `Cache-Control: private, no-store` and `Vary: X-Divine-Thumbnail-Token`,
-so no shared cache can hand an authorized response to an unauthenticated caller
-or keep serving a refusal.
+configured, every `GET` or `HEAD` `/thumbnail/:hash` response returned by the
+thumbnail handler (served, refused, or failed) carries
+`Cache-Control: private, no-store` and `Vary: X-Divine-Thumbnail-Token`, so no
+shared cache can hand an authorized response to an unauthenticated caller or
+keep serving a refusal (`OPTIONS` CORS preflight and pre-handler Axum path
+rejections run outside that handler).
 
-The internal metrics listener counts every request once a token is configured:
+The internal metrics listener counts every request reaching the handler once a
+token is configured:
 
 | Counter | Meaning |
 | --- | --- |
-| `divine_thumbnail_authenticated_total` | Carried the valid token. This is Blossom's traffic once it sends the token. |
+| `divine_thumbnail_authenticated_total` | Carried the valid token (Blossom traffic, `backfill-thumbnails.py`, and any authenticated request that later fails with 400/404/500/503). |
 | `divine_thumbnail_unauthenticated_total{reason="missing"}` | Served without any token (observe mode). |
-| `divine_thumbnail_unauthenticated_total{reason="invalid"}` | Served with a wrong token (observe mode). Nonzero means a copy of the secret doesn't match. |
+| `divine_thumbnail_unauthenticated_total{reason="invalid"}` | Cumulative requests served with a wrong or duplicate token (observe mode). New increments mean a caller or secret copy does not match. |
 | `divine_thumbnail_rejected_total{reason="missing"\|"invalid"}` | Refused (required mode). |
 
-`backfill-thumbnails.py` sends the token when `THUMBNAIL_SERVICE_TOKEN` is set
-in its environment. It warns at start when the token is unset (after the flip,
-each regeneration would fail as `regenerate:404`) and when the token would go to
-a non-default `--upload-url`.
+`backfill-thumbnails.py` requires `THUMBNAIL_SERVICE_TOKEN` by default (pass
+`--allow-unauthenticated` only for open/observe environments), enforces an
+HTTPS origin (requiring `--allow-non-default-upload-url` for hosts other than
+`DEFAULT_UPLOAD_URL`), disables HTTP redirects on token-bearing requests, and
+runs a non-destructive preflight against `/thumbnail/preflight-check` before
+deleting any stored JPEG.
 
 ### Rollout
 
@@ -220,11 +225,13 @@ which serves the same route, and into Blossom's Fastly `blossom_secrets` store a
 2. Put the same value in Fastly `blossom_secrets`, then deploy the Blossom
    change that sends it.
 3. Flip only when `divine_thumbnail_authenticated_total` rises with Blossom's
-   on-demand thumbnail generation, `reason="invalid"` stays at zero, and any
-   remaining `reason="missing"` hits are traced to callers other than Blossom
-   (Blossom's calls carry `x-request-id: blossom-thumbnail-<Blossom request id>`,
-   so a hit can be matched to the Blossom request that caused it; other callers
-   log their own id or `-`).
+   on-demand thumbnail generation, the rate of
+   `divine_thumbnail_unauthenticated_total{reason="invalid"}` is zero (no new
+   increments), and any remaining `reason="missing"` hits are traced to callers
+   other than Blossom (Blossom's viewer `GET` calls carry
+   `x-request-id: blossom-thumbnail-<Blossom request id>`, truncated to 64
+   characters in upload logs, while `HEAD` and archive-import calls send bare
+   `blossom-thumbnail`; other callers log their own id or `-`).
    `missing` may never reach zero on a public route, so it is not the criterion.
 4. Set `THUMBNAIL_TOKEN_REQUIRED=true`.
 
@@ -254,8 +261,9 @@ through observe mode, changing the receivers before the sender:
    `blossom-upload-rust` revision. Blossom still sends the old token, which
    shows as `reason="invalid"` but is served.
 3. Update Fastly `blossom_secrets`. Blossom now sends the new token:
-   `authenticated` rises and `invalid` stops.
-4. Once `invalid` stays at zero on both services, set the flag back to `true`.
+   `authenticated` rises and new `invalid` increments stop.
+4. Once `reason="invalid"` stops incrementing on both services, set the flag back
+   to `true`.
 
 ## B2 primary with optional synchronous GCS backup
 
