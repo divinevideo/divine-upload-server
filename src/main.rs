@@ -400,6 +400,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/audit", post(handle_audit_log))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route("/thumbnail/auth-check", get(handle_thumbnail_auth_check))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", get(handle_landing))
@@ -1580,6 +1581,50 @@ fn thumbnail_not_found() -> Response {
         .into_response()
 }
 
+fn attach_thumbnail_cache_headers(response: &mut Response) {
+    // Once a token decides who gets a thumbnail (or on `/thumbnail/auth-check`),
+    // no shared cache in front of this host may store any answer, so every
+    // response is private and varies on the token header.
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static(thumbnail_auth::HEADER),
+    );
+}
+
+/// Non-destructive credential check for `backfill-thumbnails.py` before it
+/// deletes stored JPEGs. Positively distinguishes open mode vs a verified token
+/// without touching storage or mutating rollout counters.
+async fn handle_thumbnail_auth_check(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let mut response = match &state.config.thumbnail_auth {
+        thumbnail_auth::Policy::Open => (
+            StatusCode::NO_CONTENT,
+            [(thumbnail_auth::AUTH_STATUS_HEADER, "open")],
+        )
+            .into_response(),
+        thumbnail_auth::Policy::Observe(_) | thumbnail_auth::Policy::Required(_) => {
+            if state.config.thumbnail_auth.verify_presented_token(&headers) {
+                (
+                    StatusCode::NO_CONTENT,
+                    [(thumbnail_auth::AUTH_STATUS_HEADER, "verified")],
+                )
+                    .into_response()
+            } else {
+                thumbnail_not_found()
+            }
+        }
+    };
+    attach_thumbnail_cache_headers(&mut response);
+    response
+}
+
 /// On-demand thumbnail generation endpoint
 /// Resolves the recorded original, generates a thumbnail, and preserves its storage policy.
 async fn handle_thumbnail_generate(
@@ -1592,19 +1637,7 @@ async fn handle_thumbnail_generate(
         .await
         .into_response();
     if guarded {
-        // Once a token decides who gets a thumbnail, no shared cache in front of
-        // this host may store any answer (an authorized 200 must not reach an
-        // unauthenticated caller, and a refusal must not stick), so every
-        // response is private and varies on the token header.
-        let headers = response.headers_mut();
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        headers.append(
-            header::VARY,
-            HeaderValue::from_static(thumbnail_auth::HEADER),
-        );
+        attach_thumbnail_cache_headers(&mut response);
     }
     response
 }
@@ -2203,6 +2236,126 @@ mod tests {
             .unwrap();
         assert_eq!(served.status(), StatusCode::OK);
         assert_not_shared_cacheable(&served, "router served");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_auth_check_positively_verifies_access_without_touching_storage_or_counters()
+    {
+        let _guard = ADMISSION_TEST_MUTEX.lock().await;
+        let (endpoint, hits, server) = counting_thumbnail_storage().await;
+
+        let counters_before = crate::thumbnail_auth::counts();
+
+        let open_app = super::build_router(thumbnail_state(
+            endpoint.clone(),
+            crate::thumbnail_auth::Policy::Open,
+        ));
+        let open_resp = open_app
+            .oneshot(
+                Request::get("/thumbnail/auth-check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open_resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            open_resp
+                .headers()
+                .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("open")
+        );
+        assert_not_shared_cacheable(&open_resp, "auth-check open");
+
+        for policy in [
+            crate::thumbnail_auth::Policy::Observe("svc-token".into()),
+            crate::thumbnail_auth::Policy::Required("svc-token".into()),
+        ] {
+            let mode = policy.mode();
+            let app = super::build_router(thumbnail_state(endpoint.clone(), policy));
+
+            let ok_resp = app
+                .clone()
+                .oneshot(
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok_resp.status(), StatusCode::NO_CONTENT, "{mode} valid");
+            assert_eq!(
+                ok_resp
+                    .headers()
+                    .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("verified"),
+                "{mode} valid"
+            );
+            assert_not_shared_cacheable(&ok_resp, &format!("{mode} auth-check valid"));
+
+            for (case, req) in [
+                (
+                    "missing",
+                    Request::get("/thumbnail/auth-check")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+                (
+                    "wrong",
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "wrong-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+                (
+                    "duplicate",
+                    Request::get("/thumbnail/auth-check")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .header(crate::thumbnail_auth::HEADER, "svc-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            ] {
+                let bad_resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(bad_resp.status(), StatusCode::NOT_FOUND, "{mode} {case}");
+                assert!(
+                    bad_resp
+                        .headers()
+                        .get(crate::thumbnail_auth::AUTH_STATUS_HEADER)
+                        .is_none(),
+                    "{mode} {case} must not emit auth status header"
+                );
+                assert_not_shared_cacheable(&bad_resp, &format!("{mode} auth-check {case}"));
+                let body = axum::body::to_bytes(bad_resp.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(&body[..], br#"{"error":"Video not found"}"#);
+            }
+        }
+
+        let counters_after = crate::thumbnail_auth::counts();
+        assert_eq!(counters_after.authenticated, counters_before.authenticated);
+        assert_eq!(
+            counters_after.unauthenticated_missing,
+            counters_before.unauthenticated_missing
+        );
+        assert_eq!(
+            counters_after.unauthenticated_invalid,
+            counters_before.unauthenticated_invalid
+        );
+        assert_eq!(
+            counters_after.rejected_missing,
+            counters_before.rejected_missing
+        );
+        assert_eq!(
+            counters_after.rejected_invalid,
+            counters_before.rejected_invalid
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         server.abort();
     }
 

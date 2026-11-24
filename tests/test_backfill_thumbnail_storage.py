@@ -1,5 +1,5 @@
 import importlib.util
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -126,17 +126,69 @@ class ThumbnailHttpHelperTests(unittest.TestCase):
             ['https://upload.divine.video/thumbnail/' + ('a' * 64)],
         )
 
+    def test_request_with_headers_returns_lowercased_response_headers(self):
+        class StubHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                resp = urllib.request.addinfourl(
+                    BytesIO(b''),
+                    {'X-Divine-Thumbnail-Auth': ' verified '},
+                    req.full_url,
+                    204,
+                )
+                resp.msg = 'No Content'
+                return resp
+
+        orig_build_opener = urllib.request.build_opener
+        helper.THREAD_LOCAL.openers = {}
+        try:
+            with patch.object(
+                urllib.request,
+                'build_opener',
+                side_effect=lambda *handlers: orig_build_opener(StubHTTPSHandler(), *handlers),
+            ):
+                status, resp_headers = helper.request_with_headers(
+                    'https://upload.divine.video/thumbnail/auth-check',
+                    headers={'X-Divine-Thumbnail-Token': 'svc-token'},
+                )
+        finally:
+            helper.THREAD_LOCAL.openers = {}
+        self.assertEqual(status, 204)
+        self.assertEqual(resp_headers.get('x-divine-thumbnail-auth'), 'verified')
+
 
 class ThumbnailPreflightTests(unittest.TestCase):
-    def test_preflight_allows_400_and_blocks_404_or_302(self):
-        with patch.object(helper, 'request', return_value=400):
+    def test_preflight_with_token_requires_204_and_verified_header(self):
+        seen = []
+
+        def fake_request(url, **kwargs):
+            seen.append((url, kwargs))
+            return 204, {'x-divine-thumbnail-auth': 'verified'}
+
+        with patch.object(helper, 'request_with_headers', side_effect=fake_request):
             helper.verify_thumbnail_access(
                 helper.DEFAULT_UPLOAD_URL,
                 headers={'X-Divine-Thumbnail-Token': 'svc-token'},
             )
-        for bad_status in (404, 302, 503):
-            with self.subTest(status=bad_status), patch.object(
-                helper, 'request', return_value=bad_status
+        self.assertEqual(
+            seen,
+            [
+                (
+                    f'{helper.DEFAULT_UPLOAD_URL}/thumbnail/auth-check',
+                    {'headers': {'X-Divine-Thumbnail-Token': 'svc-token'}, 'follow_redirects': False},
+                )
+            ],
+        )
+
+        for bad_response in (
+            (400, {}),
+            (204, {}),
+            (204, {'x-divine-thumbnail-auth': 'open'}),
+            (404, {}),
+            (302, {}),
+            (503, {}),
+        ):
+            with self.subTest(resp=bad_response), patch.object(
+                helper, 'request_with_headers', return_value=bad_response
             ):
                 with self.assertRaises(SystemExit) as ctx:
                     helper.verify_thumbnail_access(
@@ -145,15 +197,56 @@ class ThumbnailPreflightTests(unittest.TestCase):
                     )
                 self.assertNotIn('svc-token', str(ctx.exception))
 
-    def test_main_aborts_on_preflight_404_before_deleting_anything(self):
-        with (
-            patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'svc-token'}, clear=True),
-            patch('sys.argv', ['backfill-thumbnails.py', 'a' * 64]),
-            patch.object(helper, 'request', return_value=404),
-            patch.object(helper, 'process_hash') as process_mock,
+    def test_preflight_unauthenticated_requires_204_and_open_header(self):
+        with patch.object(
+            helper,
+            'request_with_headers',
+            return_value=(204, {'x-divine-thumbnail-auth': 'open'}),
         ):
-            with self.assertRaises(SystemExit):
-                helper.main()
+            helper.verify_thumbnail_access(helper.DEFAULT_UPLOAD_URL, headers={})
+
+        for bad_response in (
+            (400, {}),
+            (204, {}),
+            (204, {'x-divine-thumbnail-auth': 'verified'}),
+            (404, {}),
+            (302, {}),
+        ):
+            with self.subTest(resp=bad_response), patch.object(
+                helper, 'request_with_headers', return_value=bad_response
+            ):
+                with self.assertRaises(SystemExit):
+                    helper.verify_thumbnail_access(
+                        helper.DEFAULT_UPLOAD_URL, headers={}
+                    )
+
+    def test_main_aborts_on_generic_400_or_404_before_deleting_anything(self):
+        for bad_response in ((400, {}), (404, {})):
+            with (
+                self.subTest(resp=bad_response),
+                patch.dict('os.environ', {'THUMBNAIL_SERVICE_TOKEN': 'svc-token'}, clear=True),
+                patch('sys.argv', ['backfill-thumbnails.py', 'a' * 64]),
+                patch.object(helper, 'request_with_headers', return_value=bad_response),
+                patch.object(helper, 'process_hash') as process_mock,
+            ):
+                with self.assertRaises(SystemExit):
+                    helper.main()
+            process_mock.assert_not_called()
+
+    def test_dry_run_works_without_credentials_or_network_calls(self):
+        stdout = StringIO()
+        with (
+            patch.dict('os.environ', {}, clear=True),
+            patch('sys.argv', ['backfill-thumbnails.py', '--dry-run', 'a' * 64]),
+            patch.object(helper, 'request_with_headers') as req_headers_mock,
+            patch.object(helper, 'request') as req_mock,
+            patch.object(helper, 'process_hash') as process_mock,
+            patch('sys.stdout', stdout),
+        ):
+            helper.main()
+        self.assertEqual(stdout.getvalue().strip(), 'would_process=1')
+        req_headers_mock.assert_not_called()
+        req_mock.assert_not_called()
         process_mock.assert_not_called()
 
 

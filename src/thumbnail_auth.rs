@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Header divine-blossom sets on its `/thumbnail/<hash>` calls.
 pub const HEADER: &str = "x-divine-thumbnail-token";
+/// Header returned by `/thumbnail/auth-check` to positively confirm open vs verified auth.
+pub const AUTH_STATUS_HEADER: &str = "x-divine-thumbnail-auth";
 const TOKEN_ENV: &str = "THUMBNAIL_SERVICE_TOKEN";
 const REQUIRED_ENV: &str = "THUMBNAIL_TOKEN_REQUIRED";
 
@@ -188,19 +190,29 @@ impl Policy {
         self.decide_with(&GLOBAL_COUNTERS, headers)
     }
 
+    /// Check whether a single `X-Divine-Thumbnail-Token` header matches the
+    /// configured secret without mutating rollout metrics.
+    pub fn verify_presented_token(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Policy::Open => false,
+            Policy::Observe(expected) | Policy::Required(expected) => {
+                matches_single_header(headers, expected) == Some(true)
+            }
+        }
+    }
+
     fn decide_with(&self, counters: &Counters, headers: &HeaderMap) -> Decision {
         let expected = match self {
             Policy::Open => return Decision::Allow,
             Policy::Observe(token) | Policy::Required(token) => token,
         };
-        let mut values = headers.get_all(HEADER).iter();
-        let reason = match (values.next(), values.next()) {
-            (None, None) => Reason::Missing,
-            (Some(value), None) if presented_matches(value, expected) => {
+        let reason = match matches_single_header(headers, expected) {
+            None => Reason::Missing,
+            Some(true) => {
                 counters.authenticated.fetch_add(1, Ordering::Relaxed);
                 return Decision::Allow;
             }
-            _ => Reason::Invalid,
+            Some(false) => Reason::Invalid,
         };
         let required = matches!(self, Policy::Required(_));
         let counter = match (required, reason) {
@@ -227,6 +239,15 @@ impl Policy {
             }
             Policy::Required(_) => "/thumbnail requires the service token",
         }
+    }
+}
+
+fn matches_single_header(headers: &HeaderMap, expected: &str) -> Option<bool> {
+    let mut values = headers.get_all(HEADER).iter();
+    match (values.next(), values.next()) {
+        (None, None) => None,
+        (Some(value), None) => Some(presented_matches(value, expected)),
+        _ => Some(false),
     }
 }
 
@@ -401,6 +422,25 @@ mod tests {
             Policy::Observe("s3cret".into()).decide_with(&counters, &repeated),
             Decision::AllowUnauthenticated(Reason::Invalid)
         );
+    }
+
+    #[test]
+    fn verify_presented_token_checks_single_matching_header_across_policies() {
+        let mut duplicate = headers(Some("s3cret"));
+        duplicate.append(HEADER, "s3cret".parse().unwrap());
+
+        assert!(!Policy::Open.verify_presented_token(&headers(None)));
+        assert!(!Policy::Open.verify_presented_token(&headers(Some("s3cret"))));
+
+        for policy in [
+            Policy::Observe("s3cret".into()),
+            Policy::Required("s3cret".into()),
+        ] {
+            assert!(policy.verify_presented_token(&headers(Some("s3cret"))));
+            assert!(!policy.verify_presented_token(&headers(None)));
+            assert!(!policy.verify_presented_token(&headers(Some("wrong"))));
+            assert!(!policy.verify_presented_token(&duplicate));
+        }
     }
 
     #[cfg(unix)]

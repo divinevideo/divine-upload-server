@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Delete, regenerate, and revalidate thumbnails for a set of video hashes."""
+"""Delete, regenerate, and revalidate thumbnails for a set of video hashes.
+
+Deletes `<hash>.jpg` in GCS before calling `/thumbnail/<hash>`, so only run
+against a stable deployment (never during a token rollout flip or rotation).
+"""
 
 import argparse
 import os
@@ -20,7 +24,11 @@ DEFAULT_MEDIA_URL = "https://media.divine.video"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backfill thumbnails by deleting the stored JPEG, regenerating it, and revalidating the CDN URL."
+        description=(
+            "Backfill thumbnails by deleting the stored JPEG, regenerating it, "
+            "and revalidating the CDN URL. Only run against a stable deployment "
+            "(never during a token rollout flip or token rotation)."
+        )
     )
     parser.add_argument(
         "hashes",
@@ -49,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-unauthenticated",
         action="store_true",
-        help="Allow running without THUMBNAIL_SERVICE_TOKEN (only for open/observe environments).",
+        help="Allow running without THUMBNAIL_SERVICE_TOKEN (only when target server has no token configured).",
     )
     parser.add_argument(
         "--media-url",
@@ -171,7 +179,7 @@ def get_opener(*, follow_redirects: bool = True):
     return opener
 
 
-def request(
+def request_with_headers(
     url: str,
     *,
     method: str = "GET",
@@ -179,7 +187,7 @@ def request(
     timeout: int = 60,
     auth: bool = False,
     follow_redirects: bool = True,
-) -> int:
+) -> tuple[int, dict[str, str]]:
     final_headers = dict(headers or {})
     has_thumbnail_token = any(
         key.lower() == "x-divine-thumbnail-token" for key in final_headers
@@ -198,13 +206,45 @@ def request(
         req = urllib.request.Request(url, method=method, headers=final_headers)
         try:
             with opener.open(req, timeout=timeout) as resp:
-                return resp.status
+                resp_headers = {
+                    key.lower(): value.strip()
+                    for key, value in resp.headers.items()
+                }
+                return resp.status, resp_headers
         except urllib.error.HTTPError as exc:
-            if auth and exc.code in (401, 403) and attempt == 0:
-                continue
-            return exc.code
+            try:
+                if auth and exc.code in (401, 403) and attempt == 0:
+                    continue
+                resp_headers = (
+                    {key.lower(): value.strip() for key, value in exc.headers.items()}
+                    if exc.headers is not None
+                    else {}
+                )
+                return exc.code, resp_headers
+            finally:
+                exc.close()
 
-    return 599
+    return 599, {}
+
+
+def request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+    auth: bool = False,
+    follow_redirects: bool = True,
+) -> int:
+    status, _ = request_with_headers(
+        url,
+        method=method,
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        follow_redirects=follow_redirects,
+    )
+    return status
 
 
 def validate_upload_url(upload_url: str, *, allow_non_default: bool = False) -> str:
@@ -235,7 +275,7 @@ def resolve_thumbnail_token(*, allow_unauthenticated: bool = False) -> str:
         if allow_unauthenticated:
             return ""
         raise SystemExit(
-            "THUMBNAIL_SERVICE_TOKEN is required (pass --allow-unauthenticated only for open/observe environments)"
+            "THUMBNAIL_SERVICE_TOKEN is required (pass --allow-unauthenticated only when target server has no token configured)"
         )
     if not all(33 <= ord(ch) <= 126 for ch in token):
         raise SystemExit("THUMBNAIL_SERVICE_TOKEN must be visible ASCII with no spaces")
@@ -267,22 +307,44 @@ def verify_thumbnail_access(
     headers: dict[str, str],
     allow_non_default: bool = False,
 ) -> None:
-    """Confirm /thumbnail accepts our credential before deleting any GCS JPEG."""
+    """Confirm /thumbnail/auth-check positively verifies access before deleting any GCS JPEG."""
     origin = validate_upload_url(upload_url, allow_non_default=allow_non_default)
-    status = request(
-        f"{origin}/thumbnail/preflight-check",
+    status, resp_headers = request_with_headers(
+        f"{origin}/thumbnail/auth-check",
         headers=headers,
         follow_redirects=False,
     )
-    if status == 400:
+    auth_status = resp_headers.get("x-divine-thumbnail-auth", "")
+    has_token = any(key.lower() == "x-divine-thumbnail-token" for key in headers)
+    if has_token:
+        if status == 204 and auth_status == "verified":
+            return
+        if status == 204 and auth_status == "open":
+            raise SystemExit(
+                "Thumbnail service preflight reported open mode while THUMBNAIL_SERVICE_TOKEN is set; "
+                "wait for deployment stability or unset the token with --allow-unauthenticated"
+            )
+        if status == 404:
+            raise SystemExit(
+                "Thumbnail service preflight returned 404 before deleting objects; "
+                "verify THUMBNAIL_SERVICE_TOKEN matches the target deployment"
+            )
+        raise SystemExit(
+            f"Thumbnail service preflight failed before deleting objects "
+            f"(HTTP {status}, x-divine-thumbnail-auth={auth_status or 'missing'}); "
+            "expected 204 with x-divine-thumbnail-auth=verified"
+        )
+    if status == 204 and auth_status == "open":
         return
     if status == 404:
         raise SystemExit(
             "Thumbnail service preflight returned 404 before deleting objects; "
-            "verify THUMBNAIL_SERVICE_TOKEN (pass --allow-unauthenticated only when unrequired)"
+            "target server has THUMBNAIL_SERVICE_TOKEN configured (--allow-unauthenticated cannot proceed)"
         )
     raise SystemExit(
-        f"Thumbnail service preflight returned unexpected HTTP {status} before deleting objects"
+        f"Thumbnail service preflight failed before deleting objects "
+        f"(HTTP {status}, x-divine-thumbnail-auth={auth_status or 'missing'}); "
+        "expected 204 with x-divine-thumbnail-auth=open"
     )
 
 
@@ -324,16 +386,17 @@ def process_hash(
 
 def main() -> None:
     args = parse_args()
-    token = resolve_thumbnail_token(allow_unauthenticated=args.allow_unauthenticated)
-    headers = {"X-Divine-Thumbnail-Token": token} if token else {}
-    for warning in thumbnail_token_warnings(args.upload_url):
-        print(warning, file=sys.stderr)
     hashes = load_hashes(args)
     total = len(hashes)
 
     if args.dry_run:
         print(f"would_process={total}")
         return
+
+    token = resolve_thumbnail_token(allow_unauthenticated=args.allow_unauthenticated)
+    headers = {"X-Divine-Thumbnail-Token": token} if token else {}
+    for warning in thumbnail_token_warnings(args.upload_url):
+        print(warning, file=sys.stderr)
 
     verify_thumbnail_access(
         args.upload_url,
