@@ -1552,18 +1552,42 @@ async fn read_cached_thumbnail_response(
             Ok(data) => {
                 Some((StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data).into_response())
             }
-            Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-                warn!("Thumbnail cache read failed; attempting regeneration");
+            Err(e) if media_storage.mode == storage::WriteMode::Gcs => {
+                warn!(
+                    thumb_path = %thumb_path,
+                    error = %e,
+                    "Thumbnail cache read failed; attempting regeneration"
+                );
                 None
             }
-            Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+            Err(e) => {
+                error!(
+                    thumb_path = %thumb_path,
+                    mode = ?media_storage.mode,
+                    error = %e,
+                    "Thumbnail cache read failed; returning 502"
+                );
+                Some(StatusCode::BAD_GATEWAY.into_response())
+            }
         },
         Ok(None) => None,
-        Err(_) if media_storage.mode == storage::WriteMode::Gcs => {
-            warn!("Thumbnail cache lookup failed; attempting regeneration");
+        Err(e) if media_storage.mode == storage::WriteMode::Gcs => {
+            warn!(
+                thumb_path = %thumb_path,
+                error = %e,
+                "Thumbnail cache lookup failed; attempting regeneration"
+            );
             None
         }
-        Err(_) => Some(StatusCode::BAD_GATEWAY.into_response()),
+        Err(e) => {
+            error!(
+                thumb_path = %thumb_path,
+                mode = ?media_storage.mode,
+                error = %e,
+                "Thumbnail cache lookup failed; returning 502"
+            );
+            Some(StatusCode::BAD_GATEWAY.into_response())
+        }
     }
 }
 
@@ -1679,7 +1703,10 @@ async fn thumbnail_response(
     let hash = hash.to_lowercase();
     let media_storage = match thumbnail_storage(&state, &hash).await {
         Ok(storage) => storage,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(e) => {
+            error!(hash = %hash, error = %e, "Failed to resolve thumbnail storage; returning 502");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
